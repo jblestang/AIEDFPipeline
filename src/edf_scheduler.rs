@@ -1,0 +1,165 @@
+use crate::drr_scheduler::Packet;
+use crossbeam_channel::{Receiver, Sender};
+use parking_lot::Mutex;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::sync::Arc;
+use std::time::Instant;
+
+#[derive(Debug, Clone)]
+struct EDFTask {
+    packet: Packet,
+    deadline: Instant,
+}
+
+impl Ord for EDFTask {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse order for min-heap (earliest deadline first)
+        other.deadline.cmp(&self.deadline)
+    }
+}
+
+impl PartialOrd for EDFTask {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for EDFTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline
+    }
+}
+
+impl Eq for EDFTask {}
+
+pub struct EDFScheduler {
+    tasks: Arc<Mutex<BinaryHeap<EDFTask>>>,
+    input_rx: Arc<Mutex<Receiver<Packet>>>,
+    output_tx: Sender<Packet>,
+}
+
+impl EDFScheduler {
+    pub fn new(input_rx: Arc<Mutex<Receiver<Packet>>>, output_tx: Sender<Packet>) -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(BinaryHeap::new())),
+            input_rx,
+            output_tx,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn enqueue_packet(
+        &self,
+        packet: Packet,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let deadline = packet.timestamp + packet.latency_budget;
+        let task = EDFTask { packet, deadline };
+
+        let mut tasks = self.tasks.lock();
+        tasks.push(task);
+        Ok(())
+    }
+
+    pub fn process_next(&self) -> Option<Packet> {
+        // Collect all incoming packets first
+        let rx_guard = self.input_rx.lock();
+        while let Ok(packet) = rx_guard.try_recv() {
+            let deadline = packet.timestamp + packet.latency_budget;
+            let task = EDFTask { packet, deadline };
+            self.tasks.lock().push(task);
+        }
+        drop(rx_guard);
+
+        // Process the task with earliest deadline
+        let mut tasks = self.tasks.lock();
+        if let Some(task) = tasks.pop() {
+            // Check if deadline has passed
+            if task.deadline < Instant::now() {
+                // Deadline missed, but still process
+                eprintln!("Warning: Deadline missed for flow {}", task.packet.flow_id);
+            }
+            Some(task.packet)
+        } else {
+            None
+        }
+    }
+
+    pub fn send_processed(
+        &self,
+        packet: Packet,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.output_tx.send(packet)?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn has_tasks(&self) -> bool {
+        !self.tasks.lock().is_empty() || !self.input_rx.lock().is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+
+    #[test]
+    fn test_edf_scheduler_creation() {
+        let (_tx1, rx1) = unbounded();
+        let (tx2, _rx2) = unbounded();
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let scheduler = EDFScheduler::new(Arc::new(Mutex::new(rx1)), tx2);
+        assert!(scheduler.tasks.lock().is_empty());
+    }
+
+    #[test]
+    fn test_edf_ordering() {
+        let (tx1, rx1) = unbounded();
+        let (tx2, rx2) = unbounded();
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        use std::time::Duration;
+        let scheduler = EDFScheduler::new(Arc::new(Mutex::new(rx1)), tx2);
+
+        let now = Instant::now();
+
+        // Create packets with different deadlines
+        let packet1 = Packet {
+            flow_id: 1,
+            data: vec![1],
+            timestamp: now,
+            latency_budget: Duration::from_millis(100),
+        };
+
+        let packet2 = Packet {
+            flow_id: 2,
+            data: vec![2],
+            timestamp: now,
+            latency_budget: Duration::from_millis(50),
+        };
+
+        let packet3 = Packet {
+            flow_id: 3,
+            data: vec![3],
+            timestamp: now,
+            latency_budget: Duration::from_millis(1),
+        };
+
+        // Enqueue in wrong order
+        scheduler.enqueue_packet(packet1.clone()).unwrap();
+        scheduler.enqueue_packet(packet2.clone()).unwrap();
+        scheduler.enqueue_packet(packet3.clone()).unwrap();
+
+        // Should process in deadline order: 3, 2, 1
+        let processed1 = scheduler.process_next().unwrap();
+        assert_eq!(processed1.flow_id, 3); // Earliest deadline
+
+        let processed2 = scheduler.process_next().unwrap();
+        assert_eq!(processed2.flow_id, 2);
+
+        let processed3 = scheduler.process_next().unwrap();
+        assert_eq!(processed3.flow_id, 1);
+    }
+}
