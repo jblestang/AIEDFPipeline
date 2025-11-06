@@ -8,10 +8,13 @@ use std::time::{Duration, Instant};
 /// Flow state for DRR scheduling
 #[derive(Debug, Clone)]
 struct FlowState {
+    #[allow(dead_code)]
     flow_id: u64,
     quantum: usize,
     deficit: usize,
+    #[allow(dead_code)]
     priority: Priority,
+    #[allow(dead_code)]
     latency_budget: Duration,
 }
 
@@ -41,9 +44,11 @@ pub struct IngressDRRScheduler {
 #[derive(Debug, Clone)]
 pub struct SocketConfig {
     pub socket: Arc<StdUdpSocket>,
+    #[allow(dead_code)]
     pub flow_id: u64,
     pub priority: Priority,
     pub latency_budget: Duration,
+    #[allow(dead_code)]
     pub quantum: usize,
 }
 
