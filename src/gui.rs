@@ -185,32 +185,37 @@ fn update_ui(
         // Queue Occupancy Display
         ui.heading("Channel Occupancy");
         if let Some(first_metrics) = latest_metrics.values().next() {
-            ui.horizontal(|ui| {
-                ui.label("Queue 1:");
-                ui.label(format!(
-                    "{}/{} ({:.1}%)",
-                    first_metrics.queue1_occupancy,
-                    first_metrics.queue1_capacity,
-                    if first_metrics.queue1_capacity > 0 {
-                        (first_metrics.queue1_occupancy as f64 / first_metrics.queue1_capacity as f64) * 100.0
-                    } else {
-                        0.0
-                    }
-                ));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Queue 2:");
-                ui.label(format!(
-                    "{}/{} ({:.1}%)",
-                    first_metrics.queue2_occupancy,
-                    first_metrics.queue2_capacity,
-                    if first_metrics.queue2_capacity > 0 {
-                        (first_metrics.queue2_occupancy as f64 / first_metrics.queue2_capacity as f64) * 100.0
-                    } else {
-                        0.0
-                    }
-                ));
-            });
+            // Only show queue occupancy if capacity > 0 (indicates data is available)
+            if first_metrics.queue1_capacity > 0 || first_metrics.queue2_capacity > 0 {
+                ui.horizontal(|ui| {
+                    ui.label("Queue 1:");
+                    ui.label(format!(
+                        "{}/{} ({:.1}%)",
+                        first_metrics.queue1_occupancy,
+                        first_metrics.queue1_capacity,
+                        if first_metrics.queue1_capacity > 0 {
+                            (first_metrics.queue1_occupancy as f64 / first_metrics.queue1_capacity as f64) * 100.0
+                        } else {
+                            0.0
+                        }
+                    ));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Queue 2:");
+                    ui.label(format!(
+                        "{}/{} ({:.1}%)",
+                        first_metrics.queue2_occupancy,
+                        first_metrics.queue2_capacity,
+                        if first_metrics.queue2_capacity > 0 {
+                            (first_metrics.queue2_occupancy as f64 / first_metrics.queue2_capacity as f64) * 100.0
+                        } else {
+                            0.0
+                        }
+                    ));
+                });
+            } else {
+                ui.label("Queue occupancy data not available (pipeline may need to be rebuilt)");
+            }
         }
 
         ui.separator();
@@ -483,6 +488,7 @@ pub fn run_gui_client(server_addr: &str, shutdown_flag: Arc<AtomicBool>) {
                                         }
                                         Err(e) => {
                                             eprintln!("[GUI] Error parsing metrics JSON: {} (line: {})", e, line.trim());
+                                            eprintln!("[GUI] This might be due to missing queue occupancy fields. Make sure the pipeline binary is up to date.");
                                         }
                                     }
                                 }
@@ -531,6 +537,7 @@ fn update_ui_client(
         if latest_metrics.is_empty() {
             ui.label("Connecting to metrics server...");
             ui.label("Make sure the pipeline is running (cargo run --release)");
+            ui.label("If the pipeline is running, check console for connection errors");
             return;
         }
 
@@ -594,32 +601,37 @@ fn update_ui_client(
         // Queue Occupancy Display
         ui.heading("Channel Occupancy");
         if let Some(first_metrics) = latest_metrics.values().next() {
-            ui.horizontal(|ui| {
-                ui.label("Queue 1:");
-                ui.label(format!(
-                    "{}/{} ({:.1}%)",
-                    first_metrics.queue1_occupancy,
-                    first_metrics.queue1_capacity,
-                    if first_metrics.queue1_capacity > 0 {
-                        (first_metrics.queue1_occupancy as f64 / first_metrics.queue1_capacity as f64) * 100.0
-                    } else {
-                        0.0
-                    }
-                ));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Queue 2:");
-                ui.label(format!(
-                    "{}/{} ({:.1}%)",
-                    first_metrics.queue2_occupancy,
-                    first_metrics.queue2_capacity,
-                    if first_metrics.queue2_capacity > 0 {
-                        (first_metrics.queue2_occupancy as f64 / first_metrics.queue2_capacity as f64) * 100.0
-                    } else {
-                        0.0
-                    }
-                ));
-            });
+            // Only show queue occupancy if capacity > 0 (indicates data is available)
+            if first_metrics.queue1_capacity > 0 || first_metrics.queue2_capacity > 0 {
+                ui.horizontal(|ui| {
+                    ui.label("Queue 1:");
+                    ui.label(format!(
+                        "{}/{} ({:.1}%)",
+                        first_metrics.queue1_occupancy,
+                        first_metrics.queue1_capacity,
+                        if first_metrics.queue1_capacity > 0 {
+                            (first_metrics.queue1_occupancy as f64 / first_metrics.queue1_capacity as f64) * 100.0
+                        } else {
+                            0.0
+                        }
+                    ));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Queue 2:");
+                    ui.label(format!(
+                        "{}/{} ({:.1}%)",
+                        first_metrics.queue2_occupancy,
+                        first_metrics.queue2_capacity,
+                        if first_metrics.queue2_capacity > 0 {
+                            (first_metrics.queue2_occupancy as f64 / first_metrics.queue2_capacity as f64) * 100.0
+                        } else {
+                            0.0
+                        }
+                    ));
+                });
+            } else {
+                ui.label("Queue occupancy data not available (pipeline may need to be rebuilt)");
+            }
         }
 
         ui.separator();

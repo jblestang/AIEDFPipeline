@@ -185,9 +185,13 @@ pub struct MetricsSnapshot {
     #[serde(with = "duration_millis")]
     pub expected_max_latency: Duration, // Expected max latency (latency budget)
     // Queue occupancy metrics (shared across all flows)
+    #[serde(default = "default_zero")]
     pub queue1_occupancy: usize,
+    #[serde(default = "default_queue_capacity")]
     pub queue1_capacity: usize,
+    #[serde(default = "default_zero")]
     pub queue2_occupancy: usize,
+    #[serde(default = "default_queue_capacity")]
     pub queue2_capacity: usize,
     #[serde(skip, default = "default_instant")]
     #[allow(dead_code)]
@@ -200,6 +204,14 @@ pub struct MetricsSnapshot {
 
 fn default_instant() -> Instant {
     Instant::now()
+}
+
+fn default_zero() -> usize {
+    0
+}
+
+fn default_queue_capacity() -> usize {
+    128
 }
 
 mod duration_millis {
