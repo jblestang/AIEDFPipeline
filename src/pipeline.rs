@@ -37,7 +37,6 @@ pub struct Pipeline {
     output_drr: Arc<DRRScheduler>,
     queue1: Arc<Queue>,
     queue2: Arc<Queue>,
-    queue3: Arc<Queue>,
     metrics_collector: Arc<MetricsCollector>,
     metrics_receiver: Receiver<std::collections::HashMap<u64, MetricsSnapshot>>,
     running: Arc<Mutex<bool>>,
@@ -55,7 +54,7 @@ impl Pipeline {
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 8080,
-                latency_budget: Duration::from_millis(1),
+                latency_budget: Duration::from_millis(5),
                 flow_id: 1,
             },
             SocketConfig {
@@ -77,7 +76,7 @@ impl Pipeline {
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 9080,
-                latency_budget: Duration::from_millis(1),
+                latency_budget: Duration::from_millis(5),
                 flow_id: 1,
             },
             SocketConfig {
@@ -96,9 +95,9 @@ impl Pipeline {
 
         // Create queues
         // Flow: UDP Input → Input DRR → Queue1 → EDF → Queue2 → Output DRR → UDP Output
+        // (Queue3 removed - Output DRR now sends directly to UDP)
         let queue1 = Arc::new(Queue::new());
         let queue2 = Arc::new(Queue::new());
-        let queue3 = Arc::new(Queue::new());
 
         // Create input DRR scheduler
         // Input DRR: receives packets from UDP sockets, schedules via DRR, outputs to queue1
@@ -107,7 +106,7 @@ impl Pipeline {
         input_drr.set_receiver(input_drr_rx);
 
         // Create output DRR scheduler
-        // Output DRR: receives packets from queue2, schedules via DRR, outputs to queue3
+        // Output DRR: receives packets from queue2, schedules via DRR, sends directly to UDP
         let (output_drr_tx, output_drr_rx) = unbounded();
         let output_drr = Arc::new(DRRScheduler::new(output_drr_tx));
         output_drr.set_receiver(output_drr_rx);
@@ -125,7 +124,6 @@ impl Pipeline {
             output_drr,
             queue1,
             queue2,
-            queue3,
             metrics_collector,
             metrics_receiver: metrics_rx,
             running: Arc::new(Mutex::new(false)),
@@ -178,7 +176,7 @@ impl Pipeline {
                         }
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        tokio::task::yield_now().await;
                     }
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         break;
@@ -213,7 +211,7 @@ impl Pipeline {
                             }
                         }
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    _ = tokio::task::yield_now() => {
                         if !*running_accept.lock() {
                             break;
                         }
@@ -238,11 +236,11 @@ impl Pipeline {
 
         // Configure flows with different latencies and quantums based on socket configs
         // Rebalance DRR quantums: different quantum values to ensure fair packet distribution
-        // Quantum ratios: Flow 1: 8192, Flow 2: 2048, Flow 3: 1024 (8:2:1 ratio)
+        // Quantum ratios: Flow 1: 32768, Flow 2: 4096, Flow 3: 1024 (32:4:1 ratio)
         // This compensates for flow 1's lower data rate and balances flow 2 vs flow 3
         for config in &self.input_sockets {
             let quantum = match config.flow_id {
-                1 => 16384, // Highest quantum for flow 1 (low data rate) to ensure fair treatment
+                1 => 32768, // Highest quantum for flow 1 (low data rate) to ensure fair treatment
                 2 => 4096, // Medium quantum for flow 2
                 3 => 1024, // Standard quantum for flow 3
                 _ => 1024, // Default quantum for other flows
@@ -253,7 +251,7 @@ impl Pipeline {
 
         for config in &self.output_sockets {
             let quantum = match config.flow_id {
-                1 => 16384, // Highest quantum for flow 1 (low data rate) to ensure fair treatment
+                1 => 32768, // Highest quantum for flow 1 (low data rate) to ensure fair treatment
                 2 => 4096, // Medium quantum for flow 2
                 3 => 1024, // Standard quantum for flow 3
                 _ => 1024, // Default quantum for other flows
@@ -283,17 +281,8 @@ impl Pipeline {
                 let mut buf = [0u8; 1024];
 
                 while *running_clone.lock() {
-
-                    // Use recv_from with minimal timeout (10 microseconds) for sub-millisecond latency
-                    // Very short timeout allows rapid polling while still yielding to other tasks
-                    let result = tokio::time::timeout(
-                        Duration::from_micros(10),
-                        socket_clone.recv_from(&mut buf),
-                    )
-                    .await;
-
-                    match result {
-                        Ok(Ok((size, _addr))) => {
+                    match socket_clone.recv_from(&mut buf).await {
+                        Ok((size, _addr)) => {
                             // Extract data (no need to parse flow_id from packet, use socket's flow_id)
                             let data = if size > 0 {
                                 buf[..size].to_vec()
@@ -311,13 +300,8 @@ impl Pipeline {
                             // Schedule packet via input DRR (handles socket read priority)
                             let _ = input_drr_clone.schedule_packet(packet);
                         }
-                        Ok(Err(_e)) => {
+                        Err(_e) => {
                             // Socket error - yield briefly
-                            tokio::task::yield_now().await;
-                        }
-                        Err(_) => {
-                            // Timeout - no packet available, continue immediately without delay
-                            // Just yield to let other tasks run, but don't add artificial delay
                             tokio::task::yield_now().await;
                         }
                     }
@@ -365,42 +349,15 @@ impl Pipeline {
                         // Send processed packet via EDF's output (queue2)
                         let _ = edf_clone.send_processed(packet);
                     } else {
-                        // Minimal sleep when no packets - keep checking frequently
-                        std::thread::sleep(Duration::from_micros(1));
-                    }
-                }
-            })?;
-
-        // Output DRR processing thread - receives from queue2, schedules via DRR, sends to queue3
-        let queue2_clone = self.queue2.clone();
-        let output_drr_clone = self.output_drr.clone();
-        let queue3_clone = self.queue3.clone();
-        let running_clone2 = self.running.clone();
-
-        std::thread::Builder::new()
-            .name("Output-DRR".to_string())
-            .spawn(move || {
-                while *running_clone2.lock() {
-                    // Get packets from queue2 (output of EDF) and schedule via output DRR
-                    if let Ok(packet) = queue2_clone.try_recv() {
-                        // Removed verbose logging to reduce latency
-                        // Schedule packet via output DRR (handles sending priority)
-                        let _ = output_drr_clone.schedule_packet(packet);
-                    }
-
-                    // Process packets from output DRR and forward to queue3
-                    if let Some(packet) = output_drr_clone.process_next() {
-                        let _ = queue3_clone.send(packet);
-                    } else {
-                        // No packets available - yield briefly to avoid busy-waiting
-                        // Use std::hint::spin_loop for better CPU efficiency without sleep overhead
+                        // No packets available - use spin loop for minimal latency
                         std::hint::spin_loop();
                     }
                 }
             })?;
 
-        // Output thread - sends UDP packets to appropriate socket based on flow_id
-        let queue3_clone = self.queue3.clone();
+        // Output DRR + UDP output combined - receives from queue2, schedules via DRR, sends directly to UDP
+        let queue2_clone = self.queue2.clone();
+        let output_drr_clone = self.output_drr.clone();
         let metrics_clone = self.metrics_collector.clone();
         let running_clone = self.running.clone();
         let output_socket_map_clone = Arc::new(output_socket_map);
@@ -421,8 +378,13 @@ impl Pipeline {
             }
 
             while *running_clone.lock() {
-                if let Ok(packet) = queue3_clone.try_recv() {
-                    // Removed verbose logging to reduce latency
+                // Get packets from queue2 (output of EDF) and schedule via output DRR
+                if let Ok(packet) = queue2_clone.try_recv() {
+                    let _ = output_drr_clone.schedule_packet(packet);
+                }
+
+                // Process packets from output DRR and send directly to UDP
+                if let Some(packet) = output_drr_clone.process_next() {
                     // Record metrics
                     let latency = packet.timestamp.elapsed();
                     let deadline = packet.timestamp + packet.latency_budget;
@@ -434,19 +396,16 @@ impl Pipeline {
                         packet.latency_budget,
                     );
 
-                    // Route to appropriate output socket based on flow_id
+                    // Route to appropriate output socket based on flow_id and send directly
                     if let Some(output_config) = output_socket_map_clone.get(&packet.flow_id) {
                         if let Some(socket) = output_sockets.get(&packet.flow_id) {
                             let target_addr =
                                 format!("{}:{}", output_config.address, output_config.port);
                             let _ = socket.send_to(&packet.data, &target_addr).await;
-                            // Removed verbose logging to reduce latency
                         }
-                    } else {
-                        // No output socket configured
                     }
                 } else {
-                    // No packets - yield briefly to avoid busy-waiting
+                    // No packets available - yield to other tasks
                     tokio::task::yield_now().await;
                 }
             }
@@ -468,20 +427,29 @@ impl Pipeline {
             .name("Statistics-Thread".to_string())
             .spawn(move || {
                 set_thread_priority(1); // Lower priority for statistics (EDF is 2)
+                let mut interval = std::time::Instant::now();
                 loop {
-                    std::thread::sleep(Duration::from_millis(100));
+                    // Check shutdown flag first
                     if !*running_periodic.lock() {
                         break;
                     }
-                    let map: HashMap<u64, Duration> =
-                        flow_map_clone.iter().map(|(k, v)| (*k, *v)).collect();
-                    metrics_collector_periodic.send_current_metrics(&map);
+                    
+                    // Use spin loop with periodic check instead of sleep
+                    // This allows more responsive shutdown while still batching updates
+                    if interval.elapsed() >= Duration::from_millis(100) {
+                        let map: HashMap<u64, Duration> =
+                            flow_map_clone.iter().map(|(k, v)| (*k, *v)).collect();
+                        metrics_collector_periodic.send_current_metrics(&map);
+                        interval = std::time::Instant::now();
+                    } else {
+                        std::hint::spin_loop();
+                    }
                 }
             })?;
 
         // Keep the runtime alive - wait until shutdown is requested
         while *self.running.lock() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
         }
 
         Ok(())

@@ -219,7 +219,7 @@ fn update_ui(
                             .collect();
 
                         // Expected max latency line
-                        let expected_max_ms = metrics.expected_max_latency.as_secs_f64() * 1000.0;
+                        let expected_max_ms = metrics.max_latency.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0;
                         let time_range = if let Some(last) = flow_stats.points.last() {
                             last.time.max(1.0) // At least 1 second for initial view
                         } else {
@@ -582,6 +582,7 @@ fn update_ui_client(
                             .map(|p| [p.time, p.std_dev])
                             .collect();
 
+                        
                         // Expected max latency line
                         let expected_max_ms = metrics.expected_max_latency.as_secs_f64() * 1000.0;
                         let time_range = if let Some(last) = flow_stats.points.last() {
@@ -607,9 +608,7 @@ fn update_ui_client(
                                 .points
                                 .iter()
                                 .map(|p| {
-                                    p.max.max(p.avg.max(
-                                        p.p50.max(p.p95.max(p.p99.max(p.p100.max(p.std_dev)))),
-                                    ))
+                                    p.max.max(p.p100.max(p.std_dev))
                                 })
                                 .fold(f64::NEG_INFINITY, f64::max)
                                 .max(expected_max_ms * 1.2) // At least 20% above expected max

@@ -1,5 +1,5 @@
 use crate::drr_scheduler::Packet;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ pub struct Queue {
 
 impl Queue {
     pub fn new() -> Self {
-        let (tx, rx) = unbounded();
+        let (tx, rx) = bounded(128);
         Self {
             sender: tx,
             receiver: Arc::new(Mutex::new(rx)),
