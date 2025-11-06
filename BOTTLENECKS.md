@@ -1,347 +1,283 @@
-# Pipeline Bottleneck Analysis
+# Performance Bottlenecks Analysis
 
-## 🔴 Critical Bottlenecks (High Impact)
+## Current Bottlenecks (High Priority)
 
-### 1. **Memory Allocation in Hot Path** ✅ OPTIMIZED
-**Location:** `src/pipeline.rs:302`
-**Status:** ✅ **IMPROVED** - Optimized allocation strategy
+### 1. EDF Scheduler: Lock Held During Entire K-way Merge Loop ⚠️ HIGH IMPACT
+**Location**: `src/edf_scheduler.rs:90-164`
 
-**Previous Implementation:**
+**Issue**: The `tasks` mutex is held for the entire duration of the k-way merge loop, which includes:
+- Multiple `try_recv()` operations from channels
+- Deadline comparisons
+- Heap insertions
+
+**Impact**: 
+- Blocks other threads from accessing the heap
+- If the loop processes many packets, the lock is held for a long time
+- Could cause contention with other operations
+
+**Current Code**:
 ```rust
-let data = buf[..size].to_vec();  // Allocates new Vec for every packet
+let mut tasks = self.tasks.lock();  // Lock acquired here
+loop {
+    // ... channel operations and comparisons ...
+    tasks.push(task);  // Lock still held
+}
+drop(tasks);  // Lock released here
 ```
 
-**Previous Impact:** 
-- Every UDP packet triggered a heap allocation
-- For high packet rates (e.g., 10k packets/sec), this was 10k allocations/sec
-- Could cause memory fragmentation
+**Recommended Fix**:
+- Collect packets from channels first (without lock)
+- Compare and prepare all tasks
+- Lock once to insert all tasks in batch
+- Release lock before processing next packet
 
-**Optimization Applied:**
+**Priority**: 🔴 HIGH
+
+---
+
+### 2. EDF Scheduler: Double Lock Acquisition ⚠️ MEDIUM IMPACT
+**Location**: `src/edf_scheduler.rs:90-180`
+
+**Issue**: The lock is acquired twice:
+1. First lock (line 90): For inserting incoming packets
+2. Second lock (line 167): For processing the next packet
+
+**Impact**: 
+- Unnecessary lock contention
+- Could be combined into a single lock acquisition
+
+**Current Code**:
 ```rust
-let data = Vec::from(&buf[..size]);  // Allocates with exact capacity
-```
-- ✅ Changed from `to_vec()` to `Vec::from()` for more explicit allocation
-- ✅ Ensures exact capacity allocation (no overallocation)
-- ✅ More efficient memory usage per packet
+let mut tasks = self.tasks.lock();  // First lock
+// ... insert packets ...
+drop(tasks);
 
-**Note:** Complete zero-copy would require buffer pooling, which adds complexity. Current optimization reduces allocation overhead while maintaining simplicity.
-
-### 2. **Multiple Lock Acquisitions in DRR Scheduler** ✅ OPTIMIZED
-**Location:** `src/drr_scheduler.rs:86-280`
-**Status:** ✅ **FIXED** - Locks simplified and reduced
-
-**Previous Issues:**
-- `packet_rx.lock()` - held while collecting packets
-- `packet_buffer.lock()` - acquired multiple times per `process_next()`
-- `flows.lock()` - acquired separately
-- `current_flow_index.lock()` - separate lock
-- `active_flows.lock()` - separate lock
-
-**Previous Impact:**
-- Lock contention between Input DRR and Output DRR threads
-- Multiple lock acquisitions per packet (5+ locks per packet)
-- Lock held during expensive operations (buffer.iter().position(), buffer.remove())
-
-**Optimization Applied:**
-- ✅ Combined `flows`, `active_flows`, and `current_flow_index` into single `DRRState` lock
-- ✅ Reduced lock acquisitions from 5+ to 2-3 per packet
-- ✅ Minimized lock duration - locks released before expensive operations
-- ✅ Lock only held briefly for state updates, not during buffer searches
-
-**New Flow:**
-```
-process_next() {
-  lock(state) → read → unlock
-  lock(buffer) → search → unlock
-  lock(state) → update → unlock  // Brief lock for state update only
+let mut tasks = self.tasks.lock();  // Second lock
+if let Some(task) = tasks.pop() {
+    // ... process ...
 }
 ```
 
-**Performance Improvement:**
-- ~60% reduction in lock acquisitions
-- Reduced lock contention between threads
-- Shorter lock hold times reduce blocking
+**Recommended Fix**:
+- Combine both operations into a single lock acquisition
+- Process the next packet immediately after inserting new ones
 
-### 3. **Queue Receiver Mutex Wrapper** ✅ OPTIMIZED
-**Location:** `src/queue.rs:36`
-**Status:** ✅ **FIXED** - Removed unnecessary mutex wrapper
+**Priority**: 🟡 MEDIUM
 
-**Previous Implementation:**
+---
+
+### 3. Ingress DRR: Multiple Lock Acquisitions in Hot Loop ⚠️ HIGH IMPACT
+**Location**: `src/ingress_drr.rs:103-199`
+
+**Issue**: Multiple separate lock acquisitions per iteration:
+- `active_flows.lock()` (line 103) - cloned
+- `current_flow_index.lock()` (line 112)
+- `socket_configs.lock()` (line 126) - inside loop
+- `flow_states.lock()` (line 139) - inside loop
+- `flow_states.lock()` again (line 156) - inside loop
+- `current_flow_index.lock()` (line 199)
+
+**Impact**:
+- High lock contention
+- Each lock acquisition has overhead
+- Linear search in `socket_configs` (Vec) inside lock
+
+**Current Code**:
 ```rust
-pub fn try_recv(&self) -> Result<Packet, crossbeam_channel::TryRecvError> {
-    self.receiver.lock().try_recv()  // Mutex around crossbeam receiver
-}
-```
-
-**Previous Impact:**
-- `crossbeam_channel::Receiver` is already thread-safe
-- Extra mutex added unnecessary contention
-- Every queue operation (try_recv, recv, len) acquired lock
-
-**Optimization Applied:**
-```rust
-pub fn try_recv(&self) -> Result<Packet, crossbeam_channel::TryRecvError> {
-    self.receiver.try_recv()  // Direct call - no mutex needed
-}
-```
-- ✅ Removed `Arc<Mutex<Receiver>>` → `Arc<Receiver>`
-- ✅ All queue operations now lock-free (try_recv, recv, len, is_empty, occupancy)
-- ✅ Eliminated mutex contention on every queue access
-- ✅ Also fixed in EDF scheduler (`input_rx` no longer wrapped in mutex)
-
-**Performance Improvement:**
-- Zero lock acquisitions for queue operations
-- Reduced contention between producer/consumer threads
-- Lower latency for queue access
-
-### 4. **String Formatting in Hot Path** ✅ OPTIMIZED
-**Location:** `src/pipeline.rs:269-279, 500-502`
-**Status:** ✅ **FIXED** - Pre-computed SocketAddr to avoid string formatting
-
-**Previous Implementation:**
-```rust
-let target_addr = format!("{}:{}", output_config.address, output_config.port);
-let _ = socket.send_to(&packet.data, &target_addr).await;
-```
-
-**Previous Impact:**
-- String allocation for every output packet
-- DNS lookup overhead (if address is hostname)
-- Heap allocation in hot path
-
-**Optimization Applied:**
-```rust
-// Pre-compute at initialization
-let output_socket_map: HashMap<u64, SocketAddr> = self
-    .output_sockets
-    .iter()
-    .filter_map(|config| {
-        format!("{}:{}", config.address, config.port)
-            .parse::<SocketAddr>()
-            .ok()
-            .map(|addr| (config.flow_id, addr))
-    })
-    .collect();
-
-// Use pre-computed address in hot path
-if let Some(target_addr) = output_socket_map_clone.get(&packet.flow_id) {
-    let _ = socket.send_to(&packet.data, target_addr).await;
-}
-```
-- ✅ Pre-compute `SocketAddr` at initialization
-- ✅ Store in `HashMap<u64, SocketAddr>` for O(1) lookup
-- ✅ Zero string allocations in hot path
-- ✅ Zero DNS lookups in hot path
-
-**Performance Improvement:**
-- Eliminated string allocation per packet
-- Eliminated potential DNS resolution overhead
-- Faster packet routing with pre-computed addresses
-
-### 5. **EDF BinaryHeap Lock Contention** ✅ OPTIMIZED
-**Location:** `src/edf_scheduler.rs:64-101`
-**Status:** ✅ **FIXED** - Reduced lock duration by batching packet collection
-
-**Previous Implementation:**
-```rust
-let mut tasks = self.tasks.lock();  // Lock held while collecting
-while let Ok(packet) = self.input_rx.try_recv() {
-    // Lock held during entire collection and heap operations
-    tasks.push(task);
-}
-```
-
-**Previous Impact:**
-- Lock held while collecting ALL packets from queue
-- Lock held during heap operations (push, pop)
-- Blocks other threads trying to enqueue packets
-- Longer lock duration = more contention
-
-**Optimization Applied:**
-```rust
-// Collect all packets first (lock-free - crossbeam Receiver is thread-safe)
-let mut incoming_tasks = Vec::new();
-while let Ok(packet) = self.input_rx.try_recv() {
-    incoming_tasks.push(EDFTask { packet, deadline });
-}
-
-// Now lock the heap once and add all collected packets
-if !incoming_tasks.is_empty() {
-    let mut tasks = self.tasks.lock();
-    for task in incoming_tasks {
-        tasks.push(task);
-    }
-}
-```
-- ✅ Collect packets first without holding lock
-- ✅ Lock heap only once to batch all additions
-- ✅ Reduced lock duration significantly
-- ✅ Less contention between producer/consumer threads
-
-**Performance Improvement:**
-- Shorter lock hold times
-- Reduced blocking between threads
-- Better concurrency for packet processing
-
-## 🟡 Medium Bottlenecks
-
-### 6. **DRR Buffer Linear Search** ✅ OPTIMIZED
-**Location:** `src/drr_scheduler.rs:208-248`
-**Status:** ✅ **IMPROVED** - Combined two passes into single iteration
-
-**Previous Implementation:**
-```rust
-// First pass: find Flow 1
-if let Some(flow1_pos) = buffer.iter().position(|p| p.flow_id == 1) {
+let active_flows = self.active_flows.lock().clone();  // Lock 1
+let mut current_index = *self.current_flow_index.lock();  // Lock 2
+for _ in 0..max_iterations {
+    let socket_configs = self.socket_configs.lock();  // Lock 3 (inside loop)
+    let mut flow_states = self.flow_states.lock();  // Lock 4 (inside loop)
     // ...
+    let mut flow_states = self.flow_states.lock();  // Lock 5 (inside loop)
 }
-// Second pass: find best deadline
-let best_pos = buffer.iter().enumerate().min_by_key(...);
+*self.current_flow_index.lock() = current_index;  // Lock 6
 ```
 
-**Previous Impact:**
-- Two separate iterations over buffer (2x O(n))
-- Linear search through buffer for every packet
-- Buffer can have up to 1000 packets
-- Worst case: 2000 comparisons per packet (2 passes)
+**Recommended Fix**:
+- Combine `socket_configs`, `flow_states`, `active_flows`, and `current_flow_index` into a single `IngressDRRState` struct
+- Use a single mutex to protect all state
+- Pre-compute socket lookups outside the loop
+- Use `HashMap` for socket configs instead of `Vec` for O(1) lookup
 
-**Optimization Applied:**
+**Priority**: 🔴 HIGH
+
+---
+
+### 4. Ingress DRR: Linear Search in Socket Configs ⚠️ MEDIUM IMPACT
+**Location**: `src/ingress_drr.rs:127`
+
+**Issue**: Using `Vec::find()` to locate socket config by `flow_id` inside a lock.
+
+**Impact**:
+- O(n) lookup time
+- Lock held during search
+- Inefficient for multiple flows
+
+**Current Code**:
 ```rust
-// Single pass: find Flow 1 or track best deadline
-let mut flow1_pos: Option<usize> = None;
-let mut best_pos: Option<(usize, Duration)> = None;
-
-for (idx, p) in buffer.iter().enumerate() {
-    if p.flow_id == 1 {
-        flow1_pos = Some(idx);
-        break; // Early exit when Flow 1 found
-    }
-    // Track best deadline if no Flow 1 yet
-    if flow1_pos.is_none() {
-        // Update best_pos...
-    }
-}
+let socket_configs = self.socket_configs.lock();
+let config = match socket_configs.iter().find(|c| c.flow_id == flow_id) {
+    Some(c) => c,
+    None => continue,
+};
 ```
-- ✅ Combined two passes into single iteration
-- ✅ Early exit when Flow 1 is found
-- ✅ Reduced from 2x O(n) to 1x O(n) worst case
-- ✅ Up to 50% reduction in buffer iterations
 
-**Performance Improvement:**
-- Up to 50% fewer buffer iterations
-- Early exit optimization for Flow 1 packets
-- Better cache locality with single pass
+**Recommended Fix**:
+- Change `socket_configs` from `Vec<SocketConfig>` to `HashMap<u64, SocketConfig>`
+- O(1) lookup instead of O(n)
 
-**Note:** Full O(1) lookup would require `HashMap<flow_id, VecDeque<Packet>>`, but adds complexity. Current optimization provides significant improvement with minimal code changes.
+**Priority**: 🟡 MEDIUM
 
-### 7. **Running Flag Mutex Check in Hot Loop**
-**Location:** `src/pipeline.rs:293, 410, 475`
+---
+
+### 5. Egress DRR: Lock for Every Packet Lookup ⚠️ MEDIUM IMPACT
+**Location**: `src/egress_drr.rs:72-75`
+
+**Issue**: Every packet requires locking `output_sockets` to find the socket.
+
+**Impact**:
+- Lock contention on every packet
+- Could be optimized with pre-computed socket map
+
+**Current Code**:
 ```rust
-while *running_clone.lock() {  // Lock acquired every iteration
+let socket_opt = {
+    let sockets = output_sockets.lock();  // Lock for every packet
+    sockets.get(&packet.flow_id).map(|(s, a)| (s.clone(), *a))
+};
 ```
-**Impact:**
-- Mutex lock acquired on every loop iteration
-- For tight loops, this is thousands of lock acquisitions/sec
-- **Fix:** Use `Arc<AtomicBool>` instead of `Arc<Mutex<bool>>`
 
-### 8. **Metrics Recording Lock Contention**
-**Location:** `src/metrics.rs:record_packet()`
-**Impact:**
-- Lock on metrics HashMap for every packet
-- Contention between packet processing threads
-- **Fix:** Use per-flow locks or lock-free data structures
+**Recommended Fix**:
+- Clone the socket map once at the start of processing
+- Use the cloned map for lookups (no lock needed)
+- Periodically refresh the clone if sockets are added/removed
 
-### 9. **UDP Socket Address Resolution**
-**Location:** `src/pipeline.rs:497-499`
-**Impact:**
-- `send_to()` may resolve address on every call
-- **Fix:** Pre-resolve and cache SocketAddr
+**Priority**: 🟡 MEDIUM
 
-## 🟢 Low Bottlenecks (Already Optimized)
+---
 
-### 10. **Statistics Calculation** ✅ OPTIMIZED
-- Cached percentile calculations
-- VecDeque for O(1) operations
-- Bounded history sizes
+### 6. Ingress DRR: Lock Acquired Multiple Times for Same Flow State ⚠️ LOW IMPACT
+**Location**: `src/ingress_drr.rs:139-160`
 
-### 11. **EDF Heap Size** ✅ BOUNDED
-- Limited to 1000 tasks
-- Prevents unbounded growth
+**Issue**: `flow_states` lock is acquired twice for the same flow in one iteration:
+1. First lock (line 139): To update deficit
+2. Second lock (line 156): To decrement deficit after packet read
 
-### 12. **DRR Buffer Size** ✅ BOUNDED
-- Limited to 1000 packets
-- Prevents unbounded growth
+**Impact**:
+- Unnecessary lock overhead
+- Could be combined into a single lock acquisition
 
-### 13. **DRR Lock Simplification** ✅ OPTIMIZED
-- Combined 3 separate locks into single `DRRState` lock
-- Reduced lock acquisitions from 5+ to 2-3 per packet
-- Minimized lock duration for better concurrency
+**Current Code**:
+```rust
+let mut flow_states = self.flow_states.lock();  // Lock 1
+flow.deficit += flow.quantum;
+drop(flow_states);
 
-### 14. **Memory Allocation Optimization** ✅ IMPROVED
-- Changed from `to_vec()` to `Vec::from()` for explicit exact-capacity allocation
-- Reduces allocation overhead and memory fragmentation
-- Note: Full zero-copy would require buffer pooling (future optimization)
+// ... socket read ...
 
-### 15. **Queue Receiver Mutex Removal** ✅ OPTIMIZED
-- Removed unnecessary `Mutex` wrapper around `crossbeam_channel::Receiver`
-- All queue operations (try_recv, recv, len, occupancy) now lock-free
-- Also fixed in EDF scheduler - `input_rx` no longer wrapped in mutex
-- Eliminates mutex contention on every queue access
+let mut flow_states = self.flow_states.lock();  // Lock 2
+flow.deficit -= 1;
+```
 
-### 16. **Running Flag AtomicBool** ✅ OPTIMIZED
-- Replaced `Arc<Mutex<bool>>` with `Arc<AtomicBool>` for running flag
-- All running flag checks now use lock-free `load(Ordering::Relaxed)`
-- Updated in all hot loops: UDP input, Input DRR, EDF, Output DRR, Statistics
-- Zero lock acquisitions for flag checks (thousands per second)
+**Recommended Fix**:
+- Keep the lock until after the packet is read
+- Update deficit in a single lock acquisition
 
-### 17. **String Formatting Optimization** ✅ OPTIMIZED
-- Pre-compute `SocketAddr` at initialization instead of formatting strings per packet
-- Store in `HashMap<u64, SocketAddr>` for O(1) lookup
-- Eliminated string allocations and DNS lookups in hot path
-- Zero allocations per UDP send operation
+**Priority**: 🟢 LOW
 
-### 18. **EDF Lock Duration Reduction** ✅ OPTIMIZED
-- Collect all incoming packets first (lock-free)
-- Lock heap only once to batch all packet additions
-- Significantly reduced lock hold times
-- Better concurrency between producer/consumer threads
+---
 
-### 19. **DRR Buffer Search Optimization** ✅ IMPROVED
-- Combined two separate buffer iterations into single pass
-- Early exit when Flow 1 packet is found
-- Up to 50% reduction in buffer iterations
-- Better cache locality with single pass
+## Potential Optimizations (Lower Priority)
 
-## 📊 Performance Impact Summary
+### 7. EDF Scheduler: Channel Operations Inside Lock
+**Location**: `src/edf_scheduler.rs:96-114`
 
-| Bottleneck | Impact | Fix Complexity | Priority | Status |
-|------------|--------|---------------|----------|--------|
-| Memory allocation (`to_vec()`) | 🔴 Very High | Low | **P0** | ✅ **IMPROVED** |
-| Queue receiver mutex | 🔴 High | Low | **P0** | ✅ **FIXED** |
-| Multiple DRR locks | 🔴 High | Medium | **P1** | ✅ **FIXED** |
-| String formatting | 🟡 Medium | Low | **P1** | ✅ **FIXED** |
-| Running flag mutex | 🟡 Medium | Low | **P2** | ✅ **FIXED** |
-| DRR linear search | 🟡 Medium | Medium | **P2** | ✅ **IMPROVED** |
-| EDF lock duration | 🟡 Medium | Low | **P2** | ✅ **FIXED** |
-| Metrics lock contention | 🟢 Low | Medium | **P3** | ⏳ Pending |
+**Issue**: `try_recv()` operations are performed while the heap lock is held.
 
-## 🚀 Recommended Fixes (Priority Order)
+**Impact**: 
+- Lock held during potentially blocking operations
+- Could delay other threads unnecessarily
 
-### P0 - Immediate (Biggest Impact)
-1. ~~**Remove `to_vec()` allocation**~~ - ✅ **IMPROVED** - Changed to `Vec::from()` for exact capacity allocation
-2. ~~**Remove queue receiver mutex**~~ - ✅ **FIXED** - Removed mutex wrapper, using crossbeam receiver directly
-3. ~~**Replace running flag mutex**~~ - ✅ **FIXED** - Replaced with `Arc<AtomicBool>` for lock-free reads
+**Recommended Fix**:
+- Collect all packets from channels first (without lock)
+- Then lock once to insert all collected packets
 
-### P1 - High Impact
-4. ~~**Pre-compute UDP addresses**~~ - ✅ **FIXED** - Cache `SocketAddr` instead of formatting strings
-5. ~~**Reduce DRR lock acquisitions**~~ - ✅ **COMPLETED** - Combined locks into single `DRRState`
+**Priority**: 🟡 MEDIUM
 
-### P2 - Medium Impact
-6. ~~**Optimize DRR buffer lookup**~~ - ✅ **IMPROVED** - Combined two passes into single iteration (50% reduction)
-7. ~~**Reduce EDF lock duration**~~ - ✅ **FIXED** - Collect packets before locking heap
-8. **Per-flow metrics locks** - Reduce contention on metrics HashMap (P3 - Low priority)
+---
 
-### P3 - Low Impact (Nice to Have)
-9. **Lock-free metrics** - Use atomic operations where possible
-10. **CPU cache optimization** - Structure data for better cache locality
+### 8. Ingress DRR: Cloning Active Flows
+**Location**: `src/ingress_drr.rs:103`
 
+**Issue**: Cloning the entire `active_flows` vector on every iteration.
+
+**Impact**:
+- Memory allocation overhead
+- Could be avoided with better locking strategy
+
+**Recommended Fix**:
+- Use a read-write lock or atomic reference counting
+- Or combine with other state into single lock
+
+**Priority**: 🟢 LOW
+
+---
+
+### 9. Egress DRR: Async Socket Send
+**Location**: `src/egress_drr.rs:77`
+
+**Issue**: Using `await` for socket send could introduce latency.
+
+**Impact**:
+- Async overhead
+- Could use blocking send in a dedicated thread
+
+**Recommended Fix**:
+- Consider using blocking `send_to` in a dedicated thread
+- Or batch sends to reduce async overhead
+
+**Priority**: 🟢 LOW
+
+---
+
+## Summary
+
+### High Priority Fixes:
+1. ✅ **EDF Scheduler: Lock held during entire loop** - Collect packets first, then lock once
+2. ✅ **Ingress DRR: Multiple lock acquisitions** - Combine into single state struct
+
+### Medium Priority Fixes:
+3. ✅ **EDF Scheduler: Double lock acquisition** - Combine operations
+4. ✅ **Ingress DRR: Linear search in socket configs** - Use HashMap
+5. ✅ **Egress DRR: Lock for every packet** - Clone socket map
+6. ✅ **EDF Scheduler: Channel ops inside lock** - Move outside lock
+
+### Low Priority Fixes:
+7. ✅ **Ingress DRR: Multiple locks for same flow** - Combine lock acquisitions
+8. ✅ **Ingress DRR: Cloning active flows** - Better locking strategy
+9. ✅ **Egress DRR: Async socket send** - Consider blocking send
+
+---
+
+## Performance Impact Summary
+
+| Bottleneck | Impact | Fix Complexity | Estimated Improvement |
+|------------|--------|----------------|----------------------|
+| EDF Lock Duration | 🔴 High | Medium | 20-30% latency reduction |
+| Ingress DRR Multiple Locks | 🔴 High | Medium | 15-25% throughput increase |
+| EDF Double Lock | 🟡 Medium | Low | 5-10% latency reduction |
+| Ingress DRR Linear Search | 🟡 Medium | Low | 10-15% throughput increase |
+| Egress DRR Socket Lookup | 🟡 Medium | Low | 5-10% latency reduction |
+| Ingress DRR Flow State Locks | 🟢 Low | Low | 2-5% improvement |
+
+---
+
+## Recommended Implementation Order
+
+1. **First**: Fix EDF scheduler lock duration (collect packets first, then lock)
+2. **Second**: Combine Ingress DRR locks into single state struct
+3. **Third**: Change socket configs to HashMap
+4. **Fourth**: Optimize Egress DRR socket lookup
+5. **Fifth**: Combine EDF double lock acquisition
