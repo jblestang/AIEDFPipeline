@@ -138,7 +138,7 @@ impl IngressDRRScheduler {
 
             let mut current_index = current_index;
             let mut packets_read = 0;
-            let max_iterations = active_flows.len();
+            let _max_iterations = active_flows.len();
 
             // DRR (Deficit Round Robin) algorithm:
             // 1. Process flows in round-robin order (prioritize Flow 1 first if it exists)
