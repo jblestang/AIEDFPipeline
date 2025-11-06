@@ -147,17 +147,6 @@ impl Pipeline {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn get_metrics_receiver(
-        &self,
-    ) -> Receiver<std::collections::HashMap<u64, MetricsSnapshot>> {
-        self.metrics_receiver.clone()
-    }
-
-    #[allow(dead_code)]
-    pub fn get_metrics_collector(&self) -> Arc<MetricsCollector> {
-        self.metrics_collector.clone()
-    }
 
     /// Start a TCP server that broadcasts metrics to connected clients
     /// This allows the GUI to connect as a separate process

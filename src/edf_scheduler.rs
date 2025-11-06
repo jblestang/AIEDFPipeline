@@ -65,7 +65,7 @@ impl EDFScheduler {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used in tests
     pub fn enqueue_packet(
         &self,
         packet: Packet,
