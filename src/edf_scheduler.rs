@@ -89,7 +89,7 @@ impl EDFScheduler {
         let mut low_next: Option<EDFTask> = None;
 
         // Collect all incoming packets from channels first (no lock needed)
-        let mut tasks_to_insert = Vec::new();
+        let mut tasks_to_insert = Vec::with_capacity(MAX_HEAP_SIZE);
         
         // K-way merge: repeatedly compare the three first elements and collect tasks to insert
         loop {
