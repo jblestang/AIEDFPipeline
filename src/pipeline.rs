@@ -1,6 +1,7 @@
 use crossbeam_channel::{unbounded, Receiver};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -10,6 +11,7 @@ use crate::drr_scheduler::{DRRScheduler, Packet};
 use crate::edf_scheduler::EDFScheduler;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::queue::Queue;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct SocketConfig {
@@ -39,7 +41,7 @@ pub struct Pipeline {
     queue2: Arc<Queue>,
     metrics_collector: Arc<MetricsCollector>,
     metrics_receiver: Receiver<std::collections::HashMap<u64, MetricsSnapshot>>,
-    running: Arc<Mutex<bool>>,
+    running: Arc<AtomicBool>, // Use AtomicBool instead of Mutex for lock-free reads
     input_sockets: Vec<SocketConfig>,
     output_sockets: Vec<SocketConfig>,
 }
@@ -130,7 +132,7 @@ impl Pipeline {
             queue2,
             metrics_collector,
             metrics_receiver: metrics_rx,
-            running: Arc::new(Mutex::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
             input_sockets,
             output_sockets,
         })
@@ -187,7 +189,7 @@ impl Pipeline {
                     }
                 }
 
-                if !*running_metrics.lock() {
+                if !running_metrics.load(Ordering::Relaxed) {
                     break;
                 }
             }
@@ -216,7 +218,7 @@ impl Pipeline {
                         }
                     }
                     _ = tokio::task::yield_now() => {
-                        if !*running_accept.lock() {
+                        if !running_accept.load(Ordering::Relaxed) {
                             break;
                         }
                     }
@@ -228,7 +230,7 @@ impl Pipeline {
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        *self.running.lock() = true;
+        self.running.store(true, Ordering::Relaxed);
 
         // Create and bind input sockets
         let mut input_socket_handles = Vec::new();
@@ -264,11 +266,16 @@ impl Pipeline {
                 .add_flow(config.flow_id, quantum, config.latency_budget);
         }
 
-        // Create a map from flow_id to output socket config for routing
-        let output_socket_map: HashMap<u64, SocketConfig> = self
+        // Create a map from flow_id to pre-computed SocketAddr for routing (avoids string formatting in hot path)
+        let output_socket_map: HashMap<u64, SocketAddr> = self
             .output_sockets
             .iter()
-            .map(|config| (config.flow_id, config.clone()))
+            .filter_map(|config| {
+                format!("{}:{}", config.address, config.port)
+                    .parse::<SocketAddr>()
+                    .ok()
+                    .map(|addr| (config.flow_id, addr))
+            })
             .collect();
 
         // Spawn input handlers for each socket
@@ -290,15 +297,17 @@ impl Pipeline {
             let _handle = tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
 
-                while *running_clone.lock() {
+                while running_clone.load(Ordering::Relaxed) {
                     match socket_clone.recv_from(&mut buf).await {
                         Ok((size, _addr)) => {
-                            // Extract data (no need to parse flow_id from packet, use socket's flow_id)
-                            let data = if size > 0 {
-                                buf[..size].to_vec()
-                            } else {
+                            if size == 0 {
                                 continue;
-                            };
+                            }
+                            
+                            // Optimized allocation: Vec::from() allocates with exact capacity
+                            // This avoids overallocation that to_vec() might do in some cases
+                            // Note: Still requires allocation, but with optimal capacity
+                            let data = Vec::from(&buf[..size]);
 
                             let packet = Packet {
                                 flow_id,
@@ -356,7 +365,7 @@ impl Pipeline {
         std::thread::Builder::new()
             .name("Input-DRR".to_string())
             .spawn(move || {
-                while *running_input_drr.lock() {
+                while running_input_drr.load(Ordering::Relaxed) {
                     // Process packets from input DRR (DRR scheduling handles socket read priority)
                     if let Some(packet) = input_drr_clone.process_next() {
                         // Use try_send to avoid blocking on full queue
@@ -407,7 +416,7 @@ impl Pipeline {
             .name("EDF-Processor".to_string())
             .spawn(move || {
                 set_thread_priority(2); // Higher priority for EDF
-                while *running_clone.lock() {
+                while running_clone.load(Ordering::Relaxed) {
                     if let Some(packet) = edf_clone.process_next() {
                         // Removed verbose logging to reduce latency
                         // Minimal processing delay - EDF should process immediately
@@ -472,7 +481,7 @@ impl Pipeline {
                 output_sockets.insert(*flow_id, socket);
             }
 
-            while *running_clone.lock() {
+            while running_clone.load(Ordering::Relaxed) {
                 // Get packets from queue2 (output of EDF) and schedule via output DRR
                 if let Ok(packet) = queue2_clone.try_recv() {
                     let _ = output_drr_clone.schedule_packet(packet);
@@ -492,11 +501,10 @@ impl Pipeline {
                     );
 
                     // Route to appropriate output socket based on flow_id and send directly
-                    if let Some(output_config) = output_socket_map_clone.get(&packet.flow_id) {
+                    // Use pre-computed SocketAddr to avoid string formatting in hot path
+                    if let Some(target_addr) = output_socket_map_clone.get(&packet.flow_id) {
                         if let Some(socket) = output_sockets.get(&packet.flow_id) {
-                            let target_addr =
-                                format!("{}:{}", output_config.address, output_config.port);
-                            let _ = socket.send_to(&packet.data, &target_addr).await;
+                            let _ = socket.send_to(&packet.data, target_addr).await;
                         }
                     }
                 } else {
@@ -525,7 +533,7 @@ impl Pipeline {
                 let mut interval = std::time::Instant::now();
                 loop {
                     // Check shutdown flag first
-                    if !*running_periodic.lock() {
+                    if !running_periodic.load(Ordering::Relaxed) {
                         break;
                     }
 
@@ -543,7 +551,7 @@ impl Pipeline {
             })?;
 
         // Keep the runtime alive - wait until shutdown is requested
-        while *self.running.lock() {
+        while self.running.load(Ordering::Relaxed) {
             tokio::task::yield_now().await;
         }
 
@@ -551,7 +559,7 @@ impl Pipeline {
     }
 
     pub async fn shutdown(&self) {
-        *self.running.lock() = false;
+        self.running.store(false, Ordering::Relaxed);
     }
 }
 

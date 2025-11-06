@@ -1,11 +1,10 @@
 use crate::drr_scheduler::Packet;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use parking_lot::Mutex;
 use std::sync::Arc;
 
 pub struct Queue {
     sender: Sender<Packet>,
-    receiver: Arc<Mutex<Receiver<Packet>>>,
+    receiver: Arc<Receiver<Packet>>, // crossbeam Receiver is already thread-safe, no mutex needed
     capacity: usize,
 }
 
@@ -15,7 +14,7 @@ impl Queue {
         let (tx, rx) = bounded(capacity);
         Self {
             sender: tx,
-            receiver: Arc::new(Mutex::new(rx)),
+            receiver: Arc::new(rx), // No mutex needed - crossbeam Receiver is thread-safe
             capacity,
         }
     }
@@ -24,7 +23,7 @@ impl Queue {
         self.sender.clone()
     }
 
-    pub fn receiver(&self) -> Arc<Mutex<Receiver<Packet>>> {
+    pub fn receiver(&self) -> Arc<Receiver<Packet>> {
         self.receiver.clone()
     }
 
@@ -34,22 +33,22 @@ impl Queue {
     }
 
     pub fn try_recv(&self) -> Result<Packet, crossbeam_channel::TryRecvError> {
-        self.receiver.lock().try_recv()
+        self.receiver.try_recv() // Direct call - no mutex needed
     }
 
     #[allow(dead_code)]
     pub fn recv(&self) -> Result<Packet, crossbeam_channel::RecvError> {
-        self.receiver.lock().recv()
+        self.receiver.recv() // Direct call - no mutex needed
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.receiver.lock().is_empty()
+        self.receiver.is_empty() // Direct call - no mutex needed
     }
 
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.receiver.lock().len()
+        self.receiver.len() // Direct call - no mutex needed
     }
 
     pub fn capacity(&self) -> usize {
@@ -57,7 +56,7 @@ impl Queue {
     }
 
     pub fn occupancy(&self) -> usize {
-        self.receiver.lock().len()
+        self.receiver.len() // Direct call - no mutex needed
     }
 
     pub fn occupancy_percent(&self) -> f64 {

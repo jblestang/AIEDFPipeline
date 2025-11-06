@@ -35,12 +35,12 @@ impl Eq for EDFTask {}
 
 pub struct EDFScheduler {
     tasks: Arc<Mutex<BinaryHeap<EDFTask>>>,
-    input_rx: Arc<Mutex<Receiver<Packet>>>,
+    input_rx: Arc<Receiver<Packet>>, // crossbeam Receiver is thread-safe, no mutex needed
     output_tx: Sender<Packet>,
 }
 
 impl EDFScheduler {
-    pub fn new(input_rx: Arc<Mutex<Receiver<Packet>>>, output_tx: Sender<Packet>) -> Self {
+    pub fn new(input_rx: Arc<Receiver<Packet>>, output_tx: Sender<Packet>) -> Self {
         Self {
             tasks: Arc::new(Mutex::new(BinaryHeap::new())),
             input_rx,
@@ -64,32 +64,37 @@ impl EDFScheduler {
     pub fn process_next(&self) -> Option<Packet> {
         const MAX_HEAP_SIZE: usize = 1000; // Limit heap size to prevent unbounded growth
         
-        // Collect all incoming packets first
-        let rx_guard = self.input_rx.lock();
-        let mut tasks = self.tasks.lock();
-        
-        while let Ok(packet) = rx_guard.try_recv() {
+        // Collect all incoming packets first (no lock needed - crossbeam Receiver is thread-safe)
+        // This reduces lock duration by batching all packet additions
+        let mut incoming_tasks = Vec::new();
+        while let Ok(packet) = self.input_rx.try_recv() {
             let deadline = packet.timestamp + packet.latency_budget;
-            let task = EDFTask { packet, deadline };
-            
-            // Limit heap size - drop lowest priority packets if full
-            // This prevents unbounded growth that causes increasing latency
-            if tasks.len() >= MAX_HEAP_SIZE {
-                // Drop the task with the latest deadline (lowest priority in min-heap)
-                // This is more efficient than rebuilding the heap
-                let _ = tasks.pop();
-            }
-            
-            tasks.push(task);
+            incoming_tasks.push(EDFTask { packet, deadline });
         }
-        drop(rx_guard);
+        
+        // Now lock the heap once and add all collected packets
+        if !incoming_tasks.is_empty() {
+            let mut tasks = self.tasks.lock();
+            for task in incoming_tasks {
+                // Limit heap size - drop lowest priority packets if full
+                // This prevents unbounded growth that causes increasing latency
+                if tasks.len() >= MAX_HEAP_SIZE {
+                    // Drop the task with the latest deadline (lowest priority in min-heap)
+                    // This is more efficient than rebuilding the heap
+                    let _ = tasks.pop();
+                }
+                tasks.push(task);
+            }
+        }
 
         // Process the task with earliest deadline
+        let mut tasks = self.tasks.lock();
         if let Some(task) = tasks.pop() {
             // Check if deadline has passed
             if task.deadline < Instant::now() {
                 // Deadline missed, but still process
             }
+            drop(tasks); // Release lock before returning
             Some(task.packet)
         } else {
             None
@@ -106,7 +111,7 @@ impl EDFScheduler {
 
     #[allow(dead_code)]
     pub fn has_tasks(&self) -> bool {
-        !self.tasks.lock().is_empty() || !self.input_rx.lock().is_empty()
+        !self.tasks.lock().is_empty() || !self.input_rx.is_empty()
     }
 }
 
@@ -119,9 +124,8 @@ mod tests {
     fn test_edf_scheduler_creation() {
         let (_tx1, rx1) = unbounded();
         let (tx2, _rx2) = unbounded();
-        use parking_lot::Mutex;
         use std::sync::Arc;
-        let scheduler = EDFScheduler::new(Arc::new(Mutex::new(rx1)), tx2);
+        let scheduler = EDFScheduler::new(Arc::new(rx1), tx2);
         assert!(scheduler.tasks.lock().is_empty());
     }
 
@@ -129,10 +133,9 @@ mod tests {
     fn test_edf_ordering() {
         let (tx1, rx1) = unbounded();
         let (tx2, rx2) = unbounded();
-        use parking_lot::Mutex;
         use std::sync::Arc;
         use std::time::Duration;
-        let scheduler = EDFScheduler::new(Arc::new(Mutex::new(rx1)), tx2);
+        let scheduler = EDFScheduler::new(Arc::new(rx1), tx2);
 
         let now = Instant::now();
 
