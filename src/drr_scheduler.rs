@@ -108,6 +108,12 @@ impl DRRScheduler {
                     // Add non-Flow1 packets to buffer for later processing
                     let mut buffer = self.packet_buffer.lock();
                     buffer.extend(temp_packets);
+                    // Limit buffer size to prevent unbounded growth (drop oldest if needed)
+                    const MAX_BUFFER_SIZE: usize = 1000;
+                    let buffer_len = buffer.len();
+                    if buffer_len > MAX_BUFFER_SIZE {
+                        buffer.drain(0..(buffer_len - MAX_BUFFER_SIZE));
+                    }
                     drop(buffer);
                     drop(rx_guard);
                     
@@ -126,6 +132,12 @@ impl DRRScheduler {
                 if !temp_packets.is_empty() {
                     let mut buffer = self.packet_buffer.lock();
                     buffer.extend(temp_packets);
+                    // Limit buffer size to prevent unbounded growth (drop oldest if needed)
+                    const MAX_BUFFER_SIZE: usize = 1000;
+                    let buffer_len = buffer.len();
+                    if buffer_len > MAX_BUFFER_SIZE {
+                        buffer.drain(0..(buffer_len - MAX_BUFFER_SIZE));
+                    }
                 }
             }
         }

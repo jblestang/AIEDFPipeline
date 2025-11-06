@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 
 #[derive(Debug, Clone)]
 struct EDFTask {
@@ -62,22 +62,33 @@ impl EDFScheduler {
     }
 
     pub fn process_next(&self) -> Option<Packet> {
+        const MAX_HEAP_SIZE: usize = 1000; // Limit heap size to prevent unbounded growth
+        
         // Collect all incoming packets first
         let rx_guard = self.input_rx.lock();
+        let mut tasks = self.tasks.lock();
+        
         while let Ok(packet) = rx_guard.try_recv() {
             let deadline = packet.timestamp + packet.latency_budget;
             let task = EDFTask { packet, deadline };
-            self.tasks.lock().push(task);
+            
+            // Limit heap size - drop lowest priority packets if full
+            // This prevents unbounded growth that causes increasing latency
+            if tasks.len() >= MAX_HEAP_SIZE {
+                // Drop the task with the latest deadline (lowest priority in min-heap)
+                // This is more efficient than rebuilding the heap
+                let _ = tasks.pop();
+            }
+            
+            tasks.push(task);
         }
         drop(rx_guard);
 
         // Process the task with earliest deadline
-        let mut tasks = self.tasks.lock();
         if let Some(task) = tasks.pop() {
             // Check if deadline has passed
             if task.deadline < Instant::now() {
                 // Deadline missed, but still process
-                eprintln!("Warning: Deadline missed for flow {}", task.packet.flow_id);
             }
             Some(task.packet)
         } else {

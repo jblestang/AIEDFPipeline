@@ -2,7 +2,7 @@ use crate::metrics::MetricsSnapshot;
 use crossbeam_channel::Receiver;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -26,7 +26,7 @@ struct StatisticsPoint {
 #[derive(Clone)]
 struct FlowStatistics {
     start_time: Instant,
-    points: Vec<StatisticsPoint>,
+    points: VecDeque<StatisticsPoint>, // Use VecDeque for O(1) pop_front
     max_points: usize,
     last_point_time: f64, // Track last point time to avoid duplicates
 }
@@ -70,8 +70,8 @@ fn update_ui(
                 .entry(*flow_id)
                 .or_insert_with(|| FlowStatistics {
                     start_time: now, // Only set start_time when flow is first created
-                    points: Vec::new(),
-                    max_points: 10000,     // Keep last 10000 points
+                    points: VecDeque::with_capacity(1000),
+                    max_points: 1000,     // Keep last 1000 points (reduced to limit memory usage)
                     last_point_time: -1.0, // Initialize to -1 to always add first point
                 });
 
@@ -95,14 +95,14 @@ fn update_ui(
             // Only add if this is a new point (different time) or if it's the first point
             // This prevents duplicate points at the same timestamp
             if flow_stats.points.is_empty()
-                || (flow_stats.points.last().map(|p| p.time).unwrap_or(-1.0) < elapsed - 0.05)
+                || (flow_stats.points.back().map(|p| p.time).unwrap_or(-1.0) < elapsed - 0.05)
             {
-                flow_stats.points.push(point);
+                flow_stats.points.push_back(point);
                 flow_stats.last_point_time = elapsed;
 
-                // Keep only the last max_points points (FIFO - remove oldest)
+                // Keep only the last max_points points (FIFO - pop_front is O(1))
                 if flow_stats.points.len() > flow_stats.max_points {
-                    flow_stats.points.remove(0);
+                    flow_stats.points.pop_front();
                 }
             }
         }
@@ -265,7 +265,7 @@ fn update_ui(
                         // Expected max latency line
                         let expected_max_ms =
                             metrics.max_latency.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0;
-                        let time_range = if let Some(last) = flow_stats.points.last() {
+                        let time_range = if let Some(last) = flow_stats.points.back() {
                             last.time.max(1.0) // At least 1 second for initial view
                         } else {
                             1.0
@@ -447,7 +447,7 @@ pub fn run_gui_client(server_addr: &str, shutdown_flag: Arc<AtomicBool>) {
                                                 // Update statistics history
                                                 let flow_stats = stats_guard.entry(k).or_insert_with(|| FlowStatistics {
                                                     start_time: now, // Only set start_time when flow is first created
-                                                    points: Vec::new(),
+                                                    points: VecDeque::with_capacity(1000),
                                                     max_points: 10000, // Keep last 10000 points
                                                     last_point_time: -1.0, // Initialize to -1 to always add first point
                                                 });
@@ -472,13 +472,13 @@ pub fn run_gui_client(server_addr: &str, shutdown_flag: Arc<AtomicBool>) {
                                                 // Only add if this is a new point (different time) or if it's the first point
                                                 // This prevents duplicate points at the same timestamp
                                                 if flow_stats.points.is_empty() || 
-                                                   (flow_stats.points.last().map(|p| p.time).unwrap_or(-1.0) < elapsed - 0.05) {
-                                                    flow_stats.points.push(point);
+                                                   (flow_stats.points.back().map(|p| p.time).unwrap_or(-1.0) < elapsed - 0.05) {
+                                                    flow_stats.points.push_back(point);
                                                     flow_stats.last_point_time = elapsed;
                                                     
                                                     // Keep only the last max_points points (FIFO - remove oldest)
                                                     if flow_stats.points.len() > flow_stats.max_points {
-                                                        flow_stats.points.remove(0);
+                                                        flow_stats.points.pop_front();
                                                     }
                                                 }
                                             }
@@ -680,7 +680,7 @@ fn update_ui_client(
 
                         // Expected max latency line
                         let expected_max_ms = metrics.expected_max_latency.as_secs_f64() * 1000.0;
-                        let time_range = if let Some(last) = flow_stats.points.last() {
+                        let time_range = if let Some(last) = flow_stats.points.back() {
                             last.time.max(1.0) // At least 1 second for initial view
                         } else {
                             1.0

@@ -1,5 +1,7 @@
 use crossbeam_channel::{self, Sender};
 use parking_lot::Mutex;
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,10 +9,16 @@ use std::time::{Duration, Instant};
 pub struct Metrics {
     pub flow_id: u64,
     pub packet_count: u64,
-    pub latencies: Vec<f64>, // Store latencies in microseconds for better precision
+    pub latencies: VecDeque<f64>, // Store latencies in microseconds for better precision (VecDeque for O(1) pop_front)
     pub deadline_misses: u64,
     pub last_update: Instant,
     pub max_history: usize, // Maximum number of latency samples to keep
+    // Cached statistics to avoid expensive recalculations (using RefCell for interior mutability)
+    cached_p50: RefCell<Option<Duration>>,
+    cached_p95: RefCell<Option<Duration>>,
+    cached_p99: RefCell<Option<Duration>>,
+    cached_p999: RefCell<Option<Duration>>,
+    cached_packet_count: RefCell<u64>, // Track when to invalidate cache
 }
 
 impl Default for Metrics {
@@ -18,10 +26,15 @@ impl Default for Metrics {
         Self {
             flow_id: 0,
             packet_count: 0,
-            latencies: Vec::new(),
+            latencies: VecDeque::with_capacity(1000),
             deadline_misses: 0,
             last_update: Instant::now(),
-            max_history: 10000, // Keep last 10k samples
+            max_history: 1000, // Keep last 1k samples (reduced to limit memory usage)
+            cached_p50: RefCell::new(None),
+            cached_p95: RefCell::new(None),
+            cached_p99: RefCell::new(None),
+            cached_p999: RefCell::new(None),
+            cached_packet_count: RefCell::new(0),
         }
     }
 }
@@ -31,10 +44,15 @@ impl Metrics {
         Self {
             flow_id,
             packet_count: 0,
-            latencies: Vec::new(),
+            latencies: VecDeque::with_capacity(1000),
             deadline_misses: 0,
             last_update: Instant::now(),
-            max_history: 10000,
+            max_history: 1000,
+            cached_p50: RefCell::new(None),
+            cached_p95: RefCell::new(None),
+            cached_p99: RefCell::new(None),
+            cached_p999: RefCell::new(None),
+            cached_packet_count: RefCell::new(0),
         }
     }
 
@@ -43,18 +61,55 @@ impl Metrics {
 
         // Store latency in microseconds for better precision
         let latency_us = latency.as_secs_f64() * 1_000_000.0;
-        self.latencies.push(latency_us);
+        self.latencies.push_back(latency_us);
 
-        // Limit history size
+        // Limit history size - use pop_front for O(1) operation
         if self.latencies.len() > self.max_history {
-            self.latencies.remove(0);
+            self.latencies.pop_front();
         }
+
+        // Invalidate cache when new data arrives
+        *self.cached_p50.borrow_mut() = None;
+        *self.cached_p95.borrow_mut() = None;
+        *self.cached_p99.borrow_mut() = None;
+        *self.cached_p999.borrow_mut() = None;
 
         if deadline_missed {
             self.deadline_misses += 1;
         }
 
         self.last_update = Instant::now();
+    }
+    
+    // Compute all percentiles at once and cache them (more efficient than computing individually)
+    fn compute_and_cache_percentiles(&self) {
+        let cached_count = *self.cached_packet_count.borrow();
+        
+        // Only recompute if cache is invalid
+        if cached_count != self.packet_count {
+            if self.latencies.is_empty() {
+                *self.cached_p50.borrow_mut() = None;
+                *self.cached_p95.borrow_mut() = None;
+                *self.cached_p99.borrow_mut() = None;
+                *self.cached_p999.borrow_mut() = None;
+            } else {
+                // Sort once and compute all percentiles
+                let mut sorted: Vec<f64> = self.latencies.iter().copied().collect();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                
+                let len = sorted.len();
+                let p50_idx = ((len as f64 * 50.0 / 100.0).ceil() as usize - 1).min(len - 1);
+                let p95_idx = ((len as f64 * 95.0 / 100.0).ceil() as usize - 1).min(len - 1);
+                let p99_idx = ((len as f64 * 99.0 / 100.0).ceil() as usize - 1).min(len - 1);
+                let p999_idx = ((len as f64 * 99.9 / 100.0).ceil() as usize - 1).min(len - 1);
+                
+                *self.cached_p50.borrow_mut() = Some(Duration::from_secs_f64(sorted[p50_idx] / 1_000_000.0));
+                *self.cached_p95.borrow_mut() = Some(Duration::from_secs_f64(sorted[p95_idx] / 1_000_000.0));
+                *self.cached_p99.borrow_mut() = Some(Duration::from_secs_f64(sorted[p99_idx] / 1_000_000.0));
+                *self.cached_p999.borrow_mut() = Some(Duration::from_secs_f64(sorted[p999_idx] / 1_000_000.0));
+            }
+            *self.cached_packet_count.borrow_mut() = self.packet_count;
+        }
     }
 
     pub fn average_latency(&self) -> Duration {
@@ -102,39 +157,52 @@ impl Metrics {
 
     #[allow(dead_code)]
     pub fn get_latency_history(&self) -> Vec<f64> {
-        self.latencies.clone()
+        self.latencies.iter().copied().collect()
     }
 
     pub fn get_recent_latencies(&self, count: usize) -> Vec<f64> {
         let start = self.latencies.len().saturating_sub(count);
-        self.latencies[start..].to_vec()
+        self.latencies.range(start..).copied().collect()
     }
 
     pub fn percentile(&self, percentile: f64) -> Option<Duration> {
-        if self.latencies.is_empty() {
-            return None;
+        // For common percentiles, use cache; otherwise compute on demand
+        match percentile {
+            50.0 => self.p50(),
+            95.0 => self.p95(),
+            99.0 => self.p99(),
+            99.9 => self.p999(),
+            _ => {
+                if self.latencies.is_empty() {
+                    return None;
+                }
+                let mut sorted: Vec<f64> = self.latencies.iter().copied().collect();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let index = (sorted.len() as f64 * percentile / 100.0).ceil() as usize - 1;
+                let index = index.min(sorted.len() - 1);
+                Some(Duration::from_secs_f64(sorted[index] / 1_000_000.0))
+            }
         }
-        let mut sorted = self.latencies.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let index = (sorted.len() as f64 * percentile / 100.0).ceil() as usize - 1;
-        let index = index.min(sorted.len() - 1);
-        Some(Duration::from_secs_f64(sorted[index] / 1_000_000.0))
     }
 
     pub fn p50(&self) -> Option<Duration> {
-        self.percentile(50.0)
+        self.compute_and_cache_percentiles();
+        *self.cached_p50.borrow()
     }
 
     pub fn p95(&self) -> Option<Duration> {
-        self.percentile(95.0)
+        self.compute_and_cache_percentiles();
+        *self.cached_p95.borrow()
     }
 
     pub fn p99(&self) -> Option<Duration> {
-        self.percentile(99.0)
+        self.compute_and_cache_percentiles();
+        *self.cached_p99.borrow()
     }
 
     pub fn p999(&self) -> Option<Duration> {
-        self.percentile(99.9)
+        self.compute_and_cache_percentiles();
+        *self.cached_p999.borrow()
     }
 }
 
@@ -143,10 +211,15 @@ impl Clone for Metrics {
         Self {
             flow_id: self.flow_id,
             packet_count: self.packet_count,
-            latencies: self.latencies.clone(),
+            latencies: self.latencies.iter().copied().collect(),
             deadline_misses: self.deadline_misses,
             last_update: self.last_update,
             max_history: self.max_history,
+            cached_p50: RefCell::new(None),
+            cached_p95: RefCell::new(None),
+            cached_p99: RefCell::new(None),
+            cached_p999: RefCell::new(None),
+            cached_packet_count: RefCell::new(0),
         }
     }
 }
