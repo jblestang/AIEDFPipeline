@@ -42,7 +42,12 @@ impl EgressDRRScheduler {
         running: Arc<std::sync::atomic::AtomicBool>,
         metrics_collector: Arc<crate::metrics::MetricsCollector>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let output_sockets = self.output_sockets.clone();
+        // OPTIMIZATION: Clone socket map once at start to avoid lock per packet
+        let socket_map: HashMap<u64, (Arc<UdpSocket>, SocketAddr)> = {
+            let sockets = self.output_sockets.lock();
+            sockets.clone()
+        };
+        
         let high_rx = self.high_priority_rx.clone();
         let medium_rx = self.medium_priority_rx.clone();
         let low_rx = self.low_priority_rx.clone();
@@ -68,13 +73,9 @@ impl EgressDRRScheduler {
                         packet.latency_budget,
                     );
 
-                    // Route to appropriate output socket based on flow_id
-                    let socket_opt = {
-                        let sockets = output_sockets.lock();
-                        sockets.get(&packet.flow_id).map(|(s, a)| (s.clone(), *a))
-                    };
-                    if let Some((socket, target_addr)) = socket_opt {
-                        let _ = socket.send_to(&packet.data, target_addr).await;
+                    // Route to appropriate output socket based on flow_id (no lock needed)
+                    if let Some((socket, target_addr)) = socket_map.get(&packet.flow_id) {
+                        let _ = socket.send_to(&packet.data, *target_addr).await;
                     }
                 } else {
                     // No packets available - yield to other tasks

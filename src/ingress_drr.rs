@@ -15,20 +15,27 @@ struct FlowState {
     latency_budget: Duration,
 }
 
+/// Combined state for Ingress DRR to reduce lock acquisitions
+#[derive(Debug)]
+struct IngressDRRState {
+    // Socket configurations: flow_id -> SocketConfig (HashMap for O(1) lookup)
+    socket_configs: HashMap<u64, SocketConfig>,
+    // DRR state: flow_id -> FlowState
+    flow_states: HashMap<u64, FlowState>,
+    // Active flows list for round-robin
+    active_flows: Vec<u64>,
+    // Current flow index for round-robin
+    current_flow_index: usize,
+}
+
 /// Ingress DRR Scheduler - Reads from UDP sockets using DRR scheduling and routes to priority queues
 pub struct IngressDRRScheduler {
     // Three priority queues for EDF input
     high_priority_tx: crossbeam_channel::Sender<Packet>,
     medium_priority_tx: crossbeam_channel::Sender<Packet>,
     low_priority_tx: crossbeam_channel::Sender<Packet>,
-    // Socket configurations with priority mapping
-    socket_configs: Arc<Mutex<Vec<SocketConfig>>>,
-    // DRR state: flow_id -> FlowState
-    flow_states: Arc<Mutex<HashMap<u64, FlowState>>>,
-    // Active flows list for round-robin
-    active_flows: Arc<Mutex<Vec<u64>>>,
-    // Current flow index for round-robin
-    current_flow_index: Arc<Mutex<usize>>,
+    // OPTIMIZATION: Single mutex for all state to reduce lock acquisitions
+    state: Arc<Mutex<IngressDRRState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,10 +57,12 @@ impl IngressDRRScheduler {
             high_priority_tx,
             medium_priority_tx,
             low_priority_tx,
-            socket_configs: Arc::new(Mutex::new(Vec::new())),
-            flow_states: Arc::new(Mutex::new(HashMap::new())),
-            active_flows: Arc::new(Mutex::new(Vec::new())),
-            current_flow_index: Arc::new(Mutex::new(0)),
+            state: Arc::new(Mutex::new(IngressDRRState {
+                socket_configs: HashMap::new(),
+                flow_states: HashMap::new(),
+                active_flows: Vec::new(),
+                current_flow_index: 0,
+            })),
         }
     }
 
@@ -72,11 +81,11 @@ impl IngressDRRScheduler {
             latency_budget,
             quantum,
         };
-        self.socket_configs.lock().push(config.clone());
-
-        // Initialize flow state for DRR
-        let mut flow_states = self.flow_states.lock();
-        flow_states.insert(
+        
+        // OPTIMIZATION: Single lock acquisition for all state updates
+        let mut state = self.state.lock();
+        state.socket_configs.insert(flow_id, config);
+        state.flow_states.insert(
             flow_id,
             FlowState {
                 flow_id,
@@ -86,11 +95,8 @@ impl IngressDRRScheduler {
                 latency_budget,
             },
         );
-        drop(flow_states);
-
-        let mut active_flows = self.active_flows.lock();
-        if !active_flows.contains(&flow_id) {
-            active_flows.push(flow_id);
+        if !state.active_flows.contains(&flow_id) {
+            state.active_flows.push(flow_id);
         }
     }
 
@@ -100,16 +106,32 @@ impl IngressDRRScheduler {
         running: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         while running.load(std::sync::atomic::Ordering::Relaxed) {
-            let active_flows = self.active_flows.lock().clone();
-            drop(self.active_flows.lock());
-
+            // OPTIMIZATION: Single lock acquisition to get all needed state
+            let (active_flows, current_index, socket_configs_snapshot) = {
+                let state = self.state.lock();
+                let is_empty = state.active_flows.is_empty();
+                let active_flows = if is_empty {
+                    Vec::new()
+                } else {
+                    state.active_flows.clone()
+                };
+                let current_index = state.current_flow_index;
+                // Create snapshot of socket configs (only socket, priority, latency_budget)
+                let socket_configs_snapshot: HashMap<u64, (Arc<StdUdpSocket>, Priority, Duration)> = state
+                    .socket_configs
+                    .iter()
+                    .map(|(id, config)| (*id, (config.socket.clone(), config.priority, config.latency_budget)))
+                    .collect();
+                drop(state); // Explicitly drop before await
+                (active_flows, current_index, socket_configs_snapshot)
+            };
+            
             if active_flows.is_empty() {
                 tokio::task::yield_now().await;
                 continue;
             }
 
-            // Get current flow index and iterate through active flows
-            let mut current_index = *self.current_flow_index.lock();
+            let mut current_index = current_index;
             let mut packets_read = 0;
             let max_iterations = active_flows.len();
 
@@ -121,82 +143,77 @@ impl IngressDRRScheduler {
                 let flow_id = active_flows[current_index];
                 current_index = (current_index + 1) % active_flows.len();
 
-                // Get socket config
-                let (socket, priority, latency_budget) = {
-                    let socket_configs = self.socket_configs.lock();
-                    let config = match socket_configs.iter().find(|c| c.flow_id == flow_id) {
-                        Some(c) => c,
-                        None => continue,
-                    };
-                    (
-                        config.socket.clone(),
-                        config.priority,
-                        config.latency_budget,
-                    )
-                };
-
-                // Update deficit: add quantum
-                let mut flow_states = self.flow_states.lock();
-                let flow = match flow_states.get_mut(&flow_id) {
-                    Some(f) => f,
+                // Get socket config from snapshot (no lock needed)
+                let (socket, priority, latency_budget) = match socket_configs_snapshot.get(&flow_id) {
+                    Some((s, p, l)) => (s.clone(), *p, *l),
                     None => continue,
                 };
-                flow.deficit += flow.quantum;
 
-                // Check if we can read a packet (deficit >= 1)
-                if flow.deficit >= 1 {
-                    drop(flow_states);
+                // OPTIMIZATION: Single lock acquisition for deficit update and packet read
+                let mut local_buf = [0u8; 1024];
+                let packet_result = {
+                    let mut state = self.state.lock();
+                    let flow = match state.flow_states.get_mut(&flow_id) {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    
+                    // Update deficit: add quantum
+                    flow.deficit += flow.quantum;
 
-                    // Try to read from socket (non-blocking)
-                    let mut local_buf = [0u8; 1024];
-                    match socket.recv_from(&mut local_buf) {
-                        Ok((size, _addr)) => {
-                            if size > 0 {
-                                // Decrement deficit by 1 (packet count)
-                                let mut flow_states = self.flow_states.lock();
-                                if let Some(flow) = flow_states.get_mut(&flow_id) {
+                    // Check if we can read a packet (deficit >= 1)
+                    if flow.deficit >= 1 {
+                        // Release lock before socket read (non-blocking)
+                        drop(state);
+                        
+                        // Try to read from socket (non-blocking)
+                        match socket.recv_from(&mut local_buf) {
+                            Ok((size, _addr)) if size > 0 => {
+                                // Re-acquire lock to update deficit
+                                let mut state = self.state.lock();
+                                if let Some(flow) = state.flow_states.get_mut(&flow_id) {
                                     flow.deficit -= 1;
                                 }
-                                drop(flow_states);
-
+                                drop(state);
+                                
                                 // Create packet
                                 let data = Vec::from(&local_buf[..size]);
-                                let packet = Packet {
+                                Some(Packet {
                                     flow_id,
                                     data,
                                     timestamp: Instant::now(),
                                     latency_budget,
                                     priority,
-                                };
-
-                                // Route to appropriate priority queue
-                                let tx = match priority {
-                                    Priority::HIGH => &self.high_priority_tx,
-                                    Priority::MEDIUM => &self.medium_priority_tx,
-                                    Priority::LOW => &self.low_priority_tx,
-                                };
-
-                                if tx.try_send(packet).is_err() {
-                                    // Queue full - packet dropped
-                                }
-
-                                packets_read += 1;
+                                })
                             }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+                            Err(_) => None,
+                            _ => None,
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // No packet available, continue to next flow
-                        }
-                        Err(_) => {
-                            // Socket error, continue to next flow
-                        }
+                    } else {
+                        None
                     }
-                } else {
-                    drop(flow_states);
+                };
+
+                if let Some(packet) = packet_result {
+                    // Route to appropriate priority queue (no lock needed)
+                    let tx = match priority {
+                        Priority::HIGH => &self.high_priority_tx,
+                        Priority::MEDIUM => &self.medium_priority_tx,
+                        Priority::LOW => &self.low_priority_tx,
+                    };
+
+                    if tx.try_send(packet).is_ok() {
+                        packets_read += 1;
+                    }
                 }
             }
 
-            // Update current flow index
-            *self.current_flow_index.lock() = current_index;
+            // OPTIMIZATION: Single lock acquisition to update current index
+            {
+                let mut state = self.state.lock();
+                state.current_flow_index = current_index;
+            }
 
             // If no packets were read, yield to avoid busy-waiting
             if packets_read == 0 {

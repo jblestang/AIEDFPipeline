@@ -83,13 +83,15 @@ impl EDFScheduler {
 
         // Smart k-way merge: buffer first element from each queue, compare without removing,
         // then only remove the chosen one
+        // OPTIMIZATION: Collect packets from channels first (without lock), then lock once
         let mut high_next: Option<EDFTask> = None;
         let mut medium_next: Option<EDFTask> = None;
         let mut low_next: Option<EDFTask> = None;
 
-        let mut tasks = self.tasks.lock();
-
-        // K-way merge: repeatedly compare the three first elements and insert only the earliest
+        // Collect all incoming packets from channels first (no lock needed)
+        let mut tasks_to_insert = Vec::new();
+        
+        // K-way merge: repeatedly compare the three first elements and collect tasks to insert
         loop {
             // Refill buffers only if they are empty (don't remove from channel until we choose)
             if high_next.is_none() {
@@ -143,7 +145,7 @@ impl EDFScheduler {
                 break;
             }
 
-            // Now remove the chosen task from buffer and insert into heap
+            // Remove the chosen task from buffer and add to insertion list
             let task = match earliest_queue {
                 0 => high_next.take().unwrap(),
                 1 => medium_next.take().unwrap(),
@@ -151,20 +153,24 @@ impl EDFScheduler {
                 _ => unreachable!(),
             };
 
+            tasks_to_insert.push(task);
+            // Buffer for this queue is now empty, will be refilled in next iteration
+        }
+
+        // OPTIMIZATION: Lock once to insert all collected tasks and process next packet
+        let mut tasks = self.tasks.lock();
+        
+        // Insert all collected tasks
+        for task in tasks_to_insert {
             // Limit heap size - drop lowest priority packets if full
             if tasks.len() >= MAX_HEAP_SIZE {
                 // Drop the task with the latest deadline (lowest priority in min-heap)
                 let _ = tasks.pop();
             }
-
             tasks.push(task);
-            // Buffer for this queue is now empty, will be refilled in next iteration
         }
 
-        drop(tasks);
-
-        // Process the task with earliest deadline
-        let mut tasks = self.tasks.lock();
+        // Process the task with earliest deadline (same lock acquisition)
         if let Some(task) = tasks.pop() {
             // Check if deadline has passed
             if task.deadline < Instant::now() {
