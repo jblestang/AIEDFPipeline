@@ -2,6 +2,8 @@
 
 mod drr_scheduler;
 mod edf_scheduler;
+mod egress_drr;
+mod ingress_drr;
 mod metrics;
 mod pipeline;
 mod queue;

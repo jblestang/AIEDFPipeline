@@ -1,16 +1,15 @@
 use crossbeam_channel::{unbounded, Receiver};
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 
-use crate::drr_scheduler::{DRRScheduler, Packet};
 use crate::edf_scheduler::EDFScheduler;
+use crate::egress_drr::EgressDRRScheduler;
+use crate::ingress_drr::IngressDRRScheduler;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
-use crate::queue::Queue;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone)]
@@ -34,11 +33,9 @@ impl Pipeline {
 }
 
 pub struct Pipeline {
-    input_drr: Arc<DRRScheduler>,
+    ingress_drr: Arc<IngressDRRScheduler>,
     edf: Arc<EDFScheduler>,
-    output_drr: Arc<DRRScheduler>,
-    queue1: Arc<Queue>,
-    queue2: Arc<Queue>,
+    egress_drr: Arc<EgressDRRScheduler>,
     metrics_collector: Arc<MetricsCollector>,
     metrics_receiver: Receiver<std::collections::HashMap<u64, MetricsSnapshot>>,
     running: Arc<AtomicBool>, // Use AtomicBool instead of Mutex for lock-free reads
@@ -95,41 +92,52 @@ impl Pipeline {
             },
         ];
 
-        // Create queues
-        // Flow: UDP Input → Input DRR → Queue1 → EDF → Queue2 → Output DRR → UDP Output
-        // (Queue3 removed - Output DRR now sends directly to UDP)
-        let queue1 = Arc::new(Queue::new());
-        let queue2 = Arc::new(Queue::new());
+        // Create priority queues for EDF input (from IngressDRRScheduler)
+        let (high_priority_input_tx, high_priority_input_rx) = crossbeam_channel::bounded(128);
+        let (medium_priority_input_tx, medium_priority_input_rx) = crossbeam_channel::bounded(128);
+        let (low_priority_input_tx, low_priority_input_rx) = crossbeam_channel::bounded(128);
 
-        // Create input DRR scheduler
-        // Input DRR: receives packets from UDP sockets, schedules via DRR, outputs to queue1
-        let (input_drr_tx, input_drr_rx) = unbounded();
-        let input_drr = Arc::new(DRRScheduler::new(input_drr_tx));
-        input_drr.set_receiver(input_drr_rx);
+        // Create priority queues for EDF output (to EgressDRRScheduler)
+        let (high_priority_output_tx, high_priority_output_rx) = crossbeam_channel::bounded(128);
+        let (medium_priority_output_tx, medium_priority_output_rx) =
+            crossbeam_channel::bounded(128);
+        let (low_priority_output_tx, low_priority_output_rx) = crossbeam_channel::bounded(128);
 
-        // Create output DRR scheduler
-        // Output DRR: receives packets from queue2, schedules via DRR, sends directly to UDP
-        let (output_drr_tx, output_drr_rx) = unbounded();
-        let output_drr = Arc::new(DRRScheduler::new(output_drr_tx));
-        output_drr.set_receiver(output_drr_rx);
+        // Create IngressDRRScheduler (reads from UDP sockets, routes to priority queues)
+        let ingress_drr = Arc::new(IngressDRRScheduler::new(
+            high_priority_input_tx,
+            medium_priority_input_tx,
+            low_priority_input_tx,
+        ));
 
-        // Create EDF scheduler (input from queue1, output to queue2)
-        let edf = Arc::new(EDFScheduler::new(queue1.receiver(), queue2.sender()));
+        // Create EDF scheduler (input from 3 priority queues, output to 3 priority queues)
+        let edf = Arc::new(EDFScheduler::new(
+            Arc::new(high_priority_input_rx),
+            Arc::new(medium_priority_input_rx),
+            Arc::new(low_priority_input_rx),
+            high_priority_output_tx,
+            medium_priority_output_tx,
+            low_priority_output_tx,
+        ));
 
-        // Create metrics collector with queue references for occupancy tracking
+        // Create EgressDRRScheduler (reads from priority queues, writes to UDP sockets)
+        let egress_drr = Arc::new(EgressDRRScheduler::new(
+            high_priority_output_rx,
+            medium_priority_output_rx,
+            low_priority_output_rx,
+        ));
+
+        // Create metrics collector
         let (metrics_tx, metrics_rx) = unbounded();
         let metrics_collector = Arc::new(MetricsCollector::new(
-            metrics_tx,
-            Some(queue1.clone()),
-            Some(queue2.clone()),
+            metrics_tx, None, // No queue references for now
+            None,
         ));
 
         Ok(Self {
-            input_drr,
+            ingress_drr,
             edf,
-            output_drr,
-            queue1,
-            queue2,
+            egress_drr,
             metrics_collector,
             metrics_receiver: metrics_rx,
             running: Arc::new(AtomicBool::new(false)),
@@ -232,286 +240,65 @@ impl Pipeline {
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.running.store(true, Ordering::Relaxed);
 
-        // Create and bind input sockets
-        let mut input_socket_handles = Vec::new();
+        // Create and bind input sockets, add to IngressDRRScheduler
         for config in &self.input_sockets {
             let addr = format!("{}:{}", config.address, config.port);
-            let socket = Arc::new(UdpSocket::bind(&addr).await?);
-            input_socket_handles.push((socket, config.clone()));
-        }
+            let std_socket = std::net::UdpSocket::bind(&addr)?;
+            std_socket.set_nonblocking(true)?;
+            let socket = Arc::new(std_socket);
 
-        // Configure flows with different latencies and quantums based on socket configs
-        // Rebalance DRR quantums: different quantum values to ensure fair packet distribution
-        // Quantum ratios: Flow 1: 32768, Flow 2: 4096, Flow 3: 1024 (32:4:1 ratio)
-        // This compensates for flow 1's lower data rate and balances flow 2 vs flow 3
-        for config in &self.input_sockets {
+            // Determine quantum based on flow_id (same as before)
             let quantum = match config.flow_id {
-                1 => 32768, // Highest quantum for flow 1 (low data rate) to ensure fair treatment
+                1 => 32768, // Highest quantum for flow 1
                 2 => 4096,  // Medium quantum for flow 2
                 3 => 1024,  // Standard quantum for flow 3
                 _ => 1024,  // Default quantum for other flows
             };
-            self.input_drr
-                .add_flow(config.flow_id, quantum, config.latency_budget);
+
+            self.ingress_drr
+                .add_socket(socket, config.flow_id, config.latency_budget, quantum);
         }
 
+        // Create output sockets and add to EgressDRRScheduler
         for config in &self.output_sockets {
-            let quantum = match config.flow_id {
-                1 => 32768, // Highest quantum for flow 1 (low data rate) to ensure fair treatment
-                2 => 4096,  // Medium quantum for flow 2
-                3 => 1024,  // Standard quantum for flow 3
-                _ => 1024,  // Default quantum for other flows
-            };
-            self.output_drr
-                .add_flow(config.flow_id, quantum, config.latency_budget);
+            let addr = format!("{}:{}", config.address, config.port);
+            let socket_addr = addr.parse::<SocketAddr>()?;
+            let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+            self.egress_drr
+                .add_output_socket(config.flow_id, socket, socket_addr);
         }
 
-        // Create a map from flow_id to pre-computed SocketAddr for routing (avoids string formatting in hot path)
-        let output_socket_map: HashMap<u64, SocketAddr> = self
-            .output_sockets
-            .iter()
-            .filter_map(|config| {
-                format!("{}:{}", config.address, config.port)
-                    .parse::<SocketAddr>()
-                    .ok()
-                    .map(|addr| (config.flow_id, addr))
-            })
-            .collect();
-
-        // Spawn input handlers for each socket
-        // Flow 1 bypasses Input DRR and goes directly to queue1 for lowest latency
-        // Flow 2/3 go through Input DRR for fair scheduling
-        let queue1_clone_for_flow1 = self.queue1.clone();
-        for (socket, config) in input_socket_handles {
-            let socket_clone = socket.clone();
-            let input_drr_clone = self.input_drr.clone();
-            let running_clone = self.running.clone();
-            let latency_budget = config.latency_budget;
-            let flow_id = config.flow_id;
-            let queue1_for_flow1 = if flow_id == 1 {
-                Some(queue1_clone_for_flow1.clone())
-            } else {
-                None
-            };
-
-            let _handle = tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-
-                while running_clone.load(Ordering::Relaxed) {
-                    match socket_clone.recv_from(&mut buf).await {
-                        Ok((size, _addr)) => {
-                            if size == 0 {
-                                continue;
-                            }
-                            
-                            // Optimized allocation: Vec::from() allocates with exact capacity
-                            // This avoids overallocation that to_vec() might do in some cases
-                            // Note: Still requires allocation, but with optimal capacity
-                            let data = Vec::from(&buf[..size]);
-
-                            let packet = Packet {
-                                flow_id,
-                                data,
-                                timestamp: Instant::now(), // Record timestamp immediately when packet is received
-                                latency_budget,
-                            };
-
-                            // Flow 1 bypasses Input DRR and goes directly to queue1 for lowest latency
-                            if flow_id == 1 {
-                                if let Some(queue1) = queue1_for_flow1.as_ref() {
-                                    // Direct path for Flow 1 - bypass Input DRR entirely
-                                    match queue1.sender().try_send(packet) {
-                                        Ok(()) => {
-                                            // Successfully sent
-                                        }
-                                        Err(crossbeam_channel::TrySendError::Full(packet)) => {
-                                            // Queue is full - try to drop a Flow 2/3 packet to make room
-                                            if let Ok(old_packet) = queue1.try_recv() {
-                                                if old_packet.flow_id != 1 {
-                                                    // Drop the old packet and send Flow 1 packet
-                                                    let _ = queue1.sender().try_send(packet);
-                                                } else {
-                                                    // Old packet was also Flow 1, put it back
-                                                    let _ = queue1.sender().try_send(old_packet);
-                                                }
-                                            }
-                                            // If couldn't make room, Flow 1 packet is lost (shouldn't happen often)
-                                        }
-                                        Err(_) => {
-                                            // Channel disconnected, continue
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Flow 2/3 go through Input DRR for fair scheduling
-                                let _ = input_drr_clone.schedule_packet(packet);
-                            }
-                        }
-                        Err(_e) => {
-                            // Socket error - yield briefly
-                            tokio::task::yield_now().await;
-                        }
-                    }
-                }
-            });
-        }
-
-        // Start input DRR processing thread
-        // This thread processes packets from input DRR's internal channel and forwards to queue1
-        let input_drr_clone = self.input_drr.clone();
-        let queue1_clone = self.queue1.clone();
-        let running_input_drr = self.running.clone();
-
-        std::thread::Builder::new()
-            .name("Input-DRR".to_string())
-            .spawn(move || {
-                while running_input_drr.load(Ordering::Relaxed) {
-                    // Process packets from input DRR (DRR scheduling handles socket read priority)
-                    if let Some(packet) = input_drr_clone.process_next() {
-                        // Use try_send to avoid blocking on full queue
-                        // If queue is full, prioritize Flow 1 by dropping Flow 2/3 packets if needed
-                        let flow_id = packet.flow_id;
-                        match queue1_clone.sender().try_send(packet) {
-                            Ok(()) => {
-                                // Successfully sent
-                            }
-                            Err(crossbeam_channel::TrySendError::Full(packet)) => {
-                                // Queue is full - if this is Flow 1 (low latency), drop a Flow 2/3 packet to make room
-                                if flow_id == 1 {
-                                    // Try to receive and drop a non-Flow1 packet to make room
-                                    if let Ok(old_packet) = queue1_clone.try_recv() {
-                                        if old_packet.flow_id != 1 {
-                                            // Drop the old packet and send Flow 1 packet
-                                            let _ = queue1_clone.sender().try_send(packet);
-                                        } else {
-                                            // Old packet was also Flow 1, put it back and skip this one
-                                            let _ = queue1_clone.sender().try_send(old_packet);
-                                        }
-                                    } else {
-                                        // Couldn't make room, Flow 1 packet is lost (shouldn't happen often)
-                                    }
-                                }
-                                // For Flow 2/3, if queue is full, just drop the packet
-                                // This ensures Flow 1 packets can always get through
-                            }
-                            Err(_) => {
-                                // Channel disconnected, exit
-                                break;
-                            }
-                        }
-                    } else {
-                        // No packets available - yield briefly to avoid busy-waiting
-                        // Use std::hint::spin_loop for better CPU efficiency without sleep overhead
-                        std::hint::spin_loop();
-                    }
-                }
-            })?;
+        // Start IngressDRRScheduler (reads from UDP sockets, routes to priority queues)
+        let ingress_drr_clone = self.ingress_drr.clone();
+        let running_ingress = self.running.clone();
+        tokio::spawn(async move {
+            let _ = ingress_drr_clone.process_sockets(running_ingress).await;
+        });
 
         // EDF processing thread with high priority
         let edf_clone = self.edf.clone();
-        let queue2_clone = self.queue2.clone();
-        let running_clone = self.running.clone();
+        let running_edf = self.running.clone();
 
         std::thread::Builder::new()
             .name("EDF-Processor".to_string())
             .spawn(move || {
                 set_thread_priority(2); // Higher priority for EDF
-                while running_clone.load(Ordering::Relaxed) {
-                    if let Some(packet) = edf_clone.process_next() {
-                        // Removed verbose logging to reduce latency
-                        // Minimal processing delay - EDF should process immediately
-                        // No sleep needed for zero-copy processing
-
-                        // Send processed packet via EDF's output (queue2)
-                        // Use try_send to avoid blocking - if queue is full, prioritize Flow 1
-                        let flow_id = packet.flow_id;
-                        let queue2_sender = queue2_clone.sender();
-                        match queue2_sender.try_send(packet) {
-                            Ok(()) => {
-                                // Successfully sent
-                            }
-                            Err(crossbeam_channel::TrySendError::Full(packet)) => {
-                                // Queue is full - if this is Flow 1 (low latency), drop a Flow 2/3 packet to make room
-                                if flow_id == 1 {
-                                    // Try to receive and drop a non-Flow1 packet to make room
-                                    if let Ok(old_packet) = queue2_clone.try_recv() {
-                                        if old_packet.flow_id != 1 {
-                                            // Drop the old packet and send Flow 1 packet
-                                            let _ = queue2_sender.try_send(packet);
-                                        } else {
-                                            // Old packet was also Flow 1, put it back and skip this one
-                                            let _ = queue2_sender.try_send(old_packet);
-                                        }
-                                    } else {
-                                        // Couldn't make room, Flow 1 packet is lost (shouldn't happen often)
-                                    }
-                                }
-                                // For Flow 2/3, if queue is full, just drop the packet
-                            }
-                            Err(_) => {
-                                // Channel disconnected, continue
-                            }
-                        }
-                    } else {
-                        // No packets available - use spin loop for minimal latency
-                        std::hint::spin_loop();
-                    }
+                while running_edf.load(Ordering::Relaxed) {
+                    // EDF processes packets and routes to output priority queues
+                    let _ = edf_clone.process_next();
+                    // No packets available - use spin loop for minimal latency
+                    std::hint::spin_loop();
                 }
             })?;
 
-        // Output DRR + UDP output combined - receives from queue2, schedules via DRR, sends directly to UDP
-        let queue2_clone = self.queue2.clone();
-        let output_drr_clone = self.output_drr.clone();
+        // Start EgressDRRScheduler (reads from priority queues, writes to UDP sockets)
+        let egress_drr_clone = self.egress_drr.clone();
         let metrics_clone = self.metrics_collector.clone();
-        let running_clone = self.running.clone();
-        let output_socket_map_clone = Arc::new(output_socket_map);
-
+        let running_egress = self.running.clone();
         tokio::spawn(async move {
-            // Create output sockets for each flow
-            let mut output_sockets: HashMap<u64, Arc<UdpSocket>> = HashMap::new();
-
-            // Initialize output sockets (bind to any available port, we just need to send)
-            for (flow_id, _config) in output_socket_map_clone.iter() {
-                let socket = match UdpSocket::bind("0.0.0.0:0").await {
-                    Ok(s) => Arc::new(s),
-                    Err(_e) => {
-                        continue;
-                    }
-                };
-                output_sockets.insert(*flow_id, socket);
-            }
-
-            while running_clone.load(Ordering::Relaxed) {
-                // Get packets from queue2 (output of EDF) and schedule via output DRR
-                if let Ok(packet) = queue2_clone.try_recv() {
-                    let _ = output_drr_clone.schedule_packet(packet);
-                }
-
-                // Process packets from output DRR and send directly to UDP
-                if let Some(packet) = output_drr_clone.process_next() {
-                    // Record metrics
-                    let latency = packet.timestamp.elapsed();
-                    let deadline = packet.timestamp + packet.latency_budget;
-                    let deadline_missed = Instant::now() > deadline;
-                    metrics_clone.record_packet(
-                        packet.flow_id,
-                        latency,
-                        deadline_missed,
-                        packet.latency_budget,
-                    );
-
-                    // Route to appropriate output socket based on flow_id and send directly
-                    // Use pre-computed SocketAddr to avoid string formatting in hot path
-                    if let Some(target_addr) = output_socket_map_clone.get(&packet.flow_id) {
-                        if let Some(socket) = output_sockets.get(&packet.flow_id) {
-                            let _ = socket.send_to(&packet.data, target_addr).await;
-                        }
-                    }
-                } else {
-                    // No packets available - yield to other tasks
-                    tokio::task::yield_now().await;
-                }
-            }
+            let _ = egress_drr_clone
+                .process_queues(running_egress, metrics_clone)
+                .await;
         });
 
         // Spawn a thread to periodically send metrics updates (even when no packets are processed)

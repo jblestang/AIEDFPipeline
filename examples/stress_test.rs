@@ -219,13 +219,15 @@ fn main() {
         test_duration.as_secs()
     );
 
+    let factor = 10;
+
     // Configuration - different data rates per flow (DOUBLED)
     // Flow 1 (1ms deadline): Low latency = Low data rate (fewer packets)
     // Flow 2 (50ms deadline): Medium latency = Medium data rate
     // Flow 3 (100ms deadline): High latency = High data rate (more packets)
-    let packets_flow1 = 20 * test_duration.as_secs(); // Low data rate for low latency flow (doubled)
-    let packets_flow2 = 100 * test_duration.as_secs(); // Medium data rate (doubled)
-    let packets_flow3 = 200 * test_duration.as_secs(); // High data rate for high latency flow (doubled)
+    let packets_flow1 = 20 * factor * test_duration.as_secs(); // Low data rate for low latency flow (doubled)
+    let packets_flow2 = 100 * factor * test_duration.as_secs(); // Medium data rate (doubled)
+    let packets_flow3 = 200 * factor * test_duration.as_secs(); // High data rate for high latency flow (doubled)
 
     // Different send rates to simulate different data rates (doubled = halved delays)
     let send_delay_flow1 = 50; // Send every 50ms (20 packets/sec, doubled from 10)

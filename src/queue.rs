@@ -8,6 +8,7 @@ pub struct Queue {
     capacity: usize,
 }
 
+#[allow(dead_code)] // Old Queue struct, kept for reference but not used in new architecture
 impl Queue {
     pub fn new() -> Self {
         let capacity = 128;
@@ -96,6 +97,7 @@ mod tests {
             data: vec![1, 2, 3],
             timestamp: Instant::now(),
             latency_budget: Duration::from_millis(1),
+            priority: crate::drr_scheduler::Priority::from_flow_id(1),
         };
 
         queue.send(packet.clone()).unwrap();

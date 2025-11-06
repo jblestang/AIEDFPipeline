@@ -80,11 +80,11 @@ impl Metrics {
 
         self.last_update = Instant::now();
     }
-    
+
     // Compute all percentiles at once and cache them (more efficient than computing individually)
     fn compute_and_cache_percentiles(&self) {
         let cached_count = *self.cached_packet_count.borrow();
-        
+
         // Only recompute if cache is invalid
         if cached_count != self.packet_count {
             if self.latencies.is_empty() {
@@ -96,17 +96,21 @@ impl Metrics {
                 // Sort once and compute all percentiles
                 let mut sorted: Vec<f64> = self.latencies.iter().copied().collect();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                
+
                 let len = sorted.len();
                 let p50_idx = ((len as f64 * 50.0 / 100.0).ceil() as usize - 1).min(len - 1);
                 let p95_idx = ((len as f64 * 95.0 / 100.0).ceil() as usize - 1).min(len - 1);
                 let p99_idx = ((len as f64 * 99.0 / 100.0).ceil() as usize - 1).min(len - 1);
                 let p999_idx = ((len as f64 * 99.9 / 100.0).ceil() as usize - 1).min(len - 1);
-                
-                *self.cached_p50.borrow_mut() = Some(Duration::from_secs_f64(sorted[p50_idx] / 1_000_000.0));
-                *self.cached_p95.borrow_mut() = Some(Duration::from_secs_f64(sorted[p95_idx] / 1_000_000.0));
-                *self.cached_p99.borrow_mut() = Some(Duration::from_secs_f64(sorted[p99_idx] / 1_000_000.0));
-                *self.cached_p999.borrow_mut() = Some(Duration::from_secs_f64(sorted[p999_idx] / 1_000_000.0));
+
+                *self.cached_p50.borrow_mut() =
+                    Some(Duration::from_secs_f64(sorted[p50_idx] / 1_000_000.0));
+                *self.cached_p95.borrow_mut() =
+                    Some(Duration::from_secs_f64(sorted[p95_idx] / 1_000_000.0));
+                *self.cached_p99.borrow_mut() =
+                    Some(Duration::from_secs_f64(sorted[p99_idx] / 1_000_000.0));
+                *self.cached_p999.borrow_mut() =
+                    Some(Duration::from_secs_f64(sorted[p999_idx] / 1_000_000.0));
             }
             *self.cached_packet_count.borrow_mut() = self.packet_count;
         }
@@ -165,6 +169,7 @@ impl Metrics {
         self.latencies.range(start..).copied().collect()
     }
 
+    #[allow(dead_code)]
     pub fn percentile(&self, percentile: f64) -> Option<Duration> {
         // For common percentiles, use cache; otherwise compute on demand
         match percentile {

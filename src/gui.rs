@@ -71,7 +71,7 @@ fn update_ui(
                 .or_insert_with(|| FlowStatistics {
                     start_time: now, // Only set start_time when flow is first created
                     points: VecDeque::with_capacity(1000),
-                    max_points: 1000,     // Keep last 1000 points (reduced to limit memory usage)
+                    max_points: 1000, // Keep last 1000 points (reduced to limit memory usage)
                     last_point_time: -1.0, // Initialize to -1 to always add first point
                 });
 
@@ -194,7 +194,9 @@ fn update_ui(
                         first_metrics.queue1_occupancy,
                         first_metrics.queue1_capacity,
                         if first_metrics.queue1_capacity > 0 {
-                            (first_metrics.queue1_occupancy as f64 / first_metrics.queue1_capacity as f64) * 100.0
+                            (first_metrics.queue1_occupancy as f64
+                                / first_metrics.queue1_capacity as f64)
+                                * 100.0
                         } else {
                             0.0
                         }
@@ -207,7 +209,9 @@ fn update_ui(
                         first_metrics.queue2_occupancy,
                         first_metrics.queue2_capacity,
                         if first_metrics.queue2_capacity > 0 {
-                            (first_metrics.queue2_occupancy as f64 / first_metrics.queue2_capacity as f64) * 100.0
+                            (first_metrics.queue2_occupancy as f64
+                                / first_metrics.queue2_capacity as f64)
+                                * 100.0
                         } else {
                             0.0
                         }
@@ -240,22 +244,43 @@ fn update_ui(
                             let safe_y = y.max(0.0001); // Minimum 0.0001ms to avoid log(0)
                             safe_y.log10()
                         };
-                        
+
                         // Create plot points for each statistic with log Y scale
-                        let avg_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.avg)]).collect();
-                        let min_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.min)]).collect();
-                        let max_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.max)]).collect();
-                        let p50_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p50)]).collect();
-                        let p95_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p95)]).collect();
-                        let p99_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p99)]).collect();
-                        let p100_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p100)]).collect();
+                        let avg_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.avg)])
+                            .collect();
+                        let min_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.min)])
+                            .collect();
+                        let max_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.max)])
+                            .collect();
+                        let p50_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.p50)])
+                            .collect();
+                        let p95_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.p95)])
+                            .collect();
+                        let p99_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.p99)])
+                            .collect();
+                        let p100_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.p100)])
+                            .collect();
                         let std_dev_points: PlotPoints = flow_stats
                             .points
                             .iter()
@@ -294,7 +319,7 @@ fn update_ui(
                                 .fold(f64::NEG_INFINITY, f64::max)
                                 .max(expected_max_ms * 1.2) // At least 20% above expected max
                                 .max(1.0); // At least 1ms
-                        
+
                         // Convert bounds to log scale for plotting
                         let y_min_log = to_log_y(y_min_linear.max(0.0001));
                         let y_max_log = to_log_y(y_max_linear);
@@ -422,7 +447,7 @@ pub fn run_gui_client(server_addr: &str, shutdown_flag: Arc<AtomicBool>) {
                         println!("[GUI] Connected to metrics server at {}", server_addr);
                         let mut reader = tokio::io::BufReader::new(stream);
                         use tokio::io::AsyncBufReadExt;
-                        
+
                         let mut line = String::new();
                         loop {
                             line.clear();
@@ -439,11 +464,11 @@ pub fn run_gui_client(server_addr: &str, shutdown_flag: Arc<AtomicBool>) {
                                             // Set last_update to now for deserialized snapshots
                                             let mut updated_metrics = HashMap::new();
                                             let mut stats_guard = statistics_history_clone.lock().unwrap();
-                                            
+
                                             for (k, mut v) in metrics {
                                                 v.last_update = now;
                                                 updated_metrics.insert(k, v.clone());
-                                                
+
                                                 // Update statistics history
                                                 let flow_stats = stats_guard.entry(k).or_insert_with(|| FlowStatistics {
                                                     start_time: now, // Only set start_time when flow is first created
@@ -451,10 +476,10 @@ pub fn run_gui_client(server_addr: &str, shutdown_flag: Arc<AtomicBool>) {
                                                     max_points: 10000, // Keep last 10000 points
                                                     last_point_time: -1.0, // Initialize to -1 to always add first point
                                                 });
-                                                
+
                                                 // Don't reset start_time if flow already exists - use the original start_time
                                                 let elapsed = now.duration_since(flow_stats.start_time).as_secs_f64();
-                                                
+
                                                 // Always add a new point - accumulate all statistics over time
                                                 // Convert to milliseconds for plotting (latencies are stored in microseconds internally)
                                                 let point = StatisticsPoint {
@@ -468,21 +493,21 @@ pub fn run_gui_client(server_addr: &str, shutdown_flag: Arc<AtomicBool>) {
                                                     p100: v.p100.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0,
                                                     std_dev: v.std_dev.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0,
                                                 };
-                                                
+
                                                 // Only add if this is a new point (different time) or if it's the first point
                                                 // This prevents duplicate points at the same timestamp
-                                                if flow_stats.points.is_empty() || 
+                                                if flow_stats.points.is_empty() ||
                                                    (flow_stats.points.back().map(|p| p.time).unwrap_or(-1.0) < elapsed - 0.05) {
                                                     flow_stats.points.push_back(point);
                                                     flow_stats.last_point_time = elapsed;
-                                                    
+
                                                     // Keep only the last max_points points (FIFO - remove oldest)
                                                     if flow_stats.points.len() > flow_stats.max_points {
                                                         flow_stats.points.pop_front();
                                                     }
                                                 }
                                             }
-                                            
+
                                             drop(stats_guard);
                                             *latest_metrics_clone.lock().unwrap() = updated_metrics;
                                         }
@@ -610,7 +635,9 @@ fn update_ui_client(
                         first_metrics.queue1_occupancy,
                         first_metrics.queue1_capacity,
                         if first_metrics.queue1_capacity > 0 {
-                            (first_metrics.queue1_occupancy as f64 / first_metrics.queue1_capacity as f64) * 100.0
+                            (first_metrics.queue1_occupancy as f64
+                                / first_metrics.queue1_capacity as f64)
+                                * 100.0
                         } else {
                             0.0
                         }
@@ -623,7 +650,9 @@ fn update_ui_client(
                         first_metrics.queue2_occupancy,
                         first_metrics.queue2_capacity,
                         if first_metrics.queue2_capacity > 0 {
-                            (first_metrics.queue2_occupancy as f64 / first_metrics.queue2_capacity as f64) * 100.0
+                            (first_metrics.queue2_occupancy as f64
+                                / first_metrics.queue2_capacity as f64)
+                                * 100.0
                         } else {
                             0.0
                         }
@@ -656,22 +685,43 @@ fn update_ui_client(
                             let safe_y = y.max(0.0001); // Minimum 0.0001ms to avoid log(0)
                             safe_y.log10()
                         };
-                        
+
                         // Create plot points for each statistic with log Y scale
-                        let avg_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.avg)]).collect();
-                        let min_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.min)]).collect();
-                        let max_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.max)]).collect();
-                        let p50_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p50)]).collect();
-                        let p95_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p95)]).collect();
-                        let p99_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p99)]).collect();
-                        let p100_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p100)]).collect();
+                        let avg_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.avg)])
+                            .collect();
+                        let min_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.min)])
+                            .collect();
+                        let max_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.max)])
+                            .collect();
+                        let p50_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.p50)])
+                            .collect();
+                        let p95_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.p95)])
+                            .collect();
+                        let p99_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.p99)])
+                            .collect();
+                        let p100_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, to_log_y(p.p100)])
+                            .collect();
                         let std_dev_points: PlotPoints = flow_stats
                             .points
                             .iter()
@@ -704,7 +754,7 @@ fn update_ui_client(
                             .fold(f64::NEG_INFINITY, f64::max)
                             .max(expected_max_ms * 1.2) // At least 20% above expected max
                             .max(1.0); // At least 1ms
-                        
+
                         // Convert bounds to log scale for plotting
                         let y_min_log = to_log_y(y_min_linear.max(0.0001));
                         let y_max_log = to_log_y(y_max_linear);

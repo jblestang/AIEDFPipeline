@@ -4,14 +4,39 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Priority levels for packet scheduling
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Priority {
+    HIGH = 0,   // Highest priority (Flow 1)
+    MEDIUM = 1, // Medium priority (Flow 2)
+    LOW = 2,    // Low priority (Flow 3)
+}
+
+impl Priority {
+    /// Map flow_id to priority level
+    pub fn from_flow_id(flow_id: u64) -> Priority {
+        match flow_id {
+            1 => Priority::HIGH,
+            2 => Priority::MEDIUM,
+            3 => Priority::LOW,
+            _ => Priority::LOW, // Default to LOW for unknown flows
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Old DRR scheduler, kept for reference but not used in new architecture
 pub struct Flow {
     #[allow(dead_code)]
     pub id: u64,
+    #[allow(dead_code)]
     pub quantum: usize,
+    #[allow(dead_code)]
     pub deficit: usize,
     #[allow(dead_code)]
     pub latency_budget: Duration,
+    #[allow(dead_code)]
+    pub priority: Priority,
 }
 
 #[derive(Debug, Clone)]
@@ -20,22 +45,36 @@ pub struct Packet {
     pub data: Vec<u8>,
     pub timestamp: Instant,
     pub latency_budget: Duration,
+    pub priority: Priority,
 }
 
 // Combined DRR state to reduce lock acquisitions
+#[allow(dead_code)] // Old DRR scheduler, kept for reference but not used in new architecture
 struct DRRState {
     flows: HashMap<u64, Flow>,
+    #[allow(dead_code)]
     active_flows: Vec<u64>,
+    #[allow(dead_code)]
     current_flow_index: usize,
 }
 
+#[allow(dead_code)] // Old DRR scheduler, kept for reference but not used in new architecture
 pub struct DRRScheduler {
     state: Arc<Mutex<DRRState>>, // Single lock for all DRR state
+    #[allow(dead_code)]
     packet_tx: Sender<Packet>,
+    #[allow(dead_code)]
     packet_rx: Arc<Mutex<Option<Receiver<Packet>>>>,
-    packet_buffer: Arc<Mutex<Vec<Packet>>>, // Buffer for packets that don't match current flow
+    // Three separate queues, one per priority level
+    #[allow(dead_code)]
+    high_priority_buffer: Arc<Mutex<Vec<Packet>>>,
+    #[allow(dead_code)]
+    medium_priority_buffer: Arc<Mutex<Vec<Packet>>>,
+    #[allow(dead_code)]
+    low_priority_buffer: Arc<Mutex<Vec<Packet>>>,
 }
 
+#[allow(dead_code)] // Old DRR scheduler, kept for reference but not used in new architecture
 impl DRRScheduler {
     pub fn new(packet_tx: Sender<Packet>) -> Self {
         Self {
@@ -46,7 +85,9 @@ impl DRRScheduler {
             })),
             packet_tx,
             packet_rx: Arc::new(Mutex::new(None)),
-            packet_buffer: Arc::new(Mutex::new(Vec::new())),
+            high_priority_buffer: Arc::new(Mutex::new(Vec::new())),
+            medium_priority_buffer: Arc::new(Mutex::new(Vec::new())),
+            low_priority_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -55,6 +96,7 @@ impl DRRScheduler {
     }
 
     pub fn add_flow(&self, flow_id: u64, quantum: usize, latency_budget: Duration) {
+        let priority = Priority::from_flow_id(flow_id);
         let mut state = self.state.lock();
         state.flows.insert(
             flow_id,
@@ -63,6 +105,7 @@ impl DRRScheduler {
                 quantum,
                 deficit: 0,
                 latency_budget,
+                priority,
             },
         );
 
@@ -73,8 +116,11 @@ impl DRRScheduler {
 
     pub fn schedule_packet(
         &self,
-        packet: Packet,
+        mut packet: Packet,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Set priority based on flow_id
+        packet.priority = Priority::from_flow_id(packet.flow_id);
+
         // Add flow if it doesn't exist
         {
             let state = self.state.lock();
@@ -84,157 +130,155 @@ impl DRRScheduler {
             }
         }
 
-        // Send packet to output
-        self.packet_tx.send(packet)?;
+        // Route packet to appropriate priority queue
+        match packet.priority {
+            Priority::HIGH => {
+                let mut buffer = self.high_priority_buffer.lock();
+                const MAX_BUFFER_SIZE: usize = 1000;
+                let buffer_len = buffer.len();
+                if buffer_len >= MAX_BUFFER_SIZE {
+                    buffer.drain(0..(buffer_len - MAX_BUFFER_SIZE + 1));
+                }
+                buffer.push(packet);
+            }
+            Priority::MEDIUM => {
+                let mut buffer = self.medium_priority_buffer.lock();
+                const MAX_BUFFER_SIZE: usize = 1000;
+                let buffer_len = buffer.len();
+                if buffer_len >= MAX_BUFFER_SIZE {
+                    buffer.drain(0..(buffer_len - MAX_BUFFER_SIZE + 1));
+                }
+                buffer.push(packet);
+            }
+            Priority::LOW => {
+                let mut buffer = self.low_priority_buffer.lock();
+                const MAX_BUFFER_SIZE: usize = 1000;
+                let buffer_len = buffer.len();
+                if buffer_len >= MAX_BUFFER_SIZE {
+                    buffer.drain(0..(buffer_len - MAX_BUFFER_SIZE + 1));
+                }
+                buffer.push(packet);
+            }
+        }
+
         Ok(())
     }
 
     pub fn process_next(&self) -> Option<Packet> {
-        // CRITICAL: Check for Flow 1 packets FIRST before collecting others
-        // This ensures Flow 1 packets are processed immediately without delay
+        // Collect incoming packets from channel and route to priority queues
         {
             let rx_guard = self.packet_rx.lock();
             if let Some(rx) = rx_guard.as_ref() {
-                // Collect ALL available packets and check for Flow 1 first
-                let mut temp_packets = Vec::new();
-                let mut found_flow1 = None;
-                
-                // Collect all packets from channel
-                while let Ok(packet) = rx.try_recv() {
-                    if packet.flow_id == 1 && found_flow1.is_none() {
-                        // Found first Flow 1 packet - keep it, collect rest
-                        found_flow1 = Some(packet);
-                    } else {
-                        temp_packets.push(packet);
-                    }
-                }
-                
-                // If we found Flow 1, return it immediately and add others to buffer
-                if let Some(flow1_packet) = found_flow1 {
-                    // Add non-Flow1 packets to buffer for later processing
-                    let mut buffer = self.packet_buffer.lock();
-                    buffer.extend(temp_packets);
-                    // Limit buffer size to prevent unbounded growth (drop oldest if needed)
-                    const MAX_BUFFER_SIZE: usize = 1000;
-                    let buffer_len = buffer.len();
-                    if buffer_len > MAX_BUFFER_SIZE {
-                        buffer.drain(0..(buffer_len - MAX_BUFFER_SIZE));
-                    }
-                    drop(buffer);
-                    drop(rx_guard);
-                    
-                    // Update DRR state and return Flow 1 immediately
-                    let mut state = self.state.lock();
-                    if let Some(flow) = state.flows.get_mut(&flow1_packet.flow_id) {
-                        flow.deficit += flow.quantum;
-                        if flow.deficit >= 1 {
-                            flow.deficit -= 1;
+                while let Ok(mut packet) = rx.try_recv() {
+                    // Set priority based on flow_id
+                    packet.priority = Priority::from_flow_id(packet.flow_id);
+
+                    // Route to appropriate priority queue
+                    match packet.priority {
+                        Priority::HIGH => {
+                            let mut buffer = self.high_priority_buffer.lock();
+                            const MAX_BUFFER_SIZE: usize = 1000;
+                            let buffer_len = buffer.len();
+                            if buffer_len >= MAX_BUFFER_SIZE {
+                                buffer.drain(0..(buffer_len - MAX_BUFFER_SIZE + 1));
+                            }
+                            buffer.push(packet);
                         }
-                    }
-                    return Some(flow1_packet);
-                }
-                
-                // No Flow 1 found, add all collected packets to buffer
-                if !temp_packets.is_empty() {
-                    let mut buffer = self.packet_buffer.lock();
-                    buffer.extend(temp_packets);
-                    // Limit buffer size to prevent unbounded growth (drop oldest if needed)
-                    const MAX_BUFFER_SIZE: usize = 1000;
-                    let buffer_len = buffer.len();
-                    if buffer_len > MAX_BUFFER_SIZE {
-                        buffer.drain(0..(buffer_len - MAX_BUFFER_SIZE));
+                        Priority::MEDIUM => {
+                            let mut buffer = self.medium_priority_buffer.lock();
+                            const MAX_BUFFER_SIZE: usize = 1000;
+                            let buffer_len = buffer.len();
+                            if buffer_len >= MAX_BUFFER_SIZE {
+                                buffer.drain(0..(buffer_len - MAX_BUFFER_SIZE + 1));
+                            }
+                            buffer.push(packet);
+                        }
+                        Priority::LOW => {
+                            let mut buffer = self.low_priority_buffer.lock();
+                            const MAX_BUFFER_SIZE: usize = 1000;
+                            let buffer_len = buffer.len();
+                            if buffer_len >= MAX_BUFFER_SIZE {
+                                buffer.drain(0..(buffer_len - MAX_BUFFER_SIZE + 1));
+                            }
+                            buffer.push(packet);
+                        }
                     }
                 }
             }
         }
 
-        let mut state = self.state.lock();
+        // Process packets in priority order: HIGH -> MEDIUM -> LOW
+        // Within each priority, use DRR scheduling
 
-        if state.active_flows.is_empty() {
-            // If no active flows but we have packets, prioritize Flow 1 first, then by time remaining
-            drop(state); // Release state lock before buffer operations
-            let mut buffer = self.packet_buffer.lock();
-            if !buffer.is_empty() {
-                // First, check if there's a Flow 1 packet (always highest priority)
-                if let Some(flow1_pos) = buffer.iter().position(|p| p.flow_id == 1) {
-                    let packet = buffer.remove(flow1_pos);
-                    drop(buffer);
-                    // Add flow if it doesn't exist
-                    let mut state = self.state.lock();
-                    if !state.flows.contains_key(&packet.flow_id) {
-                        drop(state);
-                        self.add_flow(packet.flow_id, 1024, packet.latency_budget);
-                    }
-                    return Some(packet);
-                }
-                
-                // If no Flow 1, find packet with least time remaining until deadline
-                let now = std::time::Instant::now();
-                let best_pos = buffer
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, p)| {
-                        let deadline = p.timestamp + p.latency_budget;
-                        deadline.saturating_duration_since(now)
-                    })
-                    .map(|(pos, _)| pos);
-                
-                if let Some(pos) = best_pos {
-                    let packet = buffer.remove(pos);
-                    drop(buffer);
-                    // Add flow if it doesn't exist
-                    let mut state = self.state.lock();
-                    if !state.flows.contains_key(&packet.flow_id) {
-                        drop(state);
-                        self.add_flow(packet.flow_id, 1024, packet.latency_budget);
-                    }
-                    return Some(packet);
-                }
-            }
+        // Try HIGH priority queue first
+        if let Some(packet) = self.process_priority_queue(Priority::HIGH) {
+            return Some(packet);
+        }
+
+        // Try MEDIUM priority queue
+        if let Some(packet) = self.process_priority_queue(Priority::MEDIUM) {
+            return Some(packet);
+        }
+
+        // Try LOW priority queue
+        if let Some(packet) = self.process_priority_queue(Priority::LOW) {
+            return Some(packet);
+        }
+
+        None
+    }
+
+    /// Process packets from a specific priority queue using DRR scheduling
+    fn process_priority_queue(&self, priority: Priority) -> Option<Packet> {
+        // Get the appropriate buffer for this priority
+        let (buffer_ref, active_len) = {
+            let state = self.state.lock();
+            let active_len = state.active_flows.len();
+            drop(state);
+
+            let buffer = match priority {
+                Priority::HIGH => &self.high_priority_buffer,
+                Priority::MEDIUM => &self.medium_priority_buffer,
+                Priority::LOW => &self.low_priority_buffer,
+            };
+            (buffer, active_len)
+        };
+
+        let mut buf = buffer_ref.lock();
+        if buf.is_empty() {
             return None;
         }
 
-        let mut attempts = 0;
-        let max_attempts = state.active_flows.len();
-
-        // Priority: Always prioritize Flow 1 first, then by time remaining until deadline
-        // Release state lock before buffer operations to minimize lock duration
-        let active_len = state.active_flows.len();
-        drop(state);
-        
-        let mut buffer = self.packet_buffer.lock();
-        let now = std::time::Instant::now();
-        
-        // Optimize: Single pass to find Flow 1 or best deadline packet
-        // This avoids two separate iterations over the buffer
-        let mut flow1_pos: Option<usize> = None;
-        let mut best_pos: Option<(usize, Duration)> = None;
-        
-        for (idx, p) in buffer.iter().enumerate() {
-            // Check for Flow 1 (highest priority)
-            if p.flow_id == 1 {
-                flow1_pos = Some(idx);
-                break; // Flow 1 found, no need to continue
+        // If no active flows, just return first packet from this priority queue
+        if active_len == 0 {
+            let packet = buf.remove(0);
+            drop(buf);
+            // Add flow if it doesn't exist
+            let state = self.state.lock();
+            if !state.flows.contains_key(&packet.flow_id) {
+                drop(state);
+                self.add_flow(packet.flow_id, 1024, packet.latency_budget);
             }
-            
-            // Track best deadline if no Flow 1 yet
-            if flow1_pos.is_none() {
-                let deadline = p.timestamp + p.latency_budget;
-                let time_remaining = deadline.saturating_duration_since(now);
-                if best_pos.is_none() || time_remaining < best_pos.unwrap().1 {
-                    best_pos = Some((idx, time_remaining));
-                }
-            }
+            return Some(packet);
         }
-        
-        // Process Flow 1 if found, otherwise use best deadline
-        let selected_pos = flow1_pos.or_else(|| best_pos.map(|(pos, _)| pos));
-        
-        if let Some(pos) = selected_pos {
-            let packet = buffer.remove(pos);
-            drop(buffer);
-            
-            // Update DRR state for this flow (brief lock)
+
+        let now = std::time::Instant::now();
+
+        // Find packet with earliest deadline within this priority queue
+        let best_pos = buf
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| {
+                let deadline = p.timestamp + p.latency_budget;
+                deadline.saturating_duration_since(now)
+            })
+            .map(|(pos, _)| pos);
+
+        if let Some(pos) = best_pos {
+            let packet = buf.remove(pos);
+            drop(buf);
+
+            // Update DRR state for this flow
             let mut state = self.state.lock();
             if let Some(flow) = state.flows.get_mut(&packet.flow_id) {
                 flow.deficit += flow.quantum;
@@ -244,125 +288,6 @@ impl DRRScheduler {
             }
             state.current_flow_index = (state.current_flow_index + 1) % active_len;
             return Some(packet);
-        }
-        drop(buffer);
-
-        // Try to find a packet for the current flow (normal DRR)
-        while attempts < max_attempts {
-            // Get current flow_id and index (brief lock)
-            let (flow_id, current_idx, active_len) = {
-                let state = self.state.lock();
-                if state.active_flows.is_empty() {
-                    break;
-                }
-                let idx = state.current_flow_index % state.active_flows.len();
-                let fid = state.active_flows[idx];
-                (fid, idx, state.active_flows.len())
-            };
-
-            // Find a packet for this flow in the buffer (no state lock held)
-            let mut buffer = self.packet_buffer.lock();
-            if let Some(pos) = buffer.iter().position(|p| p.flow_id == flow_id) {
-                let packet = buffer.remove(pos);
-                drop(buffer);
-
-                // Update DRR state (brief lock)
-                let mut state = self.state.lock();
-                if let Some(flow) = state.flows.get_mut(&flow_id) {
-                    flow.deficit += flow.quantum;
-                    if flow.deficit >= 1 {
-                        flow.deficit -= 1;
-                    } else {
-                        flow.deficit = 0;
-                    }
-                }
-                state.current_flow_index = (current_idx + 1) % active_len;
-                return Some(packet);
-            } else {
-                drop(buffer);
-                // Update index for next attempt (brief lock)
-                let mut state = self.state.lock();
-                state.current_flow_index = (current_idx + 1) % active_len;
-            }
-            attempts += 1;
-        }
-
-        // If we have packets but none matched, prioritize Flow 1 first, then by time remaining
-        let mut buffer = self.packet_buffer.lock();
-        if !buffer.is_empty() {
-            // First, check if there's a Flow 1 packet (always highest priority)
-            if let Some(flow1_pos) = buffer.iter().position(|p| p.flow_id == 1) {
-                let packet = buffer.remove(flow1_pos);
-                drop(buffer);
-
-                // Add flow if it doesn't exist and update state (brief lock)
-                let mut state = self.state.lock();
-                if !state.flows.contains_key(&packet.flow_id) {
-                    drop(state);
-                    self.add_flow(packet.flow_id, 1024, packet.latency_budget);
-                    let mut state = self.state.lock();
-                    if let Some(flow) = state.flows.get_mut(&packet.flow_id) {
-                        flow.deficit += flow.quantum;
-                        if flow.deficit >= 1 {
-                            flow.deficit -= 1;
-                        } else {
-                            flow.deficit = 0;
-                        }
-                    }
-                    return Some(packet);
-                }
-                if let Some(flow) = state.flows.get_mut(&packet.flow_id) {
-                    flow.deficit += flow.quantum;
-                    if flow.deficit >= 1 {
-                        flow.deficit -= 1;
-                    } else {
-                        flow.deficit = 0;
-                    }
-                }
-                return Some(packet);
-            }
-            
-            // If no Flow 1, find packet with least time remaining until deadline
-            let now = std::time::Instant::now();
-            let best_pos = buffer
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, p)| {
-                    let deadline = p.timestamp + p.latency_budget;
-                    deadline.saturating_duration_since(now)
-                })
-                .map(|(pos, _)| pos);
-            
-            if let Some(pos) = best_pos {
-                let packet = buffer.remove(pos);
-                drop(buffer);
-
-                // Add flow if it doesn't exist and update state (brief lock)
-                let mut state = self.state.lock();
-                if !state.flows.contains_key(&packet.flow_id) {
-                    drop(state);
-                    self.add_flow(packet.flow_id, 1024, packet.latency_budget);
-                    let mut state = self.state.lock();
-                    if let Some(flow) = state.flows.get_mut(&packet.flow_id) {
-                        flow.deficit += flow.quantum;
-                        if flow.deficit >= 1 {
-                            flow.deficit -= 1;
-                        } else {
-                            flow.deficit = 0;
-                        }
-                    }
-                    return Some(packet);
-                }
-                if let Some(flow) = state.flows.get_mut(&packet.flow_id) {
-                    flow.deficit += flow.quantum;
-                    if flow.deficit >= 1 {
-                        flow.deficit -= 1;
-                    } else {
-                        flow.deficit = 0;
-                    }
-                }
-                return Some(packet);
-            }
         }
 
         None
@@ -376,7 +301,7 @@ impl DRRScheduler {
             false
         }
     }
-    
+
     #[allow(dead_code)]
     pub fn get_flows(&self) -> HashMap<u64, Flow> {
         self.state.lock().flows.clone()
@@ -408,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_schedule_packet() {
-        let (tx, rx) = unbounded();
+        let (tx, _rx) = unbounded();
         let scheduler = DRRScheduler::new(tx);
 
         let packet = Packet {
@@ -416,10 +341,18 @@ mod tests {
             data: vec![1, 2, 3],
             timestamp: Instant::now(),
             latency_budget: Duration::from_millis(1),
+            priority: Priority::from_flow_id(1),
         };
 
+        // schedule_packet routes to priority buffer, doesn't send to tx
         scheduler.schedule_packet(packet.clone()).unwrap();
-        let received = rx.recv().unwrap();
+
+        // Add flow so process_next can work
+        scheduler.add_flow(1, 1024, Duration::from_millis(1));
+
+        // Retrieve packet via process_next
+        let received = scheduler.process_next().unwrap();
         assert_eq!(received.flow_id, 1);
+        assert_eq!(received.data, packet.data);
     }
 }
