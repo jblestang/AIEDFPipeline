@@ -135,81 +135,96 @@ impl IngressDRRScheduler {
             let mut packets_read = 0;
             let max_iterations = active_flows.len();
 
-            // OPTIMIZATION: Prioritize Flow 1 (HIGH priority) by processing it first and exhaustively
-            // Process Flow 1 until deficit is exhausted or no packets available
-            let flow_1_index = active_flows.iter().position(|&id| id == 1);
+            // DRR (Deficit Round Robin) algorithm:
+            // 1. Process flows in round-robin order (prioritize Flow 1 first if it exists)
+            // 2. For each flow: add quantum to deficit, then process packets until deficit < 1
+            // 3. Move to next flow in round-robin
+            // 4. Deficit carries over to next round (not reset)
             
-            if let Some(_flow_1_idx) = flow_1_index {
-                let flow_id = 1;
-                // Get socket config from snapshot (no lock needed)
-                if let Some((socket, priority, latency_budget)) = socket_configs_snapshot.get(&flow_id) {
-                    let socket = socket.clone();
-                    let priority = *priority;
-                    let latency_budget = *latency_budget;
+            // Build processing order: Flow 1 first (if exists), then others in round-robin
+            let flow_1_index = active_flows.iter().position(|&id| id == 1);
+            let mut processing_order: Vec<usize> = Vec::with_capacity(active_flows.len());
+            
+            // Add Flow 1 first if it exists
+            if let Some(idx) = flow_1_index {
+                processing_order.push(idx);
+            }
+            
+            // Add other flows in round-robin order starting from current_index
+            for i in 0..active_flows.len() {
+                let idx = (current_index + i) % active_flows.len();
+                if flow_1_index.map_or(true, |flow_1_idx| idx != flow_1_idx) {
+                    processing_order.push(idx);
+                }
+            }
 
-                    // Add quantum at the start of Flow 1 processing
-                    {
-                        let mut state = self.state.lock();
-                        if let Some(flow) = state.flow_states.get_mut(&flow_id) {
-                            flow.deficit += flow.quantum;
-                        }
+            // Process each flow in order using DRR
+            for &flow_index in &processing_order {
+                if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
+                let flow_id = active_flows[flow_index];
+                
+                // Get socket config from snapshot (no lock needed)
+                let (socket, priority, latency_budget) = match socket_configs_snapshot.get(&flow_id) {
+                    Some((s, p, l)) => (s.clone(), *p, *l),
+                    None => {
+                        current_index = (flow_index + 1) % active_flows.len();
+                        continue;
+                    }
+                };
+
+                // DRR Step 1: Add quantum to deficit for this flow
+                {
+                    let mut state = self.state.lock();
+                    if let Some(flow) = state.flow_states.get_mut(&flow_id) {
+                        flow.deficit += flow.quantum;
+                    }
+                }
+
+                // DRR Step 2: Process packets for this flow until deficit < 1 (packet cost = 1)
+                // This allows the flow to send up to 'quantum' packets per round
+                loop {
+                    if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
                     }
 
-                    // Process Flow 1 exhaustively until deficit is exhausted or no packets available
-                    loop {
-                        if !running.load(std::sync::atomic::Ordering::Relaxed) {
-                            break;
-                        }
+                    // Check if we can process a packet (deficit >= 1)
+                    let can_process = {
+                        let state = self.state.lock();
+                        state.flow_states.get(&flow_id)
+                            .map(|flow| flow.deficit >= 1)
+                            .unwrap_or(false)
+                    };
 
-                        let mut local_buf = [0u8; 1024];
-                        let packet_result = {
-                            let mut state = self.state.lock();
-                            if let Some(flow) = state.flow_states.get_mut(&flow_id) {
-                                // Check if we can read a packet (deficit >= 1)
-                                if flow.deficit >= 1 {
-                                    // Release lock before socket read (non-blocking)
-                                    drop(state);
-                                    
-                                    // Try to read from socket (non-blocking)
-                                    match socket.recv_from(&mut local_buf) {
-                                        Ok((size, _addr)) if size > 0 => {
-                                            // Re-acquire lock to update deficit
-                                            let mut state = self.state.lock();
-                                            if let Some(flow) = state.flow_states.get_mut(&flow_id) {
-                                                flow.deficit -= 1;
-                                            }
-                                            drop(state);
-                                            
-                                            // Create packet
-                                            let data = Vec::from(&local_buf[..size]);
-                                            Some(Packet {
-                                                flow_id,
-                                                data,
-                                                timestamp: Instant::now(),
-                                                latency_budget,
-                                                priority,
-                                            })
-                                        }
-                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                            // No packet available, break out of Flow 1 loop
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            // Socket error, break out of Flow 1 loop
-                                            break;
-                                        }
-                                        _ => None,
-                                    }
-                                } else {
-                                    // Deficit exhausted, break out of Flow 1 loop
-                                    break;
+                    if !can_process {
+                        // Deficit exhausted for this flow, move to next flow in round-robin
+                        break;
+                    }
+
+                    // Try to read from socket (non-blocking)
+                    let mut local_buf = [0u8; 1024];
+                    match socket.recv_from(&mut local_buf) {
+                        Ok((size, _addr)) if size > 0 => {
+                            // DRR Step 3: Decrement deficit by 1 (packet count, not packet length)
+                            {
+                                let mut state = self.state.lock();
+                                if let Some(flow) = state.flow_states.get_mut(&flow_id) {
+                                    flow.deficit -= 1;
                                 }
-                            } else {
-                                break;
                             }
-                        };
+                            
+                            // Create packet
+                            let data = Vec::from(&local_buf[..size]);
+                            let packet = Packet {
+                                flow_id,
+                                data,
+                                timestamp: Instant::now(),
+                                latency_budget,
+                                priority,
+                            };
 
-                        if let Some(packet) = packet_result {
                             // Route to appropriate priority queue (no lock needed)
                             let tx = match priority {
                                 Priority::HIGH => &self.high_priority_tx,
@@ -220,94 +235,24 @@ impl IngressDRRScheduler {
                             if tx.try_send(packet).is_ok() {
                                 packets_read += 1;
                             } else {
-                                // Queue full, break to avoid blocking
+                                // Queue full, move to next flow
                                 break;
                             }
-                        } else {
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // No packet available for this flow, move to next flow
                             break;
                         }
-                    }
-                }
-            }
-
-            // Now process other flows in round-robin order
-            for _ in 0..max_iterations {
-                if !running.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-
-                let flow_id = active_flows[current_index];
-                // Skip Flow 1 if we already processed it
-                if flow_id == 1 && flow_1_index.is_some() {
-                    current_index = (current_index + 1) % active_flows.len();
-                    continue;
-                }
-                current_index = (current_index + 1) % active_flows.len();
-
-                // Get socket config from snapshot (no lock needed)
-                let (socket, priority, latency_budget) = match socket_configs_snapshot.get(&flow_id) {
-                    Some((s, p, l)) => (s.clone(), *p, *l),
-                    None => continue,
-                };
-
-                // OPTIMIZATION: Single lock acquisition for deficit update and packet read
-                let mut local_buf = [0u8; 1024];
-                let packet_result = {
-                    let mut state = self.state.lock();
-                    let flow = match state.flow_states.get_mut(&flow_id) {
-                        Some(f) => f,
-                        None => continue,
-                    };
-                    
-                    // Update deficit: add quantum
-                    flow.deficit += flow.quantum;
-
-                    // Check if we can read a packet (deficit >= 1)
-                    if flow.deficit >= 1 {
-                        // Release lock before socket read (non-blocking)
-                        drop(state);
-                        
-                        // Try to read from socket (non-blocking)
-                        match socket.recv_from(&mut local_buf) {
-                            Ok((size, _addr)) if size > 0 => {
-                                // Re-acquire lock to update deficit
-                                let mut state = self.state.lock();
-                                if let Some(flow) = state.flow_states.get_mut(&flow_id) {
-                                    flow.deficit -= 1;
-                                }
-                                drop(state);
-                                
-                                // Create packet
-                                let data = Vec::from(&local_buf[..size]);
-                                Some(Packet {
-                                    flow_id,
-                                    data,
-                                    timestamp: Instant::now(),
-                                    latency_budget,
-                                    priority,
-                                })
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
-                            Err(_) => None,
-                            _ => None,
+                        Err(_) => {
+                            // Socket error, move to next flow
+                            break;
                         }
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(packet) = packet_result {
-                    // Route to appropriate priority queue (no lock needed)
-                    let tx = match priority {
-                        Priority::HIGH => &self.high_priority_tx,
-                        Priority::MEDIUM => &self.medium_priority_tx,
-                        Priority::LOW => &self.low_priority_tx,
-                    };
-
-                    if tx.try_send(packet).is_ok() {
-                        packets_read += 1;
+                        _ => break,
                     }
                 }
+
+                // Update current_index for next round
+                current_index = (flow_index + 1) % active_flows.len();
             }
 
             // OPTIMIZATION: Single lock acquisition to update current index
