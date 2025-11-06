@@ -6,14 +6,17 @@ use std::sync::Arc;
 pub struct Queue {
     sender: Sender<Packet>,
     receiver: Arc<Mutex<Receiver<Packet>>>,
+    capacity: usize,
 }
 
 impl Queue {
     pub fn new() -> Self {
-        let (tx, rx) = bounded(128);
+        let capacity = 128;
+        let (tx, rx) = bounded(capacity);
         Self {
             sender: tx,
             receiver: Arc::new(Mutex::new(rx)),
+            capacity,
         }
     }
 
@@ -47,6 +50,23 @@ impl Queue {
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.receiver.lock().len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn occupancy(&self) -> usize {
+        self.receiver.lock().len()
+    }
+
+    pub fn occupancy_percent(&self) -> f64 {
+        let len = self.occupancy();
+        if self.capacity > 0 {
+            (len as f64 / self.capacity as f64) * 100.0
+        } else {
+            0.0
+        }
     }
 }
 

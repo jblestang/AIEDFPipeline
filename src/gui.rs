@@ -182,6 +182,39 @@ fn update_ui(
 
         ui.separator();
 
+        // Queue Occupancy Display
+        ui.heading("Channel Occupancy");
+        if let Some(first_metrics) = latest_metrics.values().next() {
+            ui.horizontal(|ui| {
+                ui.label("Queue 1:");
+                ui.label(format!(
+                    "{}/{} ({:.1}%)",
+                    first_metrics.queue1_occupancy,
+                    first_metrics.queue1_capacity,
+                    if first_metrics.queue1_capacity > 0 {
+                        (first_metrics.queue1_occupancy as f64 / first_metrics.queue1_capacity as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                ));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Queue 2:");
+                ui.label(format!(
+                    "{}/{} ({:.1}%)",
+                    first_metrics.queue2_occupancy,
+                    first_metrics.queue2_capacity,
+                    if first_metrics.queue2_capacity > 0 {
+                        (first_metrics.queue2_occupancy as f64 / first_metrics.queue2_capacity as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                ));
+            });
+        }
+
+        ui.separator();
+
         // Real-time statistics plots
         ui.heading("Real-Time Statistics Plots");
 
@@ -553,6 +586,39 @@ fn update_ui_client(
                 ui.label(format_latency(metrics.p100.unwrap_or(Duration::ZERO)));
                 ui.label(format_latency(metrics.std_dev.unwrap_or(Duration::ZERO)));
                 ui.label(format!("{}", metrics.deadline_misses));
+            });
+        }
+
+        ui.separator();
+
+        // Queue Occupancy Display
+        ui.heading("Channel Occupancy");
+        if let Some(first_metrics) = latest_metrics.values().next() {
+            ui.horizontal(|ui| {
+                ui.label("Queue 1:");
+                ui.label(format!(
+                    "{}/{} ({:.1}%)",
+                    first_metrics.queue1_occupancy,
+                    first_metrics.queue1_capacity,
+                    if first_metrics.queue1_capacity > 0 {
+                        (first_metrics.queue1_occupancy as f64 / first_metrics.queue1_capacity as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                ));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Queue 2:");
+                ui.label(format!(
+                    "{}/{} ({:.1}%)",
+                    first_metrics.queue2_occupancy,
+                    first_metrics.queue2_capacity,
+                    if first_metrics.queue2_capacity > 0 {
+                        (first_metrics.queue2_occupancy as f64 / first_metrics.queue2_capacity as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                ));
             });
         }
 

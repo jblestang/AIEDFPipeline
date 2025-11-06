@@ -154,6 +154,8 @@ impl Clone for Metrics {
 pub struct MetricsCollector {
     metrics: Arc<Mutex<std::collections::HashMap<u64, Metrics>>>,
     metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>,
+    queue1: Option<Arc<crate::queue::Queue>>,
+    queue2: Option<Arc<crate::queue::Queue>>,
 }
 
 // Helper struct to send metrics data
@@ -182,6 +184,11 @@ pub struct MetricsSnapshot {
     pub deadline_misses: u64,
     #[serde(with = "duration_millis")]
     pub expected_max_latency: Duration, // Expected max latency (latency budget)
+    // Queue occupancy metrics (shared across all flows)
+    pub queue1_occupancy: usize,
+    pub queue1_capacity: usize,
+    pub queue2_occupancy: usize,
+    pub queue2_capacity: usize,
     #[serde(skip, default = "default_instant")]
     #[allow(dead_code)]
     pub last_update: Instant,
@@ -247,10 +254,16 @@ mod duration_millis_option {
 }
 
 impl MetricsCollector {
-    pub fn new(metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>) -> Self {
+    pub fn new(
+        metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>,
+        queue1: Option<Arc<crate::queue::Queue>>,
+        queue2: Option<Arc<crate::queue::Queue>>,
+    ) -> Self {
         Self {
             metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
             metrics_tx,
+            queue1,
+            queue2,
         }
     }
 
@@ -266,6 +279,12 @@ impl MetricsCollector {
             .entry(flow_id)
             .or_insert_with(|| Metrics::new(flow_id));
         metrics.record_latency(latency, deadline_missed);
+
+        // Get queue occupancy
+        let queue1_occupancy = self.queue1.as_ref().map(|q| q.occupancy()).unwrap_or(0);
+        let queue1_capacity = self.queue1.as_ref().map(|q| q.capacity()).unwrap_or(0);
+        let queue2_occupancy = self.queue2.as_ref().map(|q| q.occupancy()).unwrap_or(0);
+        let queue2_capacity = self.queue2.as_ref().map(|q| q.capacity()).unwrap_or(0);
 
         // Send updated metrics as snapshots
         let mut snapshot = std::collections::HashMap::new();
@@ -286,6 +305,10 @@ impl MetricsCollector {
                     std_dev: m.standard_deviation(),
                     deadline_misses: m.deadline_misses,
                     expected_max_latency, // Use the passed expected max latency
+                    queue1_occupancy,
+                    queue1_capacity,
+                    queue2_occupancy,
+                    queue2_capacity,
                     last_update: m.last_update,
                     recent_latencies: m.get_recent_latencies(1000), // Last 1000 samples for plotting
                 },
@@ -299,6 +322,12 @@ impl MetricsCollector {
         &self,
         flow_id_to_expected_latency: &std::collections::HashMap<u64, Duration>,
     ) {
+        // Get queue occupancy
+        let queue1_occupancy = self.queue1.as_ref().map(|q| q.occupancy()).unwrap_or(0);
+        let queue1_capacity = self.queue1.as_ref().map(|q| q.capacity()).unwrap_or(0);
+        let queue2_occupancy = self.queue2.as_ref().map(|q| q.occupancy()).unwrap_or(0);
+        let queue2_capacity = self.queue2.as_ref().map(|q| q.capacity()).unwrap_or(0);
+
         let metrics_map = self.metrics.lock();
         let mut snapshot = std::collections::HashMap::new();
         for (fid, m) in metrics_map.iter() {
@@ -322,6 +351,10 @@ impl MetricsCollector {
                     std_dev: m.standard_deviation(),
                     deadline_misses: m.deadline_misses,
                     expected_max_latency: expected_max,
+                    queue1_occupancy,
+                    queue1_capacity,
+                    queue2_occupancy,
+                    queue2_capacity,
                     last_update: m.last_update,
                     recent_latencies: m.get_recent_latencies(1000),
                 },
@@ -335,6 +368,12 @@ impl MetricsCollector {
         &self,
         flow_id_to_expected_latency: &std::collections::HashMap<u64, Duration>,
     ) -> std::collections::HashMap<u64, MetricsSnapshot> {
+        // Get queue occupancy
+        let queue1_occupancy = self.queue1.as_ref().map(|q| q.occupancy()).unwrap_or(0);
+        let queue1_capacity = self.queue1.as_ref().map(|q| q.capacity()).unwrap_or(0);
+        let queue2_occupancy = self.queue2.as_ref().map(|q| q.occupancy()).unwrap_or(0);
+        let queue2_capacity = self.queue2.as_ref().map(|q| q.capacity()).unwrap_or(0);
+
         let metrics = self.metrics.lock();
         let mut snapshot = std::collections::HashMap::new();
         for (flow_id, m) in metrics.iter() {
@@ -358,6 +397,10 @@ impl MetricsCollector {
                     std_dev: m.standard_deviation(),
                     deadline_misses: m.deadline_misses,
                     expected_max_latency: expected_max,
+                    queue1_occupancy,
+                    queue1_capacity,
+                    queue2_occupancy,
+                    queue2_capacity,
                     last_update: m.last_update,
                     recent_latencies: m.get_recent_latencies(1000),
                 },
@@ -441,7 +484,7 @@ mod tests {
     #[test]
     fn test_metrics_collector() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let collector = MetricsCollector::new(tx);
+        let collector = MetricsCollector::new(tx, None, None);
 
         collector.record_packet(
             1,

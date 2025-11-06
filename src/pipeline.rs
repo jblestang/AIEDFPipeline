@@ -114,9 +114,13 @@ impl Pipeline {
         // Create EDF scheduler (input from queue1, output to queue2)
         let edf = Arc::new(EDFScheduler::new(queue1.receiver(), queue2.sender()));
 
-        // Create metrics collector
+        // Create metrics collector with queue references for occupancy tracking
         let (metrics_tx, metrics_rx) = unbounded();
-        let metrics_collector = Arc::new(MetricsCollector::new(metrics_tx));
+        let metrics_collector = Arc::new(MetricsCollector::new(
+            metrics_tx,
+            Some(queue1.clone()),
+            Some(queue2.clone()),
+        ));
 
         Ok(Self {
             input_drr,
