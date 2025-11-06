@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 
+use crate::drr_scheduler::Priority;
 use crate::edf_scheduler::EDFScheduler;
 use crate::egress_drr::EgressDRRScheduler;
 use crate::ingress_drr::IngressDRRScheduler;
@@ -17,7 +18,7 @@ pub struct SocketConfig {
     pub address: String,
     pub port: u16,
     pub latency_budget: Duration,
-    pub flow_id: u64,
+    pub priority: Priority,
 }
 
 // Make Pipeline accessible for testing
@@ -54,19 +55,19 @@ impl Pipeline {
                 address: "127.0.0.1".to_string(),
                 port: 8080,
                 latency_budget: Duration::from_millis(5),
-                flow_id: 1,
+                priority: Priority::HIGH,
             },
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 8081,
                 latency_budget: Duration::from_millis(50),
-                flow_id: 2,
+                priority: Priority::MEDIUM,
             },
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 8082,
                 latency_budget: Duration::from_millis(100),
-                flow_id: 3,
+                priority: Priority::LOW,
             },
         ];
 
@@ -76,19 +77,19 @@ impl Pipeline {
                 address: "127.0.0.1".to_string(),
                 port: 9080,
                 latency_budget: Duration::from_millis(5),
-                flow_id: 1,
+                priority: Priority::HIGH,
             },
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 9081,
                 latency_budget: Duration::from_millis(50),
-                flow_id: 2,
+                priority: Priority::MEDIUM,
             },
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 9082,
                 latency_budget: Duration::from_millis(100),
-                flow_id: 3,
+                priority: Priority::LOW,
             },
         ];
 
@@ -247,16 +248,22 @@ impl Pipeline {
             std_socket.set_nonblocking(true)?;
             let socket = Arc::new(std_socket);
 
-            // Determine quantum based on flow_id (same as before)
-            let quantum = match config.flow_id {
-                1 => 32768, // Highest quantum for flow 1
-                2 => 4096,  // Medium quantum for flow 2
-                3 => 1024,  // Standard quantum for flow 3
-                _ => 1024,  // Default quantum for other flows
+            // Determine quantum based on priority
+            let quantum = match config.priority {
+                Priority::HIGH => 65536,   // Highest quantum for HIGH priority
+                Priority::MEDIUM => 1024,   // Medium quantum for MEDIUM priority
+                Priority::LOW => 512,       // Standard quantum for LOW priority
+            };
+
+            // Derive flow_id from priority for backward compatibility with IngressDRRScheduler
+            let flow_id = match config.priority {
+                Priority::HIGH => 1,
+                Priority::MEDIUM => 2,
+                Priority::LOW => 3,
             };
 
             self.ingress_drr
-                .add_socket(socket, config.flow_id, config.latency_budget, quantum);
+                .add_socket(socket, flow_id, config.latency_budget, quantum);
         }
 
         // Create output sockets and add to EgressDRRScheduler
@@ -264,8 +271,16 @@ impl Pipeline {
             let addr = format!("{}:{}", config.address, config.port);
             let socket_addr = addr.parse::<SocketAddr>()?;
             let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+            
+            // Derive flow_id from priority for backward compatibility with EgressDRRScheduler
+            let flow_id = match config.priority {
+                Priority::HIGH => 1,
+                Priority::MEDIUM => 2,
+                Priority::LOW => 3,
+            };
+            
             self.egress_drr
-                .add_output_socket(config.flow_id, socket, socket_addr);
+                .add_output_socket(flow_id, socket, socket_addr);
         }
 
         // Start IngressDRRScheduler (reads from UDP sockets, routes to priority queues)
@@ -306,10 +321,18 @@ impl Pipeline {
         // Use lower priority thread for statistics to not interfere with packet processing
         let metrics_collector_periodic = self.metrics_collector.clone();
         let running_periodic = self.running.clone();
+        // Map priority to expected latency, but convert to flow_id for metrics (backward compatibility)
         let flow_id_to_expected_latency: HashMap<u64, Duration> = self
             .output_sockets
             .iter()
-            .map(|config| (config.flow_id, config.latency_budget))
+            .map(|config| {
+                let flow_id = match config.priority {
+                    Priority::HIGH => 1,
+                    Priority::MEDIUM => 2,
+                    Priority::LOW => 3,
+                };
+                (flow_id, config.latency_budget)
+            })
             .collect();
         let flow_id_to_expected_latency_arc = Arc::new(flow_id_to_expected_latency);
         let flow_map_clone = flow_id_to_expected_latency_arc.clone();
