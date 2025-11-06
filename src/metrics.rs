@@ -305,7 +305,7 @@ impl MetricsCollector {
             let expected_max = flow_id_to_expected_latency
                 .get(fid)
                 .copied()
-                .unwrap_or(Duration::from_millis(100));
+                .unwrap_or(Duration::from_millis(200));
             snapshot.insert(
                 *fid,
                 MetricsSnapshot {

@@ -211,7 +211,7 @@ fn main() {
     std::io::stdin().read_line(&mut input).unwrap();
 
     let test = StressTest::new();
-    let test_duration = Duration::from_secs(30); // Longer test duration
+    let test_duration = Duration::from_secs(240); // Longer test duration
 
     println!("\nStarting stress test...");
     println!(
@@ -223,9 +223,9 @@ fn main() {
     // Flow 1 (1ms deadline): Low latency = Low data rate (fewer packets)
     // Flow 2 (50ms deadline): Medium latency = Medium data rate
     // Flow 3 (100ms deadline): High latency = High data rate (more packets)
-    let packets_flow1 = 400; // Low data rate for low latency flow (doubled)
-    let packets_flow2 = 2000; // Medium data rate (doubled)
-    let packets_flow3 = 4000; // High data rate for high latency flow (doubled)
+    let packets_flow1 = 20 * test_duration.as_secs(); // Low data rate for low latency flow (doubled)
+    let packets_flow2 = 100 * test_duration.as_secs(); // Medium data rate (doubled)
+    let packets_flow3 = 200 * test_duration.as_secs(); // High data rate for high latency flow (doubled)
 
     // Different send rates to simulate different data rates (doubled = halved delays)
     let send_delay_flow1 = 50; // Send every 50ms (20 packets/sec, doubled from 10)
@@ -268,11 +268,11 @@ fn main() {
     println!();
 
     // Start sending threads for each flow with different rates
-    test.send_packets(1, 8080, packets_flow1, send_delay_flow1);
+    test.send_packets(1, 8080, packets_flow1 as usize, send_delay_flow1);
     thread::sleep(Duration::from_millis(10)); // Small offset
-    test.send_packets(2, 8081, packets_flow2, send_delay_flow2);
+    test.send_packets(2, 8081, packets_flow2 as usize, send_delay_flow2);
     thread::sleep(Duration::from_millis(10)); // Small offset
-    test.send_packets(3, 8082, packets_flow3, send_delay_flow3);
+    test.send_packets(3, 8082, packets_flow3 as usize, send_delay_flow3);
 
     // Wait for test duration
     thread::sleep(test_duration);

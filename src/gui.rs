@@ -60,7 +60,7 @@ fn update_ui(
 ) {
     // Try to receive latest metrics
     let mut latest_metrics = HashMap::new();
-    
+
     while let Ok(metrics) = metrics_rx.try_recv() {
         let now = Instant::now();
         let mut stats_guard = statistics_history.lock().unwrap();
@@ -197,37 +197,43 @@ fn update_ui(
                             metrics.expected_max_latency.as_secs_f64() * 1000.0
                         ));
 
-                        // Create plot points for each statistic
+                        // Helper function to safely convert to log scale (avoid log(0) or negative values)
+                        let to_log_y = |y: f64| {
+                            let safe_y = y.max(0.0001); // Minimum 0.0001ms to avoid log(0)
+                            safe_y.log10()
+                        };
+                        
+                        // Create plot points for each statistic with log Y scale
                         let avg_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.avg]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.avg)]).collect();
                         let min_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.min]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.min)]).collect();
                         let max_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.max]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.max)]).collect();
                         let p50_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.p50]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p50)]).collect();
                         let p95_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.p95]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p95)]).collect();
                         let p99_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.p99]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p99)]).collect();
                         let p100_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.p100]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p100)]).collect();
                         let std_dev_points: PlotPoints = flow_stats
                             .points
                             .iter()
-                            .map(|p| [p.time, p.std_dev])
+                            .map(|p| [p.time, to_log_y(p.std_dev)])
                             .collect();
 
                         // Expected max latency line
-                        let expected_max_ms = metrics.max_latency.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0;
+                        let expected_max_ms =
+                            metrics.max_latency.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0;
                         let time_range = if let Some(last) = flow_stats.points.last() {
                             last.time.max(1.0) // At least 1 second for initial view
                         } else {
                             1.0
                         };
-                        // Calculate Y-axis bounds based on all data points to prevent jumping
-                        // Use linear scale with proper formatting
-                        let y_min =
+                        // Calculate Y-axis bounds based on all data points (in linear space)
+                        let y_min_linear =
                             flow_stats
                                 .points
                                 .iter()
@@ -238,7 +244,7 @@ fn update_ui(
                                 })
                                 .fold(f64::INFINITY, f64::min)
                                 .min(0.0); // Start at 0 or below
-                        let y_max =
+                        let y_max_linear =
                             flow_stats
                                 .points
                                 .iter()
@@ -250,6 +256,10 @@ fn update_ui(
                                 .fold(f64::NEG_INFINITY, f64::max)
                                 .max(expected_max_ms * 1.2) // At least 20% above expected max
                                 .max(1.0); // At least 1ms
+                        
+                        // Convert bounds to log scale for plotting
+                        let y_min_log = to_log_y(y_min_linear.max(0.0001));
+                        let y_max_log = to_log_y(y_max_linear);
 
                         // Get available width for the plot
                         let plot_width = ui.available_width().max(400.0); // Minimum 400px width
@@ -258,25 +268,27 @@ fn update_ui(
                             .width(plot_width)
                             .height(250.0)
                             .x_axis_label("Time (seconds)")
-                            .y_axis_label("Latency (ms)")
+                            .y_axis_label("Latency (ms) - Log Scale")
                             .y_axis_formatter(|val, _range, _| {
-                                // Format with appropriate precision for linear scale
-                                if val < 1.0 {
-                                    format!("{:.3}", val)
+                                // Convert from log scale back to linear for display
+                                let linear_val = 10f64.powf(val);
+                                // Format with appropriate precision for linear value
+                                if linear_val < 1.0 {
+                                    format!("{:.3}", linear_val)
                                 } else {
-                                    format!("{:.2}", val)
+                                    format!("{:.2}", linear_val)
                                 }
                             })
-                            .include_y(y_min)
-                            .include_y(y_max)
+                            .include_y(y_min_log)
+                            .include_y(y_max_log)
                             .legend(
                                 egui_plot::Legend::default().position(egui_plot::Corner::RightTop),
                             )
                             .show(ui, |plot_ui| {
-                                // Use linear scale (no transformation)
+                                // Expected max line in log scale
                                 let max_line_points = PlotPoints::new(vec![
-                                    [0.0, expected_max_ms],
-                                    [time_range, expected_max_ms],
+                                    [0.0, to_log_y(expected_max_ms)],
+                                    [time_range, to_log_y(expected_max_ms)],
                                 ]);
 
                                 plot_ui.line(
@@ -561,28 +573,33 @@ fn update_ui_client(
                             metrics.expected_max_latency.as_secs_f64() * 1000.0
                         ));
 
-                        // Create plot points for each statistic
+                        // Helper function to safely convert to log scale (avoid log(0) or negative values)
+                        let to_log_y = |y: f64| {
+                            let safe_y = y.max(0.0001); // Minimum 0.0001ms to avoid log(0)
+                            safe_y.log10()
+                        };
+                        
+                        // Create plot points for each statistic with log Y scale
                         let avg_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.avg]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.avg)]).collect();
                         let min_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.min]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.min)]).collect();
                         let max_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.max]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.max)]).collect();
                         let p50_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.p50]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p50)]).collect();
                         let p95_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.p95]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p95)]).collect();
                         let p99_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.p99]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p99)]).collect();
                         let p100_points: PlotPoints =
-                            flow_stats.points.iter().map(|p| [p.time, p.p100]).collect();
+                            flow_stats.points.iter().map(|p| [p.time, to_log_y(p.p100)]).collect();
                         let std_dev_points: PlotPoints = flow_stats
                             .points
                             .iter()
-                            .map(|p| [p.time, p.std_dev])
+                            .map(|p| [p.time, to_log_y(p.std_dev)])
                             .collect();
 
-                        
                         // Expected max latency line
                         let expected_max_ms = metrics.expected_max_latency.as_secs_f64() * 1000.0;
                         let time_range = if let Some(last) = flow_stats.points.last() {
@@ -590,9 +607,8 @@ fn update_ui_client(
                         } else {
                             1.0
                         };
-                        // Calculate Y-axis bounds based on all data points to prevent jumping
-                        // Use linear scale with proper formatting
-                        let y_min =
+                        // Calculate Y-axis bounds based on all data points (in linear space)
+                        let y_min_linear =
                             flow_stats
                                 .points
                                 .iter()
@@ -603,16 +619,17 @@ fn update_ui_client(
                                 })
                                 .fold(f64::INFINITY, f64::min)
                                 .min(0.0); // Start at 0 or below
-                        let y_max =
-                            flow_stats
-                                .points
-                                .iter()
-                                .map(|p| {
-                                    p.max.max(p.p100.max(p.std_dev))
-                                })
-                                .fold(f64::NEG_INFINITY, f64::max)
-                                .max(expected_max_ms * 1.2) // At least 20% above expected max
-                                .max(1.0); // At least 1ms
+                        let y_max_linear = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| p.max.max(p.p100.max(p.std_dev)))
+                            .fold(f64::NEG_INFINITY, f64::max)
+                            .max(expected_max_ms * 1.2) // At least 20% above expected max
+                            .max(1.0); // At least 1ms
+                        
+                        // Convert bounds to log scale for plotting
+                        let y_min_log = to_log_y(y_min_linear.max(0.0001));
+                        let y_max_log = to_log_y(y_max_linear);
 
                         // Get available width for the plot
                         let plot_width = ui.available_width().max(400.0); // Minimum 400px width
@@ -621,25 +638,27 @@ fn update_ui_client(
                             .width(plot_width)
                             .height(250.0)
                             .x_axis_label("Time (seconds)")
-                            .y_axis_label("Latency (ms)")
+                            .y_axis_label("Latency (ms) - Log Scale")
                             .y_axis_formatter(|val, _range, _| {
-                                // Format with appropriate precision for linear scale
-                                if val < 1.0 {
-                                    format!("{:.3}", val)
+                                // Convert from log scale back to linear for display
+                                let linear_val = 10f64.powf(val);
+                                // Format with appropriate precision for linear value
+                                if linear_val < 1.0 {
+                                    format!("{:.3}", linear_val)
                                 } else {
-                                    format!("{:.2}", val)
+                                    format!("{:.2}", linear_val)
                                 }
                             })
-                            .include_y(y_min)
-                            .include_y(y_max)
+                            .include_y(y_min_log)
+                            .include_y(y_max_log)
                             .legend(
                                 egui_plot::Legend::default().position(egui_plot::Corner::RightTop),
                             )
                             .show(ui, |plot_ui| {
-                                // Use linear scale (no transformation)
+                                // Expected max line in log scale
                                 let max_line_points = PlotPoints::new(vec![
-                                    [0.0, expected_max_ms],
-                                    [time_range, expected_max_ms],
+                                    [0.0, to_log_y(expected_max_ms)],
+                                    [time_range, to_log_y(expected_max_ms)],
                                 ]);
 
                                 plot_ui.line(

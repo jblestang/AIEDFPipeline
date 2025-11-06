@@ -241,9 +241,9 @@ impl Pipeline {
         for config in &self.input_sockets {
             let quantum = match config.flow_id {
                 1 => 32768, // Highest quantum for flow 1 (low data rate) to ensure fair treatment
-                2 => 4096, // Medium quantum for flow 2
-                3 => 1024, // Standard quantum for flow 3
-                _ => 1024, // Default quantum for other flows
+                2 => 4096,  // Medium quantum for flow 2
+                3 => 1024,  // Standard quantum for flow 3
+                _ => 1024,  // Default quantum for other flows
             };
             self.input_drr
                 .add_flow(config.flow_id, quantum, config.latency_budget);
@@ -252,9 +252,9 @@ impl Pipeline {
         for config in &self.output_sockets {
             let quantum = match config.flow_id {
                 1 => 32768, // Highest quantum for flow 1 (low data rate) to ensure fair treatment
-                2 => 4096, // Medium quantum for flow 2
-                3 => 1024, // Standard quantum for flow 3
-                _ => 1024, // Default quantum for other flows
+                2 => 4096,  // Medium quantum for flow 2
+                3 => 1024,  // Standard quantum for flow 3
+                _ => 1024,  // Default quantum for other flows
             };
             self.output_drr
                 .add_flow(config.flow_id, quantum, config.latency_budget);
@@ -268,14 +268,20 @@ impl Pipeline {
             .collect();
 
         // Spawn input handlers for each socket
-        // These handlers read from UDP sockets and schedule packets via input DRR
+        // Flow 1 bypasses Input DRR and goes directly to queue1 for lowest latency
+        // Flow 2/3 go through Input DRR for fair scheduling
+        let queue1_clone_for_flow1 = self.queue1.clone();
         for (socket, config) in input_socket_handles {
             let socket_clone = socket.clone();
             let input_drr_clone = self.input_drr.clone();
             let running_clone = self.running.clone();
             let latency_budget = config.latency_budget;
             let flow_id = config.flow_id;
-
+            let queue1_for_flow1 = if flow_id == 1 {
+                Some(queue1_clone_for_flow1.clone())
+            } else {
+                None
+            };
 
             let _handle = tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
@@ -297,8 +303,36 @@ impl Pipeline {
                                 latency_budget,
                             };
 
-                            // Schedule packet via input DRR (handles socket read priority)
-                            let _ = input_drr_clone.schedule_packet(packet);
+                            // Flow 1 bypasses Input DRR and goes directly to queue1 for lowest latency
+                            if flow_id == 1 {
+                                if let Some(queue1) = queue1_for_flow1.as_ref() {
+                                    // Direct path for Flow 1 - bypass Input DRR entirely
+                                    match queue1.sender().try_send(packet) {
+                                        Ok(()) => {
+                                            // Successfully sent
+                                        }
+                                        Err(crossbeam_channel::TrySendError::Full(packet)) => {
+                                            // Queue is full - try to drop a Flow 2/3 packet to make room
+                                            if let Ok(old_packet) = queue1.try_recv() {
+                                                if old_packet.flow_id != 1 {
+                                                    // Drop the old packet and send Flow 1 packet
+                                                    let _ = queue1.sender().try_send(packet);
+                                                } else {
+                                                    // Old packet was also Flow 1, put it back
+                                                    let _ = queue1.sender().try_send(old_packet);
+                                                }
+                                            }
+                                            // If couldn't make room, Flow 1 packet is lost (shouldn't happen often)
+                                        }
+                                        Err(_) => {
+                                            // Channel disconnected, continue
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Flow 2/3 go through Input DRR for fair scheduling
+                                let _ = input_drr_clone.schedule_packet(packet);
+                            }
                         }
                         Err(_e) => {
                             // Socket error - yield briefly
@@ -321,9 +355,37 @@ impl Pipeline {
                 while *running_input_drr.lock() {
                     // Process packets from input DRR (DRR scheduling handles socket read priority)
                     if let Some(packet) = input_drr_clone.process_next() {
-                        // Removed verbose logging to reduce latency
-                        // Forward to queue1 (which feeds EDF)
-                        let _ = queue1_clone.send(packet);
+                        // Use try_send to avoid blocking on full queue
+                        // If queue is full, prioritize Flow 1 by dropping Flow 2/3 packets if needed
+                        let flow_id = packet.flow_id;
+                        match queue1_clone.sender().try_send(packet) {
+                            Ok(()) => {
+                                // Successfully sent
+                            }
+                            Err(crossbeam_channel::TrySendError::Full(packet)) => {
+                                // Queue is full - if this is Flow 1 (low latency), drop a Flow 2/3 packet to make room
+                                if flow_id == 1 {
+                                    // Try to receive and drop a non-Flow1 packet to make room
+                                    if let Ok(old_packet) = queue1_clone.try_recv() {
+                                        if old_packet.flow_id != 1 {
+                                            // Drop the old packet and send Flow 1 packet
+                                            let _ = queue1_clone.sender().try_send(packet);
+                                        } else {
+                                            // Old packet was also Flow 1, put it back and skip this one
+                                            let _ = queue1_clone.sender().try_send(old_packet);
+                                        }
+                                    } else {
+                                        // Couldn't make room, Flow 1 packet is lost (shouldn't happen often)
+                                    }
+                                }
+                                // For Flow 2/3, if queue is full, just drop the packet
+                                // This ensures Flow 1 packets can always get through
+                            }
+                            Err(_) => {
+                                // Channel disconnected, exit
+                                break;
+                            }
+                        }
                     } else {
                         // No packets available - yield briefly to avoid busy-waiting
                         // Use std::hint::spin_loop for better CPU efficiency without sleep overhead
@@ -334,6 +396,7 @@ impl Pipeline {
 
         // EDF processing thread with high priority
         let edf_clone = self.edf.clone();
+        let queue2_clone = self.queue2.clone();
         let running_clone = self.running.clone();
 
         std::thread::Builder::new()
@@ -347,7 +410,35 @@ impl Pipeline {
                         // No sleep needed for zero-copy processing
 
                         // Send processed packet via EDF's output (queue2)
-                        let _ = edf_clone.send_processed(packet);
+                        // Use try_send to avoid blocking - if queue is full, prioritize Flow 1
+                        let flow_id = packet.flow_id;
+                        let queue2_sender = queue2_clone.sender();
+                        match queue2_sender.try_send(packet) {
+                            Ok(()) => {
+                                // Successfully sent
+                            }
+                            Err(crossbeam_channel::TrySendError::Full(packet)) => {
+                                // Queue is full - if this is Flow 1 (low latency), drop a Flow 2/3 packet to make room
+                                if flow_id == 1 {
+                                    // Try to receive and drop a non-Flow1 packet to make room
+                                    if let Ok(old_packet) = queue2_clone.try_recv() {
+                                        if old_packet.flow_id != 1 {
+                                            // Drop the old packet and send Flow 1 packet
+                                            let _ = queue2_sender.try_send(packet);
+                                        } else {
+                                            // Old packet was also Flow 1, put it back and skip this one
+                                            let _ = queue2_sender.try_send(old_packet);
+                                        }
+                                    } else {
+                                        // Couldn't make room, Flow 1 packet is lost (shouldn't happen often)
+                                    }
+                                }
+                                // For Flow 2/3, if queue is full, just drop the packet
+                            }
+                            Err(_) => {
+                                // Channel disconnected, continue
+                            }
+                        }
                     } else {
                         // No packets available - use spin loop for minimal latency
                         std::hint::spin_loop();
@@ -433,7 +524,7 @@ impl Pipeline {
                     if !*running_periodic.lock() {
                         break;
                     }
-                    
+
                     // Use spin loop with periodic check instead of sleep
                     // This allows more responsive shutdown while still batching updates
                     if interval.elapsed() >= Duration::from_millis(100) {
@@ -503,13 +594,13 @@ fn set_thread_priority(priority: i32) {
         // Map priority levels to QoS classes:
         // Priority 2 (high) -> QOS_CLASS_USER_INTERACTIVE or QOS_CLASS_USER_INITIATED
         // Priority 1 (low) -> QOS_CLASS_UTILITY or QOS_CLASS_BACKGROUND
-        
+
         // Define QoS class constants (from pthread/qos.h)
         // QOS_CLASS_USER_INTERACTIVE = 0x21 (highest, for UI)
         const QOS_CLASS_USER_INITIATED: u32 = 0x19; // High priority for critical work
         const QOS_CLASS_UTILITY: u32 = 0x15; // Medium priority for utility work
         const QOS_CLASS_BACKGROUND: u32 = 0x09; // Low priority for background work
-        
+
         // Select QoS class based on priority
         let qos_class = if priority >= 2 {
             QOS_CLASS_USER_INITIATED // High priority for EDF and critical threads
@@ -518,16 +609,16 @@ fn set_thread_priority(priority: i32) {
         } else {
             QOS_CLASS_BACKGROUND // Lowest priority
         };
-        
+
         unsafe {
             // Set QoS class for current thread
             // pthread_set_qos_class_self_np signature: int pthread_set_qos_class_self_np(qos_class_t qos_class, int relative_priority);
             extern "C" {
                 fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
             }
-            
+
             let _ = pthread_set_qos_class_self_np(qos_class, 0);
-            
+
             // Also set thread name if possible
             if let Ok(name) = CString::new(format!("Thread-Priority-{}", priority)) {
                 let _ = libc::pthread_setname_np(name.as_ptr());
