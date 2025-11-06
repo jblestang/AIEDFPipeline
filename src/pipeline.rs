@@ -249,10 +249,11 @@ impl Pipeline {
             let socket = Arc::new(std_socket);
 
             // Determine quantum based on priority
+            // Balanced quantums: HIGH gets more bandwidth but not overwhelming
             let quantum = match config.priority {
-                Priority::HIGH => 65536,   // Highest quantum for HIGH priority
-                Priority::MEDIUM => 1024,   // Medium quantum for MEDIUM priority
-                Priority::LOW => 512,       // Standard quantum for LOW priority
+                Priority::HIGH => 32768,   // High quantum for HIGH priority (was 65536, too high)
+                Priority::MEDIUM => 4096,   // Medium quantum for MEDIUM priority
+                Priority::LOW => 1024,      // Lower quantum for LOW priority
             };
 
             // Derive flow_id from priority for backward compatibility with IngressDRRScheduler

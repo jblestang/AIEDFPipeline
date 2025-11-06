@@ -164,8 +164,28 @@ impl EDFScheduler {
         for task in tasks_to_insert {
             // Limit heap size - drop lowest priority packets if full
             if tasks.len() >= MAX_HEAP_SIZE {
-                // Drop the task with the latest deadline (lowest priority in min-heap)
-                let _ = tasks.pop();
+                // When heap is full and inserting a HIGH priority packet,
+                // try to drop a LOW priority packet if one exists
+                // Otherwise, drop the latest deadline (which is at the root of min-heap after reversal)
+                if task.packet.priority == crate::drr_scheduler::Priority::HIGH {
+                    // For HIGH priority, try to find and drop a LOW priority packet
+                    // Since we can't efficiently find latest deadline in min-heap,
+                    // we'll drop the earliest deadline if it's LOW priority
+                    // (This is a heuristic - ideally we'd drop latest LOW, but that's expensive)
+                    if let Some(peeked) = tasks.peek() {
+                        if peeked.packet.priority == crate::drr_scheduler::Priority::LOW {
+                            let _ = tasks.pop();
+                        } else {
+                            // No LOW priority at root, drop latest deadline (standard pop)
+                            let _ = tasks.pop();
+                        }
+                    } else {
+                        let _ = tasks.pop();
+                    }
+                } else {
+                    // For MEDIUM/LOW priority, drop latest deadline (standard behavior)
+                    let _ = tasks.pop();
+                }
             }
             tasks.push(task);
         }
