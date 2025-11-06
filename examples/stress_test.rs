@@ -219,7 +219,7 @@ fn main() {
         test_duration.as_secs()
     );
 
-    let factor = 10;
+    let factor = 5;
 
     // Configuration - different data rates per flow (DOUBLED)
     // Flow 1 (1ms deadline): Low latency = Low data rate (fewer packets)
@@ -230,9 +230,9 @@ fn main() {
     let packets_flow3 = 200 * factor * test_duration.as_secs(); // High data rate for high latency flow (doubled)
 
     // Different send rates to simulate different data rates (doubled = halved delays)
-    let send_delay_flow1 = 50; // Send every 50ms (20 packets/sec, doubled from 10)
-    let send_delay_flow2 = 10; // Send every 10ms (100 packets/sec, doubled from 50)
-    let send_delay_flow3 = 5; // Send every 5ms (200 packets/sec, doubled from 100)
+    let send_delay_flow1 = test_duration.as_secs() * 1000 / packets_flow1  ; // Send every 50ms (20 packets/sec, doubled from 10)
+    let send_delay_flow2 = test_duration.as_secs() * 1000 / packets_flow2 ; // Send every 10ms (100 packets/sec, doubled from 50)
+    let send_delay_flow3 = test_duration.as_secs() * 1000 / packets_flow3 ; // Send every 5ms (200 packets/sec, doubled from 100)
 
     // Start receiving threads for each flow
     let receiver_handles: Vec<_> = vec![(1, 9080), (2, 9081), (3, 9082)]
