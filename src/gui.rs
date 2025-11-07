@@ -182,6 +182,29 @@ fn update_ui(
 
         ui.separator();
 
+        // Packet drops display
+        ui.heading("Packet Drops");
+        ui.horizontal(|ui| {
+            ui.label("Flow ID");
+            ui.label("Ingress");
+            ui.label("EDF Heap");
+            ui.label("EDF Output");
+            ui.label("Total");
+        });
+        ui.separator();
+        for &flow_id in &flows {
+            let metrics = &latest_metrics[flow_id];
+            ui.horizontal(|ui| {
+                ui.label(format!("{}", flow_id));
+                ui.label(format!("{}", metrics.ingress_drops));
+                ui.label(format!("{}", metrics.edf_heap_drops));
+                ui.label(format!("{}", metrics.edf_output_drops));
+                ui.label(format!("{}", metrics.total_drops));
+            });
+        }
+
+        ui.separator();
+
         // Queue Occupancy Display
         ui.heading("Channel Occupancy");
         if let Some(first_metrics) = latest_metrics.values().next() {
@@ -632,6 +655,29 @@ fn update_ui_client(
                 ui.label(format_latency(metrics.p100.unwrap_or(Duration::ZERO)));
                 ui.label(format_latency(metrics.std_dev.unwrap_or(Duration::ZERO)));
                 ui.label(format!("{}", metrics.deadline_misses));
+            });
+        }
+
+        ui.separator();
+
+        // Packet drops display
+        ui.heading("Packet Drops");
+        ui.horizontal(|ui| {
+            ui.label("Flow ID");
+            ui.label("Ingress");
+            ui.label("EDF Heap");
+            ui.label("EDF Output");
+            ui.label("Total");
+        });
+        ui.separator();
+        for &flow_id in &flows {
+            let metrics = &latest_metrics[flow_id];
+            ui.horizontal(|ui| {
+                ui.label(format!("{}", flow_id));
+                ui.label(format!("{}", metrics.ingress_drops));
+                ui.label(format!("{}", metrics.edf_heap_drops));
+                ui.label(format!("{}", metrics.edf_output_drops));
+                ui.label(format!("{}", metrics.total_drops));
             });
         }
 

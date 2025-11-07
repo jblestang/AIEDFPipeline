@@ -43,6 +43,11 @@ pub struct EDFScheduler {
     high_priority_output_tx: Sender<Packet>,
     medium_priority_output_tx: Sender<Packet>,
     low_priority_output_tx: Sender<Packet>,
+    // Drop counters (lock-free atomics)
+    heap_drops: Arc<std::sync::atomic::AtomicU64>,
+    high_priority_output_drops: Arc<std::sync::atomic::AtomicU64>,
+    medium_priority_output_drops: Arc<std::sync::atomic::AtomicU64>,
+    low_priority_output_drops: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl EDFScheduler {
@@ -62,7 +67,21 @@ impl EDFScheduler {
             high_priority_output_tx,
             medium_priority_output_tx,
             low_priority_output_tx,
+            heap_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            high_priority_output_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            medium_priority_output_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            low_priority_output_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Get drop counts (for metrics)
+    pub fn get_drop_counts(&self) -> (u64, u64, u64, u64) {
+        (
+            self.heap_drops.load(std::sync::atomic::Ordering::Relaxed),
+            self.high_priority_output_drops.load(std::sync::atomic::Ordering::Relaxed),
+            self.medium_priority_output_drops.load(std::sync::atomic::Ordering::Relaxed),
+            self.low_priority_output_drops.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     #[allow(dead_code)] // Used in tests
@@ -164,6 +183,9 @@ impl EDFScheduler {
         for task in tasks_to_insert {
             // Limit heap size - drop lowest priority packets if full
             if tasks.len() >= MAX_HEAP_SIZE {
+                // Track drop
+                self.heap_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                
                 // When heap is full and inserting a HIGH priority packet,
                 // try to drop a LOW priority packet if one exists
                 // Otherwise, drop the latest deadline (which is at the root of min-heap after reversal)
@@ -202,13 +224,22 @@ impl EDFScheduler {
             let packet = task.packet;
             match packet.priority {
                 crate::drr_scheduler::Priority::HIGH => {
-                    let _ = self.high_priority_output_tx.try_send(packet);
+                    if self.high_priority_output_tx.try_send(packet).is_err() {
+                        // Queue full - track drop
+                        self.high_priority_output_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 crate::drr_scheduler::Priority::MEDIUM => {
-                    let _ = self.medium_priority_output_tx.try_send(packet);
+                    if self.medium_priority_output_tx.try_send(packet).is_err() {
+                        // Queue full - track drop
+                        self.medium_priority_output_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 crate::drr_scheduler::Priority::LOW => {
-                    let _ = self.low_priority_output_tx.try_send(packet);
+                    if self.low_priority_output_tx.try_send(packet).is_err() {
+                        // Queue full - track drop
+                        self.low_priority_output_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             None // Return None since packet was sent to output queue

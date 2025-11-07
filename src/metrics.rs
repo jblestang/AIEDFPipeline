@@ -301,6 +301,15 @@ pub struct MetricsSnapshot {
     pub queue2_occupancy: usize,
     #[serde(default = "default_queue_capacity")]
     pub queue2_capacity: usize,
+    // Packet drop metrics (per flow, aggregated from all drop points)
+    #[serde(default = "default_zero_u64")]
+    pub ingress_drops: u64,      // Drops at IngressDRR → Input Queue
+    #[serde(default = "default_zero_u64")]
+    pub edf_heap_drops: u64,     // Drops at EDF Heap
+    #[serde(default = "default_zero_u64")]
+    pub edf_output_drops: u64,   // Drops at EDF → Output Queue
+    #[serde(default = "default_zero_u64")]
+    pub total_drops: u64,        // Total drops for this flow
     #[serde(skip, default = "default_instant")]
     #[allow(dead_code)]
     pub last_update: Instant,
@@ -320,6 +329,10 @@ fn default_zero() -> usize {
 
 fn default_queue_capacity() -> usize {
     128
+}
+
+fn default_zero_u64() -> u64 {
+    0
 }
 
 mod duration_millis {
@@ -461,6 +474,8 @@ impl MetricsCollector {
     pub fn send_current_metrics(
         &self,
         flow_id_to_expected_latency: &std::collections::HashMap<u64, Duration>,
+        ingress_drops: Option<(u64, u64, u64)>, // (high, medium, low) drops from IngressDRR
+        edf_drops: Option<(u64, u64, u64, u64)>, // (heap, high_out, medium_out, low_out) drops from EDF
     ) {
         // Get queue occupancy (no lock needed)
         let queue1_occupancy = self.queue1.as_ref().map(|q| q.occupancy()).unwrap_or(0);
@@ -475,6 +490,12 @@ impl MetricsCollector {
             metrics.clone() // Clone while holding lock (fast operation)
         }; // Lock released here
 
+        // Map drop counts to flow_id (HIGH=1, MEDIUM=2, LOW=3)
+        let (ingress_high_drops, ingress_medium_drops, ingress_low_drops) = 
+            ingress_drops.unwrap_or((0, 0, 0));
+        let (edf_heap_drops, edf_high_out_drops, edf_medium_out_drops, edf_low_out_drops) = 
+            edf_drops.unwrap_or((0, 0, 0, 0));
+
         // Compute statistics outside the lock (no blocking of other threads)
         let mut snapshot = std::collections::HashMap::new();
         for (fid, m) in metrics_clone.iter() {
@@ -482,6 +503,19 @@ impl MetricsCollector {
                 .get(fid)
                 .copied()
                 .unwrap_or(Duration::from_millis(200));
+            
+            // Map drop counts to this flow_id
+            let (ingress_drops_for_flow, edf_output_drops_for_flow) = match *fid {
+                1 => (ingress_high_drops, edf_high_out_drops),      // HIGH priority
+                2 => (ingress_medium_drops, edf_medium_out_drops), // MEDIUM priority
+                3 => (ingress_low_drops, edf_low_out_drops),       // LOW priority
+                _ => (0, 0),
+            };
+            
+            // EDF heap drops are shared across all flows (we'll attribute to all flows for visibility)
+            // In practice, heap drops affect all priorities, but we show it per flow for monitoring
+            let total_drops = ingress_drops_for_flow + edf_heap_drops + edf_output_drops_for_flow;
+            
             snapshot.insert(
                 *fid,
                 MetricsSnapshot {
@@ -502,6 +536,10 @@ impl MetricsCollector {
                     queue1_capacity,
                     queue2_occupancy,
                     queue2_capacity,
+                    ingress_drops: ingress_drops_for_flow,
+                    edf_heap_drops, // Shared across all flows
+                    edf_output_drops: edf_output_drops_for_flow,
+                    total_drops,
                     last_update: m.last_update,
                     recent_latencies: m.get_recent_latencies(1000),
                 },
@@ -548,6 +586,10 @@ impl MetricsCollector {
                     queue1_capacity,
                     queue2_occupancy,
                     queue2_capacity,
+                    ingress_drops: 0,
+                    edf_heap_drops: 0,
+                    edf_output_drops: 0,
+                    total_drops: 0,
                     last_update: m.last_update,
                     recent_latencies: m.get_recent_latencies(1000),
                 },

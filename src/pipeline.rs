@@ -42,6 +42,9 @@ pub struct Pipeline {
     running: Arc<AtomicBool>, // Use AtomicBool instead of Mutex for lock-free reads
     input_sockets: Vec<SocketConfig>,
     output_sockets: Vec<SocketConfig>,
+    // Store scheduler references for drop count collection
+    ingress_drr_for_drops: Arc<IngressDRRScheduler>,
+    edf_for_drops: Arc<EDFScheduler>,
 }
 
 impl Pipeline {
@@ -136,14 +139,16 @@ impl Pipeline {
         ));
 
         Ok(Self {
-            ingress_drr,
-            edf,
+            ingress_drr: ingress_drr.clone(),
+            edf: edf.clone(),
             egress_drr,
             metrics_collector,
             metrics_receiver: metrics_rx,
             running: Arc::new(AtomicBool::new(false)),
             input_sockets,
             output_sockets,
+            ingress_drr_for_drops: ingress_drr,
+            edf_for_drops: edf,
         })
     }
 
@@ -326,6 +331,8 @@ impl Pipeline {
             .collect();
         let flow_id_to_expected_latency_arc = Arc::new(flow_id_to_expected_latency);
         let flow_map_clone = flow_id_to_expected_latency_arc.clone();
+        let ingress_drr_for_drops = self.ingress_drr_for_drops.clone();
+        let edf_for_drops = self.edf_for_drops.clone();
         std::thread::Builder::new()
             .name("Statistics-Thread".to_string())
             .spawn(move || {
@@ -342,7 +349,12 @@ impl Pipeline {
                     if interval.elapsed() >= Duration::from_millis(100) {
                         let map: HashMap<u64, Duration> =
                             flow_map_clone.iter().map(|(k, v)| (*k, *v)).collect();
-                        metrics_collector_periodic.send_current_metrics(&map);
+                        
+                        // Collect drop counts from schedulers
+                        let ingress_drops = ingress_drr_for_drops.get_drop_counts();
+                        let edf_drops = edf_for_drops.get_drop_counts();
+                        
+                        metrics_collector_periodic.send_current_metrics(&map, Some(ingress_drops), Some(edf_drops));
                         interval = std::time::Instant::now();
                     } else {
                         std::hint::spin_loop();

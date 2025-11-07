@@ -39,6 +39,10 @@ pub struct IngressDRRScheduler {
     low_priority_tx: crossbeam_channel::Sender<Packet>,
     // OPTIMIZATION: Single mutex for all state to reduce lock acquisitions
     state: Arc<Mutex<IngressDRRState>>,
+    // Drop counters per priority (lock-free atomics)
+    high_priority_drops: Arc<std::sync::atomic::AtomicU64>,
+    medium_priority_drops: Arc<std::sync::atomic::AtomicU64>,
+    low_priority_drops: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,7 +72,19 @@ impl IngressDRRScheduler {
                 active_flows: Vec::new(),
                 current_flow_index: 0,
             })),
+            high_priority_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            medium_priority_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            low_priority_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Get drop counts per priority (for metrics)
+    pub fn get_drop_counts(&self) -> (u64, u64, u64) {
+        (
+            self.high_priority_drops.load(std::sync::atomic::Ordering::Relaxed),
+            self.medium_priority_drops.load(std::sync::atomic::Ordering::Relaxed),
+            self.low_priority_drops.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     pub fn add_socket(
@@ -230,7 +246,18 @@ impl IngressDRRScheduler {
                             if tx.try_send(packet).is_ok() {
                                 packets_read += 1;
                             } else {
-                                // Queue full, move to next flow
+                                // Queue full - track drop and move to next flow
+                                match priority {
+                                    Priority::HIGH => {
+                                        self.high_priority_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Priority::MEDIUM => {
+                                        self.medium_priority_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Priority::LOW => {
+                                        self.low_priority_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
                                 break;
                             }
                         }
