@@ -380,7 +380,7 @@ impl MetricsCollector {
         queue2: Option<Arc<crate::queue::Queue>>,
     ) -> Self {
         // Create lock-free channel for metrics events (bounded to prevent unbounded growth)
-        let (events_tx, events_rx) = crossbeam_channel::bounded(10000);
+        let (events_tx, events_rx): (crossbeam_channel::Sender<MetricsEvent>, crossbeam_channel::Receiver<MetricsEvent>) = crossbeam_channel::bounded(10000);
         
         let metrics: Arc<Mutex<std::collections::HashMap<u64, Metrics>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let metrics_clone = metrics.clone();
