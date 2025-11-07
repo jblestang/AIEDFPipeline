@@ -220,6 +220,20 @@ impl EDFScheduler {
             }
             drop(tasks); // Release lock before returning
 
+            // Simulate packet processing time: 0.5 ms +/- 0.05 ms (0.45 ms to 0.55 ms)
+            // Use a simple pseudo-random approach based on packet data hash for deterministic simulation
+            let hash = task.packet.data.iter().fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            // Map hash to range [0, 1] then scale to [0.45, 0.55] ms
+            let normalized = (hash % 1000) as f64 / 1000.0;
+            let processing_time_ms = 0.45 + (normalized * 0.1); // 0.45 to 0.55 ms
+            let processing_time = std::time::Duration::from_secs_f64(processing_time_ms / 1000.0);
+            
+            // Busy-wait to simulate processing (more accurate than sleep for sub-millisecond delays)
+            let start = Instant::now();
+            while start.elapsed() < processing_time {
+                std::hint::spin_loop();
+            }
+
             // Route output packet to appropriate priority queue
             let packet = task.packet;
             match packet.priority {

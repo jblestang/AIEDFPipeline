@@ -20,6 +20,11 @@ struct StatisticsPoint {
     p99: f64,
     p100: f64,
     std_dev: f64,
+    // Drop metrics
+    ingress_drops: u64,
+    edf_heap_drops: u64,
+    edf_output_drops: u64,
+    total_drops: u64,
 }
 
 // State to track statistics history per flow
@@ -90,6 +95,10 @@ fn update_ui(
                 p99: snapshot.p99.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0,
                 p100: snapshot.p100.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0,
                 std_dev: snapshot.std_dev.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0,
+                ingress_drops: snapshot.ingress_drops,
+                edf_heap_drops: snapshot.edf_heap_drops,
+                edf_output_drops: snapshot.edf_output_drops,
+                total_drops: snapshot.total_drops,
             };
 
             // Only add if this is a new point (different time) or if it's the first point
@@ -201,48 +210,6 @@ fn update_ui(
                 ui.label(format!("{}", metrics.edf_output_drops));
                 ui.label(format!("{}", metrics.total_drops));
             });
-        }
-
-        ui.separator();
-
-        // Queue Occupancy Display
-        ui.heading("Channel Occupancy");
-        if let Some(first_metrics) = latest_metrics.values().next() {
-            // Only show queue occupancy if capacity > 0 (indicates data is available)
-            if first_metrics.queue1_capacity > 0 || first_metrics.queue2_capacity > 0 {
-                ui.horizontal(|ui| {
-                    ui.label("Queue 1:");
-                    ui.label(format!(
-                        "{}/{} ({:.1}%)",
-                        first_metrics.queue1_occupancy,
-                        first_metrics.queue1_capacity,
-                        if first_metrics.queue1_capacity > 0 {
-                            (first_metrics.queue1_occupancy as f64
-                                / first_metrics.queue1_capacity as f64)
-                                * 100.0
-                        } else {
-                            0.0
-                        }
-                    ));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Queue 2:");
-                    ui.label(format!(
-                        "{}/{} ({:.1}%)",
-                        first_metrics.queue2_occupancy,
-                        first_metrics.queue2_capacity,
-                        if first_metrics.queue2_capacity > 0 {
-                            (first_metrics.queue2_occupancy as f64
-                                / first_metrics.queue2_capacity as f64)
-                                * 100.0
-                        } else {
-                            0.0
-                        }
-                    ));
-                });
-            } else {
-                ui.label("Queue occupancy data not available (pipeline may need to be rebuilt)");
-            }
         }
 
         ui.separator();
@@ -445,6 +412,99 @@ fn update_ui(
 
         ui.separator();
 
+        // Packet drops graph
+        ui.heading("Packet Drops Over Time");
+        for &flow_id in &flows {
+            if let Some(flow_stats) = stats_history.get(&flow_id) {
+                if !flow_stats.points.is_empty() {
+                    ui.group(|ui| {
+                        ui.label(format!("Flow {} Packet Drops", flow_id));
+
+                        // Create plot points for drop metrics
+                        let ingress_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, p.ingress_drops as f64])
+                            .collect();
+                        let edf_heap_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, p.edf_heap_drops as f64])
+                            .collect();
+                        let edf_output_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, p.edf_output_drops as f64])
+                            .collect();
+                        let total_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, p.total_drops as f64])
+                            .collect();
+
+                        // Calculate Y-axis bounds
+                        let y_max = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| {
+                                p.ingress_drops
+                                    .max(p.edf_heap_drops)
+                                    .max(p.edf_output_drops)
+                                    .max(p.total_drops) as f64
+                            })
+                            .fold(0.0, f64::max)
+                            .max(1.0); // At least 1 for visibility
+
+                        let time_range = if let Some(last) = flow_stats.points.back() {
+                            last.time.max(1.0)
+                        } else {
+                            1.0
+                        };
+
+                        Plot::new(format!("flow_{}_drops_plot", flow_id))
+                            .width(ui.available_width())
+                            .height(300.0)
+                            .x_axis_formatter(|val, _range, _| format!("{:.1}s", val))
+                            .label_formatter(|name, point| {
+                                format!("{}\n{:.1}s, {:.0} drops", name, point.x, point.y)
+                            })
+                            .include_x(0.0)
+                            .include_x(time_range)
+                            .include_y(0.0)
+                            .include_y(y_max)
+                            .show(ui, |plot_ui| {
+                                plot_ui.line(
+                                    Line::new(ingress_points)
+                                        .name("Ingress Drops")
+                                        .color(egui::Color32::RED),
+                                );
+                                plot_ui.line(
+                                    Line::new(edf_heap_points)
+                                        .name("EDF Heap Drops")
+                                        .color(egui::Color32::from_rgb(255, 165, 0)),
+                                );
+                                plot_ui.line(
+                                    Line::new(edf_output_points)
+                                        .name("EDF Output Drops")
+                                        .color(egui::Color32::YELLOW),
+                                );
+                                plot_ui.line(
+                                    Line::new(total_points)
+                                        .name("Total Drops")
+                                        .color(egui::Color32::BLUE),
+                                );
+                            });
+                    });
+                } else {
+                    ui.label(format!("Flow {}: No drop data yet", flow_id));
+                }
+            } else {
+                ui.label(format!("Flow {}: Waiting for drop data...", flow_id));
+            }
+        }
+
+        ui.separator();
+
         // Shutdown button
         if ui.button("Shutdown Pipeline").clicked() {
             _shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -529,6 +589,10 @@ pub fn run_gui_client(server_addr: &str, shutdown_flag: Arc<AtomicBool>) {
                                                     p99: v.p99.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0,
                                                     p100: v.p100.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0,
                                                     std_dev: v.std_dev.unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0,
+                                                    ingress_drops: v.ingress_drops,
+                                                    edf_heap_drops: v.edf_heap_drops,
+                                                    edf_output_drops: v.edf_output_drops,
+                                                    total_drops: v.total_drops,
                                                 };
 
                                                 // Only add if this is a new point (different time) or if it's the first point
@@ -679,48 +743,6 @@ fn update_ui_client(
                 ui.label(format!("{}", metrics.edf_output_drops));
                 ui.label(format!("{}", metrics.total_drops));
             });
-        }
-
-        ui.separator();
-
-        // Queue Occupancy Display
-        ui.heading("Channel Occupancy");
-        if let Some(first_metrics) = latest_metrics.values().next() {
-            // Only show queue occupancy if capacity > 0 (indicates data is available)
-            if first_metrics.queue1_capacity > 0 || first_metrics.queue2_capacity > 0 {
-                ui.horizontal(|ui| {
-                    ui.label("Queue 1:");
-                    ui.label(format!(
-                        "{}/{} ({:.1}%)",
-                        first_metrics.queue1_occupancy,
-                        first_metrics.queue1_capacity,
-                        if first_metrics.queue1_capacity > 0 {
-                            (first_metrics.queue1_occupancy as f64
-                                / first_metrics.queue1_capacity as f64)
-                                * 100.0
-                        } else {
-                            0.0
-                        }
-                    ));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Queue 2:");
-                    ui.label(format!(
-                        "{}/{} ({:.1}%)",
-                        first_metrics.queue2_occupancy,
-                        first_metrics.queue2_capacity,
-                        if first_metrics.queue2_capacity > 0 {
-                            (first_metrics.queue2_occupancy as f64
-                                / first_metrics.queue2_capacity as f64)
-                                * 100.0
-                        } else {
-                            0.0
-                        }
-                    ));
-                });
-            } else {
-                ui.label("Queue occupancy data not available (pipeline may need to be rebuilt)");
-            }
         }
 
         ui.separator();
