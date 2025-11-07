@@ -140,30 +140,15 @@ impl IngressDRRScheduler {
             let mut packets_read = 0;
 
             // DRR (Deficit Round Robin) algorithm:
-            // 1. Process flows in round-robin order (prioritize Flow 1 first if it exists)
-            // 2. For each flow: add quantum to deficit, then process packets until deficit < 1
-            // 3. Move to next flow in round-robin
-            // 4. Deficit carries over to next round (not reset)
-            
-            // Build processing order: Flow 1 first (if exists), then others in round-robin
-            let flow_1_index = active_flows.iter().position(|&id| id == 1);
-            let mut processing_order: Vec<usize> = Vec::with_capacity(active_flows.len());
-            
-            // Add Flow 1 first if it exists
-            if let Some(idx) = flow_1_index {
-                processing_order.push(idx);
-            }
-            
-            // Add other flows in round-robin order starting from current_index
-            for i in 0..active_flows.len() {
-                let idx = (current_index + i) % active_flows.len();
-                if flow_1_index.map_or(true, |flow_1_idx| idx != flow_1_idx) {
-                    processing_order.push(idx);
-                }
-            }
+            // 1. Process flows in round-robin order (fair scheduling, no prioritization)
+            // 2. For each flow: add quantum to deficit, then process packets while deficit > 0
+            // 3. Decrement deficit by 1 for each packet read until deficit reaches 0
+            // 4. When deficit is 0, move flow to back and go to next flow
+            // 5. Deficit carries over to next round (not reset)
 
-            // Process each flow in order using DRR
-            for &flow_index in &processing_order {
+            // Process each flow in round-robin order starting from current_index
+            for i in 0..active_flows.len() {
+                let flow_index = (current_index + i) % active_flows.len();
                 if !running.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
@@ -173,10 +158,7 @@ impl IngressDRRScheduler {
                 // Get socket config from snapshot (no lock needed)
                 let (socket, priority, latency_budget) = match socket_configs_snapshot.get(&flow_id) {
                     Some((s, p, l)) => (s.clone(), *p, *l),
-                    None => {
-                        current_index = (flow_index + 1) % active_flows.len();
-                        continue;
-                    }
+                    None => continue,
                 };
 
                 // DRR Step 1: Add quantum to deficit for this flow
@@ -263,7 +245,7 @@ impl IngressDRRScheduler {
                     }
                 }
 
-                // Update current_index for next round
+                // Update current_index for next round (move to next flow)
                 current_index = (flow_index + 1) % active_flows.len();
             }
 
