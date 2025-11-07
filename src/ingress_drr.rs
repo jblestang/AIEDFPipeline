@@ -162,15 +162,23 @@ impl IngressDRRScheduler {
                 };
 
                 // DRR Step 1: Add quantum to deficit for this flow
-                {
+                let flow_has_deficit = {
                     let mut state = self.state.lock();
                     if let Some(flow) = state.flow_states.get_mut(&flow_id) {
                         flow.deficit += flow.quantum;
+                        flow.deficit > 0
+                    } else {
+                        false
                     }
-                }
+                };
 
                 // DRR Step 2: Process packets for this flow while deficit > 0
                 // Decrement deficit by 1 for each packet read until deficit reaches 0
+                if !flow_has_deficit {
+                    // Flow has no deficit after adding quantum (shouldn't happen, but handle it)
+                    continue;
+                }
+
                 loop {
                     if !running.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
