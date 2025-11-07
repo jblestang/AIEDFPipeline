@@ -42,18 +42,19 @@ impl EgressDRRScheduler {
         running: Arc<std::sync::atomic::AtomicBool>,
         metrics_collector: Arc<crate::metrics::MetricsCollector>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let high_rx = self.high_priority_rx.clone();
+        let medium_rx = self.medium_priority_rx.clone();
+        let low_rx = self.low_priority_rx.clone();
+        
         // OPTIMIZATION: Clone socket map once at start to avoid lock per packet
         // NOTE: This means sockets added after process_queues starts won't be available
         // until the next iteration. For now, we assume all sockets are added before
         // process_queues is called.
+        // IMPORTANT: Clone socket map AFTER cloning receivers to ensure all sockets are added
         let socket_map: HashMap<u64, (Arc<UdpSocket>, SocketAddr)> = {
             let sockets = self.output_sockets.lock();
             sockets.clone()
         };
-        
-        let high_rx = self.high_priority_rx.clone();
-        let medium_rx = self.medium_priority_rx.clone();
-        let low_rx = self.low_priority_rx.clone();
 
         tokio::spawn(async move {
             while running.load(std::sync::atomic::Ordering::Relaxed) {
