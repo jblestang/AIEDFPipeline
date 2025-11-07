@@ -248,9 +248,20 @@ impl Clone for Metrics {
     }
 }
 
+/// Metrics event for lock-free recording (sent from hot path)
+#[derive(Debug, Clone)]
+struct MetricsEvent {
+    flow_id: u64,
+    latency: Duration,
+    deadline_missed: bool,
+    expected_max_latency: Duration,
+}
+
 pub struct MetricsCollector {
     metrics: Arc<Mutex<std::collections::HashMap<u64, Metrics>>>,
     metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>,
+    // Lock-free channel for metrics events (hot path sends here, background thread processes)
+    events_tx: crossbeam_channel::Sender<MetricsEvent>,
     queue1: Option<Arc<crate::queue::Queue>>,
     queue2: Option<Arc<crate::queue::Queue>>,
 }
@@ -368,14 +379,62 @@ impl MetricsCollector {
         queue1: Option<Arc<crate::queue::Queue>>,
         queue2: Option<Arc<crate::queue::Queue>>,
     ) -> Self {
+        // Create lock-free channel for metrics events (bounded to prevent unbounded growth)
+        let (events_tx, events_rx) = crossbeam_channel::bounded(10000);
+        
+        let metrics: Arc<Mutex<std::collections::HashMap<u64, Metrics>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let metrics_clone = metrics.clone();
+        
+        // Background thread to process metrics events (doesn't block hot path)
+        std::thread::Builder::new()
+            .name("Metrics-Processor".to_string())
+            .spawn(move || {
+                // Process events in batches for efficiency
+                let mut batch = Vec::with_capacity(100);
+                loop {
+                    // Collect a batch of events (non-blocking)
+                    while batch.len() < 100 {
+                        match events_rx.try_recv() {
+                            Ok(event) => batch.push(event),
+                            Err(crossbeam_channel::TryRecvError::Empty) => break,
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => return, // Shutdown
+                        }
+                    }
+                    
+                    if batch.is_empty() {
+                        // No events, yield briefly
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    
+                    // Process batch: update metrics (lock only once per batch)
+                    {
+                        let mut metrics_map = metrics_clone.lock();
+                        for event in &batch {
+                            let metrics = metrics_map
+                                .entry(event.flow_id)
+                                .or_insert_with(|| Metrics::new(event.flow_id));
+                            metrics.record_latency(event.latency, event.deadline_missed);
+                        }
+                    } // Lock released
+                    
+                    // Clear batch for next iteration
+                    batch.clear();
+                }
+            })
+            .expect("Failed to spawn metrics processor thread");
+        
         Self {
-            metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            metrics,
             metrics_tx,
+            events_tx,
             queue1,
             queue2,
         }
     }
 
+    /// Record packet metrics (LOCK-FREE: sends event to channel, never blocks)
+    /// This is called from the hot path (EgressDRR) and must not block
     pub fn record_packet(
         &self,
         flow_id: u64,
@@ -383,47 +442,17 @@ impl MetricsCollector {
         deadline_missed: bool,
         expected_max_latency: Duration,
     ) {
-        let mut metrics_map = self.metrics.lock();
-        let metrics = metrics_map
-            .entry(flow_id)
-            .or_insert_with(|| Metrics::new(flow_id));
-        metrics.record_latency(latency, deadline_missed);
-
-        // Get queue occupancy
-        let queue1_occupancy = self.queue1.as_ref().map(|q| q.occupancy()).unwrap_or(0);
-        let queue1_capacity = self.queue1.as_ref().map(|q| q.capacity()).unwrap_or(0);
-        let queue2_occupancy = self.queue2.as_ref().map(|q| q.occupancy()).unwrap_or(0);
-        let queue2_capacity = self.queue2.as_ref().map(|q| q.capacity()).unwrap_or(0);
-
-        // Send updated metrics as snapshots
-        let mut snapshot = std::collections::HashMap::new();
-        for (fid, m) in metrics_map.iter() {
-            snapshot.insert(
-                *fid,
-                MetricsSnapshot {
-                    flow_id: m.flow_id,
-                    packet_count: m.packet_count,
-                    avg_latency: m.average_latency(),
-                    min_latency: m.min_latency(),
-                    max_latency: m.max_latency(),
-                    p50: m.p50(),
-                    p95: m.p95(),
-                    p99: m.p99(),
-                    p999: m.p999(),
-                    p100: m.max_latency(), // P100 is the same as max (100th percentile)
-                    std_dev: m.standard_deviation(),
-                    deadline_misses: m.deadline_misses,
-                    expected_max_latency, // Use the passed expected max latency
-                    queue1_occupancy,
-                    queue1_capacity,
-                    queue2_occupancy,
-                    queue2_capacity,
-                    last_update: m.last_update,
-                    recent_latencies: m.get_recent_latencies(1000), // Last 1000 samples for plotting
-                },
-            );
-        }
-        let _ = self.metrics_tx.try_send(snapshot);
+        // Send event to lock-free channel (non-blocking, never waits on mutex)
+        // If channel is full, drop the event (better than blocking packet processing)
+        let _ = self.events_tx.try_send(MetricsEvent {
+            flow_id,
+            latency,
+            deadline_missed,
+            expected_max_latency,
+        });
+        
+        // Note: We don't send snapshots here anymore - that's done by the statistics thread
+        // This eliminates all mutex contention from the hot path
     }
 
     /// Force send current metrics (useful for periodic updates)
