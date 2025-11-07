@@ -43,6 +43,9 @@ impl EgressDRRScheduler {
         metrics_collector: Arc<crate::metrics::MetricsCollector>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // OPTIMIZATION: Clone socket map once at start to avoid lock per packet
+        // NOTE: This means sockets added after process_queues starts won't be available
+        // until the next iteration. For now, we assume all sockets are added before
+        // process_queues is called.
         let socket_map: HashMap<u64, (Arc<UdpSocket>, SocketAddr)> = {
             let sockets = self.output_sockets.lock();
             sockets.clone()
@@ -86,5 +89,93 @@ impl EgressDRRScheduler {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_add_output_socket_adds_flow_2() {
+        let (high_tx, high_rx) = crossbeam_channel::bounded(128);
+        let (medium_tx, medium_rx) = crossbeam_channel::bounded(128);
+        let (low_tx, low_rx) = crossbeam_channel::bounded(128);
+        
+        let scheduler = EgressDRRScheduler::new(high_rx, medium_rx, low_rx);
+        
+        // Add output socket for Flow 2
+        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        let addr: SocketAddr = "127.0.0.1:9081".parse().unwrap();
+        scheduler.add_output_socket(2, socket, addr);
+        
+        // Verify Flow 2 is in output_sockets
+        let sockets = scheduler.output_sockets.lock();
+        assert!(sockets.contains_key(&2));
+        assert_eq!(sockets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_all_flows_added_to_output_sockets() {
+        let (high_tx, high_rx) = crossbeam_channel::bounded(128);
+        let (medium_tx, medium_rx) = crossbeam_channel::bounded(128);
+        let (low_tx, low_rx) = crossbeam_channel::bounded(128);
+        
+        let scheduler = EgressDRRScheduler::new(high_rx, medium_rx, low_rx);
+        
+        // Add all three output sockets
+        let socket1 = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        let socket2 = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        let socket3 = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        
+        let addr1: SocketAddr = "127.0.0.1:9080".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:9081".parse().unwrap();
+        let addr3: SocketAddr = "127.0.0.1:9082".parse().unwrap();
+        
+        scheduler.add_output_socket(1, socket1, addr1);
+        scheduler.add_output_socket(2, socket2, addr2);
+        scheduler.add_output_socket(3, socket3, addr3);
+        
+        // Verify all flows are in output_sockets
+        let sockets = scheduler.output_sockets.lock();
+        assert_eq!(sockets.len(), 3);
+        assert!(sockets.contains_key(&1));
+        assert!(sockets.contains_key(&2));
+        assert!(sockets.contains_key(&3));
+    }
+
+    #[tokio::test]
+    async fn test_socket_map_clone_includes_all_flows() {
+        let (high_tx, high_rx) = crossbeam_channel::bounded(128);
+        let (medium_tx, medium_rx) = crossbeam_channel::bounded(128);
+        let (low_tx, low_rx) = crossbeam_channel::bounded(128);
+        
+        let scheduler = EgressDRRScheduler::new(high_rx, medium_rx, low_rx);
+        
+        // Add all three output sockets
+        let socket1 = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        let socket2 = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        let socket3 = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        
+        let addr1: SocketAddr = "127.0.0.1:9080".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:9081".parse().unwrap();
+        let addr3: SocketAddr = "127.0.0.1:9082".parse().unwrap();
+        
+        scheduler.add_output_socket(1, socket1, addr1);
+        scheduler.add_output_socket(2, socket2, addr2);
+        scheduler.add_output_socket(3, socket3, addr3);
+        
+        // Simulate socket_map clone like in process_queues
+        let socket_map: HashMap<u64, (Arc<UdpSocket>, SocketAddr)> = {
+            let sockets = scheduler.output_sockets.lock();
+            sockets.clone()
+        };
+        
+        // Verify socket_map contains all flows
+        assert_eq!(socket_map.len(), 3);
+        assert!(socket_map.contains_key(&1));
+        assert!(socket_map.contains_key(&2));
+        assert!(socket_map.contains_key(&3));
     }
 }

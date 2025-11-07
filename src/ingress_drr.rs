@@ -476,7 +476,7 @@ mod tests {
         assert!(socket_configs_snapshot.contains_key(&3));
         
         // Verify Flow 2 has correct priority and latency_budget in snapshot
-        let (socket, priority, latency_budget) = socket_configs_snapshot.get(&2).unwrap();
+        let (_socket, priority, latency_budget) = socket_configs_snapshot.get(&2).unwrap();
         assert_eq!(*priority, Priority::MEDIUM);
         assert_eq!(*latency_budget, Duration::from_millis(50));
     }
