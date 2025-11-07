@@ -187,23 +187,31 @@ impl IngressDRRScheduler {
                     }
                 }
 
-                // DRR Step 2: Process packets for this flow until deficit < 1 (packet cost = 1)
-                // This allows the flow to send up to 'quantum' packets per round
+                // DRR Step 2: Process packets for this flow while deficit > 0
+                // Decrement deficit by 1 for each packet read until deficit reaches 0
                 loop {
                     if !running.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
 
-                    // Check if we can process a packet (deficit >= 1)
-                    let can_process = {
+                    // Check if we can process a packet (deficit > 0)
+                    let current_deficit = {
                         let state = self.state.lock();
                         state.flow_states.get(&flow_id)
-                            .map(|flow| flow.deficit >= 1)
-                            .unwrap_or(false)
+                            .map(|flow| flow.deficit)
+                            .unwrap_or(0)
                     };
 
-                    if !can_process {
-                        // Deficit exhausted for this flow, move to next flow in round-robin
+                    if current_deficit == 0 {
+                        // Deficit is 0, move this flow to the back and go to next flow
+                        {
+                            let mut state = self.state.lock();
+                            // Remove flow from current position and add to end
+                            if let Some(pos) = state.active_flows.iter().position(|&id| id == flow_id) {
+                                state.active_flows.remove(pos);
+                                state.active_flows.push(flow_id);
+                            }
+                        }
                         break;
                     }
 
@@ -211,7 +219,7 @@ impl IngressDRRScheduler {
                     let mut local_buf = [0u8; 1024];
                     match socket.recv_from(&mut local_buf) {
                         Ok((size, _addr)) if size > 0 => {
-                            // DRR Step 3: Decrement deficit by 1 (packet count, not packet length)
+                            // DRR Step 3: Decrement deficit by 1 (packet count)
                             {
                                 let mut state = self.state.lock();
                                 if let Some(flow) = state.flow_states.get_mut(&flow_id) {
