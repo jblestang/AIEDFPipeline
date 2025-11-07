@@ -342,6 +342,15 @@ fn update_ui(
                                     format!("{:.2}", linear_val)
                                 }
                             })
+                            .coordinate_formatter(|coord, _plot_style| {
+                                // Format coordinates for hover tooltip: show real linear value with "ms"
+                                let linear_y = 10f64.powf(coord.y);
+                                if linear_y < 1.0 {
+                                    format!("{:.3} ms", linear_y)
+                                } else {
+                                    format!("{:.2} ms", linear_y)
+                                }
+                            })
                             .include_y(y_min_log)
                             .include_y(y_max_log)
                             .legend(
@@ -775,6 +784,15 @@ fn update_ui_client(
                                     format!("{:.3}", linear_val)
                                 } else {
                                     format!("{:.2}", linear_val)
+                                }
+                            })
+                            .coordinate_formatter(|coord, _plot_style| {
+                                // Format coordinates for hover tooltip: show real linear value with "ms"
+                                let linear_y = 10f64.powf(coord.y);
+                                if linear_y < 1.0 {
+                                    format!("{:.3} ms", linear_y)
+                                } else {
+                                    format!("{:.2} ms", linear_y)
                                 }
                             })
                             .include_y(y_min_log)
