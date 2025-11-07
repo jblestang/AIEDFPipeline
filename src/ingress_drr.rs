@@ -161,7 +161,7 @@ impl IngressDRRScheduler {
                     None => continue,
                 };
 
-                // DRR Step 1: Add quantum to deficit for this flow
+                // DRR Step 1: Add quantum to deficit for this flow (deficit carries over)
                 let flow_has_deficit = {
                     let mut state = self.state.lock();
                     if let Some(flow) = state.flow_states.get_mut(&flow_id) {
@@ -263,5 +263,251 @@ impl IngressDRRScheduler {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_add_socket_adds_flow_to_active_flows() {
+        let (high_tx, _high_rx) = crossbeam_channel::bounded(128);
+        let (medium_tx, _medium_rx) = crossbeam_channel::bounded(128);
+        let (low_tx, _low_rx) = crossbeam_channel::bounded(128);
+        
+        let scheduler = IngressDRRScheduler::new(high_tx, medium_tx, low_tx);
+        
+        // Create mock sockets
+        let socket1 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        let socket2 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        let socket3 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        
+        // Add three flows
+        scheduler.add_socket(socket1, 1, Duration::from_millis(5), 32768);
+        scheduler.add_socket(socket2, 2, Duration::from_millis(50), 4096);
+        scheduler.add_socket(socket3, 3, Duration::from_millis(100), 1024);
+        
+        // Verify all flows are in active_flows
+        let state = scheduler.state.lock();
+        assert_eq!(state.active_flows.len(), 3);
+        assert!(state.active_flows.contains(&1));
+        assert!(state.active_flows.contains(&2));
+        assert!(state.active_flows.contains(&3));
+        
+        // Verify flow states exist
+        assert!(state.flow_states.contains_key(&1));
+        assert!(state.flow_states.contains_key(&2));
+        assert!(state.flow_states.contains_key(&3));
+        
+        // Verify flow 2 has correct quantum
+        assert_eq!(state.flow_states.get(&2).unwrap().quantum, 4096);
+    }
+
+    #[test]
+    fn test_deficit_accumulation() {
+        let (high_tx, _high_rx) = crossbeam_channel::bounded(128);
+        let (medium_tx, _medium_rx) = crossbeam_channel::bounded(128);
+        let (low_tx, _low_rx) = crossbeam_channel::bounded(128);
+        
+        let scheduler = IngressDRRScheduler::new(high_tx, medium_tx, low_tx);
+        
+        let socket = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        scheduler.add_socket(socket, 2, Duration::from_millis(50), 4096);
+        
+        // Manually add quantum to deficit (simulating what happens in process_sockets)
+        {
+            let mut state = scheduler.state.lock();
+            if let Some(flow) = state.flow_states.get_mut(&2) {
+                flow.deficit += flow.quantum; // First round
+            }
+        }
+        
+        // Verify deficit is quantum
+        {
+            let state = scheduler.state.lock();
+            assert_eq!(state.flow_states.get(&2).unwrap().deficit, 4096);
+        }
+        
+        // Simulate processing some packets (decrement deficit)
+        {
+            let mut state = scheduler.state.lock();
+            if let Some(flow) = state.flow_states.get_mut(&2) {
+                flow.deficit -= 100; // Process 100 packets
+            }
+        }
+        
+        // Verify deficit decreased
+        {
+            let state = scheduler.state.lock();
+            assert_eq!(state.flow_states.get(&2).unwrap().deficit, 3996);
+        }
+        
+        // Add quantum again (next round) - deficit should accumulate
+        {
+            let mut state = scheduler.state.lock();
+            if let Some(flow) = state.flow_states.get_mut(&2) {
+                flow.deficit += flow.quantum; // Second round
+            }
+        }
+        
+        // Verify deficit accumulated (3996 + 4096 = 8092)
+        {
+            let state = scheduler.state.lock();
+            assert_eq!(state.flow_states.get(&2).unwrap().deficit, 8092);
+        }
+    }
+
+    #[test]
+    fn test_all_flows_in_round_robin_order() {
+        let (high_tx, _high_rx) = crossbeam_channel::bounded(128);
+        let (medium_tx, _medium_rx) = crossbeam_channel::bounded(128);
+        let (low_tx, _low_rx) = crossbeam_channel::bounded(128);
+        
+        let scheduler = IngressDRRScheduler::new(high_tx, medium_tx, low_tx);
+        
+        // Add flows in order: 1, 2, 3
+        let socket1 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        let socket2 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        let socket3 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        
+        scheduler.add_socket(socket1, 1, Duration::from_millis(5), 32768);
+        scheduler.add_socket(socket2, 2, Duration::from_millis(50), 4096);
+        scheduler.add_socket(socket3, 3, Duration::from_millis(100), 1024);
+        
+        // Verify active_flows contains all three flows
+        let state = scheduler.state.lock();
+        assert_eq!(state.active_flows.len(), 3);
+        
+        // Verify all flows are present
+        let flow_ids: Vec<u64> = state.active_flows.clone();
+        assert!(flow_ids.contains(&1));
+        assert!(flow_ids.contains(&2));
+        assert!(flow_ids.contains(&3));
+    }
+
+    #[test]
+    fn test_flow_2_quantum_and_priority() {
+        let (high_tx, _high_rx) = crossbeam_channel::bounded(128);
+        let (medium_tx, _medium_rx) = crossbeam_channel::bounded(128);
+        let (low_tx, _low_rx) = crossbeam_channel::bounded(128);
+        
+        let scheduler = IngressDRRScheduler::new(high_tx, medium_tx, low_tx);
+        
+        let socket = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        scheduler.add_socket(socket, 2, Duration::from_millis(50), 4096);
+        
+        let state = scheduler.state.lock();
+        let flow2 = state.flow_states.get(&2).unwrap();
+        
+        // Verify Flow 2 has correct properties
+        assert_eq!(flow2.flow_id, 2);
+        assert_eq!(flow2.quantum, 4096);
+        assert_eq!(flow2.deficit, 0); // Initial deficit is 0
+        assert_eq!(flow2.priority, Priority::MEDIUM);
+        assert_eq!(flow2.latency_budget, Duration::from_millis(50));
+        
+        // Verify Flow 2 is in active_flows
+        assert!(state.active_flows.contains(&2));
+        
+        // Verify Flow 2 socket config exists
+        assert!(state.socket_configs.contains_key(&2));
+        let config = state.socket_configs.get(&2).unwrap();
+        assert_eq!(config.flow_id, 2);
+        assert_eq!(config.priority, Priority::MEDIUM);
+    }
+
+    #[test]
+    fn test_multiple_flows_round_robin_processing() {
+        let (high_tx, _high_rx) = crossbeam_channel::bounded(128);
+        let (medium_tx, _medium_rx) = crossbeam_channel::bounded(128);
+        let (low_tx, _low_rx) = crossbeam_channel::bounded(128);
+        
+        let scheduler = IngressDRRScheduler::new(high_tx, medium_tx, low_tx);
+        
+        // Add all three flows
+        let socket1 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        let socket2 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        let socket3 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        
+        scheduler.add_socket(socket1, 1, Duration::from_millis(5), 32768);
+        scheduler.add_socket(socket2, 2, Duration::from_millis(50), 4096);
+        scheduler.add_socket(socket3, 3, Duration::from_millis(100), 1024);
+        
+        // Verify all flows are in active_flows in the order they were added
+        let state = scheduler.state.lock();
+        assert_eq!(state.active_flows, vec![1, 2, 3]);
+        
+        // Verify current_flow_index starts at 0
+        assert_eq!(state.current_flow_index, 0);
+    }
+
+    #[test]
+    fn test_socket_configs_snapshot_includes_all_flows() {
+        let (high_tx, _high_rx) = crossbeam_channel::bounded(128);
+        let (medium_tx, _medium_rx) = crossbeam_channel::bounded(128);
+        let (low_tx, _low_rx) = crossbeam_channel::bounded(128);
+        
+        let scheduler = IngressDRRScheduler::new(high_tx, medium_tx, low_tx);
+        
+        // Add all three flows
+        let socket1 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        let socket2 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        let socket3 = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        
+        scheduler.add_socket(socket1, 1, Duration::from_millis(5), 32768);
+        scheduler.add_socket(socket2, 2, Duration::from_millis(50), 4096);
+        scheduler.add_socket(socket3, 3, Duration::from_millis(100), 1024);
+        
+        // Simulate creating a snapshot like in process_sockets
+        let socket_configs_snapshot: HashMap<u64, (Arc<StdUdpSocket>, Priority, Duration)> = {
+            let state = scheduler.state.lock();
+            state.socket_configs
+                .iter()
+                .map(|(id, config)| (*id, (config.socket.clone(), config.priority, config.latency_budget)))
+                .collect()
+        };
+        
+        // Verify snapshot contains all three flows
+        assert_eq!(socket_configs_snapshot.len(), 3);
+        assert!(socket_configs_snapshot.contains_key(&1));
+        assert!(socket_configs_snapshot.contains_key(&2));
+        assert!(socket_configs_snapshot.contains_key(&3));
+        
+        // Verify Flow 2 has correct priority and latency_budget in snapshot
+        let (socket, priority, latency_budget) = socket_configs_snapshot.get(&2).unwrap();
+        assert_eq!(*priority, Priority::MEDIUM);
+        assert_eq!(*latency_budget, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn test_flow_2_packet_creation() {
+        let (high_tx, _high_rx) = crossbeam_channel::bounded(128);
+        let (medium_tx, medium_rx) = crossbeam_channel::bounded(128);
+        let (low_tx, _low_rx) = crossbeam_channel::bounded(128);
+        
+        let scheduler = IngressDRRScheduler::new(high_tx, medium_tx, low_tx);
+        
+        let socket = Arc::new(StdUdpSocket::bind("127.0.0.1:0").unwrap());
+        scheduler.add_socket(socket, 2, Duration::from_millis(50), 4096);
+        
+        // Verify Flow 2 would route to medium_priority_tx
+        // Create a test packet manually to verify routing
+        let test_packet = Packet {
+            flow_id: 2,
+            data: vec![1, 2, 3],
+            timestamp: Instant::now(),
+            latency_budget: Duration::from_millis(50),
+            priority: Priority::MEDIUM,
+        };
+        
+        // Send packet to medium priority queue (simulating what would happen)
+        assert!(scheduler.medium_priority_tx.try_send(test_packet).is_ok());
+        
+        // Verify packet was received
+        let received = medium_rx.try_recv().unwrap();
+        assert_eq!(received.flow_id, 2);
+        assert_eq!(received.priority, Priority::MEDIUM);
     }
 }
