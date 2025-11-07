@@ -427,19 +427,28 @@ impl MetricsCollector {
     }
 
     /// Force send current metrics (useful for periodic updates)
+    /// OPTIMIZATION: Minimize lock hold time to reduce priority inversion risk
+    /// Clone metrics data quickly, then compute statistics outside the lock
     pub fn send_current_metrics(
         &self,
         flow_id_to_expected_latency: &std::collections::HashMap<u64, Duration>,
     ) {
-        // Get queue occupancy
+        // Get queue occupancy (no lock needed)
         let queue1_occupancy = self.queue1.as_ref().map(|q| q.occupancy()).unwrap_or(0);
         let queue1_capacity = self.queue1.as_ref().map(|q| q.capacity()).unwrap_or(0);
         let queue2_occupancy = self.queue2.as_ref().map(|q| q.occupancy()).unwrap_or(0);
         let queue2_capacity = self.queue2.as_ref().map(|q| q.capacity()).unwrap_or(0);
 
-        let metrics_map = self.metrics.lock();
+        // Quick clone to minimize lock hold time (reduces priority inversion risk)
+        // Statistics computation happens outside the lock
+        let metrics_clone: std::collections::HashMap<u64, Metrics> = {
+            let metrics = self.metrics.lock();
+            metrics.clone() // Clone while holding lock (fast operation)
+        }; // Lock released here
+
+        // Compute statistics outside the lock (no blocking of other threads)
         let mut snapshot = std::collections::HashMap::new();
-        for (fid, m) in metrics_map.iter() {
+        for (fid, m) in metrics_clone.iter() {
             let expected_max = flow_id_to_expected_latency
                 .get(fid)
                 .copied()
