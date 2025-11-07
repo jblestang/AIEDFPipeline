@@ -639,6 +639,10 @@ mod tests {
             false,
             Duration::from_millis(100),
         );
+        
+        // Wait for background thread to process the event (metrics are now processed asynchronously)
+        std::thread::sleep(Duration::from_millis(10));
+        
         let metrics = collector.get_metrics();
         assert!(metrics.contains_key(&1));
         assert_eq!(metrics[&1].packet_count, 1);
