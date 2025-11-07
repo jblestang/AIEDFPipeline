@@ -420,7 +420,6 @@ fn update_ui(
                     ui.group(|ui| {
                         ui.label(format!("Flow {} Packet Drops", flow_id));
 
-                        // Create plot points for drop metrics
                         let ingress_points: PlotPoints = flow_stats
                             .points
                             .iter()
@@ -442,7 +441,6 @@ fn update_ui(
                             .map(|p| [p.time, p.total_drops as f64])
                             .collect();
 
-                        // Calculate Y-axis bounds
                         let y_max = flow_stats
                             .points
                             .iter()
@@ -453,7 +451,7 @@ fn update_ui(
                                     .max(p.total_drops) as f64
                             })
                             .fold(0.0, f64::max)
-                            .max(1.0); // At least 1 for visibility
+                            .max(1.0);
 
                         let time_range = if let Some(last) = flow_stats.points.back() {
                             last.time.max(1.0)
@@ -934,6 +932,97 @@ fn update_ui_client(
                 }
             } else {
                 ui.label(format!("Flow {}: Waiting for statistics...", flow_id));
+            }
+        }
+
+        ui.separator();
+
+        // Packet drops graph
+        ui.heading("Packet Drops Over Time");
+        for &flow_id in &flows {
+            if let Some(flow_stats) = stats_history.get(&flow_id) {
+                if !flow_stats.points.is_empty() {
+                    ui.group(|ui| {
+                        ui.label(format!("Flow {} Packet Drops", flow_id));
+
+                        let ingress_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, p.ingress_drops as f64])
+                            .collect();
+                        let edf_heap_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, p.edf_heap_drops as f64])
+                            .collect();
+                        let edf_output_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, p.edf_output_drops as f64])
+                            .collect();
+                        let total_points: PlotPoints = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| [p.time, p.total_drops as f64])
+                            .collect();
+
+                        let y_max = flow_stats
+                            .points
+                            .iter()
+                            .map(|p| {
+                                p.ingress_drops
+                                    .max(p.edf_heap_drops)
+                                    .max(p.edf_output_drops)
+                                    .max(p.total_drops) as f64
+                            })
+                            .fold(0.0, f64::max)
+                            .max(1.0);
+
+                        let time_range = if let Some(last) = flow_stats.points.back() {
+                            last.time.max(1.0)
+                        } else {
+                            1.0
+                        };
+
+                        Plot::new(format!("flow_{}_drops_plot_client", flow_id))
+                            .width(ui.available_width())
+                            .height(300.0)
+                            .x_axis_formatter(|val, _range, _| format!("{:.1}s", val))
+                            .label_formatter(|name, point| {
+                                format!("{}\n{:.1}s, {:.0} drops", name, point.x, point.y)
+                            })
+                            .include_x(0.0)
+                            .include_x(time_range)
+                            .include_y(0.0)
+                            .include_y(y_max)
+                            .show(ui, |plot_ui| {
+                                plot_ui.line(
+                                    Line::new(ingress_points)
+                                        .name("Ingress Drops")
+                                        .color(egui::Color32::RED),
+                                );
+                                plot_ui.line(
+                                    Line::new(edf_heap_points)
+                                        .name("EDF Heap Drops")
+                                        .color(egui::Color32::from_rgb(255, 165, 0)),
+                                );
+                                plot_ui.line(
+                                    Line::new(edf_output_points)
+                                        .name("EDF Output Drops")
+                                        .color(egui::Color32::YELLOW),
+                                );
+                                plot_ui.line(
+                                    Line::new(total_points)
+                                        .name("Total Drops")
+                                        .color(egui::Color32::BLUE),
+                                );
+                            });
+                    });
+                } else {
+                    ui.label(format!("Flow {}: No drop data yet", flow_id));
+                }
+            } else {
+                ui.label(format!("Flow {}: Waiting for drop data...", flow_id));
             }
         }
 
