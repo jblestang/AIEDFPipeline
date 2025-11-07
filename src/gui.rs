@@ -336,20 +336,25 @@ fn update_ui(
                                 // Convert from log scale back to linear for display
                                 let linear_val = 10f64.powf(val);
                                 // Format with appropriate precision for linear value
+                                // Note: This formatter is used for both axis labels and hover tooltip
                                 if linear_val < 1.0 {
                                     format!("{:.3}", linear_val)
                                 } else {
                                     format!("{:.2}", linear_val)
                                 }
                             })
-                            .coordinate_formatter(|coord, _plot_style| {
-                                // Format coordinates for hover tooltip: show real linear value with "ms"
-                                let linear_y = 10f64.powf(coord.y);
-                                if linear_y < 1.0 {
+                            .x_axis_formatter(|val, _range, _| {
+                                format!("{:.1}s", val)
+                            })
+                            .label_formatter(|name, point| {
+                                // Custom formatter for hover tooltip: show real linear value with "ms"
+                                let linear_y = 10f64.powf(point.y);
+                                let y_str = if linear_y < 1.0 {
                                     format!("{:.3} ms", linear_y)
                                 } else {
                                     format!("{:.2} ms", linear_y)
-                                }
+                                };
+                                format!("{}\n{:.1}s, {}", name, point.x, y_str)
                             })
                             .include_y(y_min_log)
                             .include_y(y_max_log)
@@ -780,20 +785,25 @@ fn update_ui_client(
                                 // Convert from log scale back to linear for display
                                 let linear_val = 10f64.powf(val);
                                 // Format with appropriate precision for linear value
+                                // Note: This formatter is used for both axis labels and hover tooltip
                                 if linear_val < 1.0 {
                                     format!("{:.3}", linear_val)
                                 } else {
                                     format!("{:.2}", linear_val)
                                 }
                             })
-                            .coordinate_formatter(|coord, _plot_style| {
-                                // Format coordinates for hover tooltip: show real linear value with "ms"
-                                let linear_y = 10f64.powf(coord.y);
-                                if linear_y < 1.0 {
+                            .x_axis_formatter(|val, _range, _| {
+                                format!("{:.1}s", val)
+                            })
+                            .label_formatter(|name, point| {
+                                // Custom formatter for hover tooltip: show real linear value with "ms"
+                                let linear_y = 10f64.powf(point.y);
+                                let y_str = if linear_y < 1.0 {
                                     format!("{:.3} ms", linear_y)
                                 } else {
                                     format!("{:.2} ms", linear_y)
-                                }
+                                };
+                                format!("{}\n{:.1}s, {}", name, point.x, y_str)
                             })
                             .include_y(y_min_log)
                             .include_y(y_max_log)
