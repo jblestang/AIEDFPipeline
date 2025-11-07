@@ -193,15 +193,8 @@ impl IngressDRRScheduler {
                     };
 
                     if current_deficit == 0 {
-                        // Deficit is 0, move this flow to the back and go to next flow
-                        {
-                            let mut state = self.state.lock();
-                            // Remove flow from current position and add to end
-                            if let Some(pos) = state.active_flows.iter().position(|&id| id == flow_id) {
-                                state.active_flows.remove(pos);
-                                state.active_flows.push(flow_id);
-                            }
-                        }
+                        // Deficit is 0, go to next flow in round-robin
+                        // current_index already tracks our position, so just break and move to next
                         break;
                     }
 
