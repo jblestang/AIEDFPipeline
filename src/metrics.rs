@@ -5,14 +5,21 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Latency measurement with timestamp for time-based windowing
+#[derive(Debug, Clone)]
+struct LatencyMeasurement {
+    latency_us: f64,
+    timestamp: Instant,
+}
+
 #[derive(Debug)]
 pub struct Metrics {
     pub flow_id: u64,
     pub packet_count: u64,
-    pub latencies: VecDeque<f64>, // Store latencies in microseconds for better precision (VecDeque for O(1) pop_front)
+    pub latencies: VecDeque<LatencyMeasurement>, // Store latencies with timestamps for time-based windowing
     pub deadline_misses: u64,
     pub last_update: Instant,
-    pub max_history: usize, // Maximum number of latency samples to keep
+    pub time_window: Duration, // Time window for latency history (e.g., 10 seconds)
     // Cached statistics to avoid expensive recalculations (using RefCell for interior mutability)
     cached_p50: RefCell<Option<Duration>>,
     cached_p95: RefCell<Option<Duration>>,
@@ -26,10 +33,10 @@ impl Default for Metrics {
         Self {
             flow_id: 0,
             packet_count: 0,
-            latencies: VecDeque::with_capacity(1000),
+            latencies: VecDeque::with_capacity(10000), // Pre-allocate for high packet rates
             deadline_misses: 0,
             last_update: Instant::now(),
-            max_history: 1000, // Keep last 1k samples (reduced to limit memory usage)
+            time_window: Duration::from_secs(10), // Keep last 10 seconds of latency data
             cached_p50: RefCell::new(None),
             cached_p95: RefCell::new(None),
             cached_p99: RefCell::new(None),
@@ -44,10 +51,10 @@ impl Metrics {
         Self {
             flow_id,
             packet_count: 0,
-            latencies: VecDeque::with_capacity(1000),
+            latencies: VecDeque::with_capacity(10000), // Pre-allocate for high packet rates
             deadline_misses: 0,
             last_update: Instant::now(),
-            max_history: 1000,
+            time_window: Duration::from_secs(10), // Keep last 10 seconds of latency data
             cached_p50: RefCell::new(None),
             cached_p95: RefCell::new(None),
             cached_p99: RefCell::new(None),
@@ -59,13 +66,24 @@ impl Metrics {
     pub fn record_latency(&mut self, latency: Duration, deadline_missed: bool) {
         self.packet_count += 1;
 
-        // Store latency in microseconds for better precision
+        let now = Instant::now();
+        
+        // Store latency in microseconds with timestamp for time-based windowing
         let latency_us = latency.as_secs_f64() * 1_000_000.0;
-        self.latencies.push_back(latency_us);
+        self.latencies.push_back(LatencyMeasurement {
+            latency_us,
+            timestamp: now,
+        });
 
-        // Limit history size - use pop_front for O(1) operation
-        if self.latencies.len() > self.max_history {
-            self.latencies.pop_front();
+        // Remove old measurements outside the time window (time-based windowing)
+        // This ensures all flows are compared over the same time period regardless of packet rate
+        let cutoff_time = now.checked_sub(self.time_window).unwrap_or(now);
+        while let Some(front) = self.latencies.front() {
+            if front.timestamp < cutoff_time {
+                self.latencies.pop_front();
+            } else {
+                break; // Remaining measurements are all within the window
+            }
         }
 
         // Invalidate cache when new data arrives
@@ -78,7 +96,7 @@ impl Metrics {
             self.deadline_misses += 1;
         }
 
-        self.last_update = Instant::now();
+        self.last_update = now;
     }
 
     // Compute all percentiles at once and cache them (more efficient than computing individually)
@@ -93,8 +111,8 @@ impl Metrics {
                 *self.cached_p99.borrow_mut() = None;
                 *self.cached_p999.borrow_mut() = None;
             } else {
-                // Sort once and compute all percentiles
-                let mut sorted: Vec<f64> = self.latencies.iter().copied().collect();
+                // Extract latency values and sort once to compute all percentiles
+                let mut sorted: Vec<f64> = self.latencies.iter().map(|m| m.latency_us).collect();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
                 let len = sorted.len();
@@ -120,7 +138,7 @@ impl Metrics {
         if self.latencies.is_empty() {
             return Duration::ZERO;
         }
-        let sum: f64 = self.latencies.iter().sum();
+        let sum: f64 = self.latencies.iter().map(|m| m.latency_us).sum();
         let mean = sum / self.latencies.len() as f64;
         Duration::from_secs_f64(mean / 1_000_000.0)
     }
@@ -129,11 +147,11 @@ impl Metrics {
         if self.latencies.len() < 2 {
             return None;
         }
-        let mean = self.latencies.iter().sum::<f64>() / self.latencies.len() as f64;
+        let mean = self.latencies.iter().map(|m| m.latency_us).sum::<f64>() / self.latencies.len() as f64;
         let variance = self
             .latencies
             .iter()
-            .map(|x| (x - mean).powi(2))
+            .map(|m| (m.latency_us - mean).powi(2))
             .sum::<f64>()
             / self.latencies.len() as f64;
         let std_dev = variance.sqrt();
@@ -144,7 +162,7 @@ impl Metrics {
         if self.latencies.is_empty() {
             return None;
         }
-        let min = self.latencies.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let min = self.latencies.iter().map(|m| m.latency_us).fold(f64::INFINITY, |a, b| a.min(b));
         Some(Duration::from_secs_f64(min / 1_000_000.0))
     }
 
@@ -155,18 +173,19 @@ impl Metrics {
         let max = self
             .latencies
             .iter()
-            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            .map(|m| m.latency_us)
+            .fold(f64::NEG_INFINITY, |a, b| a.max(b));
         Some(Duration::from_secs_f64(max / 1_000_000.0))
     }
 
     #[allow(dead_code)]
     pub fn get_latency_history(&self) -> Vec<f64> {
-        self.latencies.iter().copied().collect()
+        self.latencies.iter().map(|m| m.latency_us).collect()
     }
 
     pub fn get_recent_latencies(&self, count: usize) -> Vec<f64> {
         let start = self.latencies.len().saturating_sub(count);
-        self.latencies.range(start..).copied().collect()
+        self.latencies.range(start..).map(|m| m.latency_us).collect()
     }
 
     #[allow(dead_code)]
@@ -181,7 +200,7 @@ impl Metrics {
                 if self.latencies.is_empty() {
                     return None;
                 }
-                let mut sorted: Vec<f64> = self.latencies.iter().copied().collect();
+                let mut sorted: Vec<f64> = self.latencies.iter().map(|m| m.latency_us).collect();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let index = (sorted.len() as f64 * percentile / 100.0).ceil() as usize - 1;
                 let index = index.min(sorted.len() - 1);
@@ -216,10 +235,10 @@ impl Clone for Metrics {
         Self {
             flow_id: self.flow_id,
             packet_count: self.packet_count,
-            latencies: self.latencies.iter().copied().collect(),
+            latencies: self.latencies.clone(),
             deadline_misses: self.deadline_misses,
             last_update: self.last_update,
-            max_history: self.max_history,
+            time_window: self.time_window,
             cached_p50: RefCell::new(None),
             cached_p95: RefCell::new(None),
             cached_p99: RefCell::new(None),
