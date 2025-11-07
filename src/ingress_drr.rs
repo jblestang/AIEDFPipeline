@@ -245,10 +245,11 @@ impl IngressDRRScheduler {
                         _ => break,
                     }
                 }
-
-                // Update current_index for next round (move to next flow)
-                current_index = (flow_index + 1) % active_flows.len();
             }
+            
+            // Update current_index for next round (move to next flow after processing all flows)
+            // Only update at the end of the outer loop, not inside the inner loop
+            current_index = (current_index + 1) % active_flows.len();
 
             // OPTIMIZATION: Single lock acquisition to update current index
             {
