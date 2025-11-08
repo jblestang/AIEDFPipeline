@@ -1,10 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use crossbeam_channel::unbounded;
-use parking_lot::Mutex;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use aiedf_pipeline::drr_scheduler::{DRRScheduler, Packet};
+use aiedf_pipeline::drr_scheduler::{DRRScheduler, Packet, PriorityTable};
 use aiedf_pipeline::edf_scheduler::EDFScheduler;
 use aiedf_pipeline::queue::Queue;
 
@@ -43,9 +42,9 @@ fn bench_edf_scheduler(c: &mut Criterion) {
     let mut group = c.benchmark_group("edf_scheduler");
 
     group.bench_function("enqueue_packet", |b| {
-        let (tx1, rx1) = unbounded();
-        let (tx2, _rx2) = unbounded();
-        let scheduler = Arc::new(EDFScheduler::new(Arc::new(Mutex::new(rx1)), tx2));
+        let input_receivers = PriorityTable::from_fn(|_| Arc::new(unbounded::<Packet>().1));
+        let output_senders = PriorityTable::from_fn(|_| unbounded::<Packet>().0);
+        let scheduler = Arc::new(EDFScheduler::new(input_receivers, output_senders, 1));
 
         let packet = Packet::new(
             aiedf_pipeline::drr_scheduler::Priority::High,
@@ -59,9 +58,19 @@ fn bench_edf_scheduler(c: &mut Criterion) {
     });
 
     group.bench_function("process_next", |b| {
-        let (tx1, rx1) = unbounded();
-        let (tx2, _rx2) = unbounded();
-        let scheduler = Arc::new(EDFScheduler::new(Arc::new(Mutex::new(rx1)), tx2));
+        let mut input_senders = Vec::new();
+        let input_receivers = PriorityTable::from_fn(|_| {
+            let (tx, rx) = unbounded();
+            input_senders.push(tx);
+            Arc::new(rx)
+        });
+        let mut output_receivers = Vec::new();
+        let output_senders = PriorityTable::from_fn(|_| {
+            let (tx, rx) = unbounded();
+            output_receivers.push(rx);
+            tx
+        });
+        let scheduler = Arc::new(EDFScheduler::new(input_receivers, output_senders, 1));
 
         // Pre-populate with packets
         for i in 0..100 {
@@ -75,7 +84,7 @@ fn bench_edf_scheduler(c: &mut Criterion) {
                 vec![0u8; 100],
                 Duration::from_millis(i as u64 % 100 + 1),
             );
-            scheduler.enqueue_packet(packet).unwrap();
+            input_senders[priority.index()].send(packet).unwrap();
         }
 
         b.iter(|| {

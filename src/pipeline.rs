@@ -82,7 +82,7 @@ pub struct EdfSchedulerConfig {
 
 impl Default for EdfSchedulerConfig {
     fn default() -> Self {
-        Self { max_heap_size: 1 }
+        Self { max_heap_size: 16 }
     }
 }
 

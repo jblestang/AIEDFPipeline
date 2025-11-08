@@ -336,7 +336,9 @@ fn update_ui(
                                                     format!("{:.2}", linear_val)
                                                 }
                                             })
-                                            .x_axis_formatter(|mark, _range| format!("{:.1}s", mark.value))
+                                            .x_axis_formatter(|mark, _range| {
+                                                format!("{:.1}s", mark.value)
+                                            })
                                             .label_formatter(|name, point| {
                                                 let linear_y = 10f64.powf(point.y);
                                                 let y_str = if linear_y < 1.0 {
@@ -350,26 +352,24 @@ fn update_ui(
                                             .include_x(time_range)
                                             .include_y(y_min_log)
                                             .include_y(y_max_log)
-                                            .legend(
-                                                Legend::default()
-                                                    .position(Corner::RightTop),
-                                            )
+                                            .legend(Legend::default().position(Corner::RightTop))
                                             .show(
                                                 grid_ui,
                                                 |plot_ui| {
-                                                        plot_ui.line(
-                                                            Line::new(*title, data.clone())
-                                                                .color(*color),
-                                                        );
+                                                    plot_ui.line(
+                                                        Line::new(*title, data.clone())
+                                                            .color(*color),
+                                                    );
                                                     if let Some((name, extra_points)) = extra_line {
                                                         plot_ui.line(
-                                                            Line::new(name.clone(), extra_points.clone())
-                                                                .color(egui::Color32::RED)
-                                                                .style(
-                                                                    LineStyle::Dashed {
-                                                                        length: 5.0,
-                                                                    },
-                                                                ),
+                                                            Line::new(
+                                                                name.clone(),
+                                                                extra_points.clone(),
+                                                            )
+                                                            .color(egui::Color32::RED)
+                                                            .style(LineStyle::Dashed {
+                                                                length: 5.0,
+                                                            }),
                                                         );
                                                     }
                                                 },
@@ -460,6 +460,7 @@ fn update_ui(
                                             .include_x(time_range)
                                             .include_y(0.0)
                                             .include_y(y_max)
+                                            .legend(Legend::default().position(Corner::RightTop))
                                             .show(ui, |plot_ui| {
                                                 plot_ui.line(
                                                     Line::new("Ingress Drops", ingress_points)
@@ -794,22 +795,17 @@ fn update_ui_client(
                                         };
                                         format!("{}\n{:.1}s, {}", name, point.x, y_str)
                                     })
-                                    .legend(
-                                        Legend::default()
-                                            .position(Corner::RightTop),
-                                    )
+                                    .legend(Legend::default().position(Corner::RightTop))
                                     .show(ui, |plot_ui| {
                                         plot_ui.line(
-                                            Line::new("Avg", avg_points)
-                                                .color(egui::Color32::BLUE),
+                                            Line::new("Avg", avg_points).color(egui::Color32::BLUE),
                                         );
                                         plot_ui.line(
                                             Line::new("Min", min_points)
                                                 .color(egui::Color32::GREEN),
                                         );
                                         plot_ui.line(
-                                            Line::new("Max", max_points)
-                                                .color(egui::Color32::RED),
+                                            Line::new("Max", max_points).color(egui::Color32::RED),
                                         );
                                         plot_ui.line(
                                             Line::new("P50", p50_points)
@@ -834,9 +830,7 @@ fn update_ui_client(
                                         plot_ui.line(
                                             Line::new("Expected Max", expected_line)
                                                 .color(egui::Color32::RED)
-                                                .style(LineStyle::Dashed {
-                                                    length: 5.0,
-                                                }),
+                                                .style(LineStyle::Dashed { length: 5.0 }),
                                         );
                                     });
                             });
@@ -917,17 +911,17 @@ fn update_ui_client(
                                             .include_x(time_range)
                                             .include_y(0.0)
                                             .include_y(y_max)
+                                            .legend(Legend::default().position(Corner::RightTop))
                                             .show(ui, |plot_ui| {
                                                 plot_ui.line(
                                                     Line::new("Ingress Drops", ingress_points)
                                                         .color(egui::Color32::RED),
                                                 );
                                                 plot_ui.line(
-                                                    Line::new(
-                                                        "EDF Heap Drops",
-                                                        edf_heap_points,
-                                                    )
-                                                    .color(egui::Color32::from_rgb(255, 165, 0)),
+                                                    Line::new("EDF Heap Drops", edf_heap_points)
+                                                        .color(egui::Color32::from_rgb(
+                                                            255, 165, 0,
+                                                        )),
                                                 );
                                                 plot_ui.line(
                                                     Line::new(
@@ -960,5 +954,5 @@ fn update_ui_client(
         }
     });
     // Request repaint less frequently to reduce flickering (200ms instead of 100ms)
-    ctx.request_repaint_after(Duration::from_millis(200));
+    ctx.request_repaint_after(Duration::from_millis(40));
 }

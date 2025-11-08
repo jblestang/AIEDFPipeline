@@ -231,7 +231,7 @@ fn main() {
         test_duration.as_secs()
     );
 
-    let factor  = 20;
+    let factor = 15;
 
     let rate_flow1 = 128u64 * factor; // packets per second
     let rate_flow2 = 256u64 * factor;
@@ -245,7 +245,10 @@ fn main() {
     let interval_flow2 = Duration::from_micros((1_000_000.0 / rate_flow2 as f64) as u64);
     let interval_flow3 = Duration::from_micros((1_000_000.0 / rate_flow3 as f64) as u64);
 
-    println!("rate_flow1: {}, rate_flow2: {}, rate_flow3: {}", rate_flow1, rate_flow2, rate_flow3);
+    println!(
+        "rate_flow1: {}, rate_flow2: {}, rate_flow3: {}",
+        rate_flow1, rate_flow2, rate_flow3
+    );
 
     // Start receiving threads for each flow
     let receiver_handles: Vec<_> = vec![(1, 9080), (2, 9081), (3, 9082)]
