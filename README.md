@@ -57,6 +57,10 @@ This runs the pipeline and processes packets. You can monitor it via console out
 
 The GUI is a separate binary that connects to the running pipeline via TCP:
 
+![AIEDF Pipeline Dashboard](docs/gui-dashboard.png)
+
+*(Replace `docs/gui-dashboard.png` with your captured screenshot path after adding the image to the repository.)*
+
 **Terminal 1 - Start the pipeline:**
 ```bash
 cargo run --release
