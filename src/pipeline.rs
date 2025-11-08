@@ -47,12 +47,12 @@ impl Default for QueueConfig {
     fn default() -> Self {
         Self {
             ingress_to_edf: PriorityTable::from_fn(|priority| match priority {
-                Priority::High => 2,
-                Priority::Medium | Priority::Low | Priority::BestEffort => 1,
+                Priority::High => 16,
+                Priority::Medium | Priority::Low | Priority::BestEffort => 16,
             }),
             edf_to_egress: PriorityTable::from_fn(|priority| match priority {
-                Priority::High => 2,
-                Priority::Medium | Priority::Low | Priority::BestEffort => 1,
+                Priority::High => 16,
+                Priority::Medium | Priority::Low | Priority::BestEffort => 16,
             }),
         }
     }
