@@ -1,5 +1,5 @@
 //! Core scheduling primitives shared across the ingress/egress DRR stages and the EDF processor.
-//! 
+//!
 //! The module defines the global [`Priority`] ordering used throughout the pipeline, the
 //! [`Packet`] representation that flows between stages, and the [`PriorityTable`] helper that
 //! keeps APIs stable when new priority classes are introduced.
@@ -79,6 +79,9 @@ impl fmt::Display for Priority {
     }
 }
 
+/// Maximum payload size handled by the pipeline (standard Ethernet MTU).
+pub const MAX_PACKET_SIZE: usize = 1500;
+
 /// Lightweight representation of a work unit travelling through the pipeline.
 ///
 /// Each [`Packet`] captures payload bytes, their latency budget, and the [`Priority`] used by the
@@ -88,7 +91,8 @@ impl fmt::Display for Priority {
 pub struct Packet {
     #[cfg_attr(not(test), allow(dead_code))]
     pub flow_id: u64,
-    pub data: Vec<u8>,
+    data: [u8; MAX_PACKET_SIZE],
+    len: usize,
     pub timestamp: Instant,
     pub latency_budget: Duration,
     pub priority: Priority,
@@ -97,14 +101,28 @@ pub struct Packet {
 impl Packet {
     /// Create a packet while ensuring the flow/priorities are consistent.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn new(priority: Priority, data: Vec<u8>, latency_budget: Duration) -> Packet {
+    pub fn new(priority: Priority, payload: &[u8], latency_budget: Duration) -> Packet {
+        let mut data = [0u8; MAX_PACKET_SIZE];
+        let len = payload.len().min(MAX_PACKET_SIZE);
+        data[..len].copy_from_slice(&payload[..len]);
         Packet {
             flow_id: priority.flow_id(),
             priority,
             timestamp: Instant::now(),
             latency_budget,
             data,
+            len,
         }
+    }
+
+    /// Borrow the payload as a slice.
+    pub fn payload(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+
+    /// Current payload length.
+    pub fn len(&self) -> usize {
+        self.len
     }
 }
 
@@ -217,7 +235,7 @@ mod tests {
 
     #[test]
     fn packet_builder_sets_priority() {
-        let p = Packet::new(Priority::Medium, vec![1, 2, 3], Duration::from_millis(10));
+        let p = Packet::new(Priority::Medium, &[1, 2, 3], Duration::from_millis(10));
         assert_eq!(p.priority, Priority::Medium);
         assert_eq!(p.flow_id, Priority::Medium.flow_id());
     }

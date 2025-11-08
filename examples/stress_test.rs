@@ -231,11 +231,11 @@ fn main() {
         test_duration.as_secs()
     );
 
-    let factor = 15;
+    let factor = 1;
 
-    let rate_flow1 = 128u64 * factor; // packets per second
-    let rate_flow2 = 256u64 * factor;
-    let rate_flow3 = 512u64 * factor;
+    let rate_flow1 = 64u64 * factor; // packets per second
+    let rate_flow2 = 128u64 * factor;
+    let rate_flow3 = 256u64 * factor;
 
     let packets_flow1 = rate_flow1 * test_duration.as_secs();
     let packets_flow2 = rate_flow2 * test_duration.as_secs();

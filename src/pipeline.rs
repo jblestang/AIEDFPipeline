@@ -1,5 +1,5 @@
 //! Pipeline orchestration.
-//! 
+//!
 //! This module wires the ingress DRR, EDF, and egress DRR schedulers together, exposes
 //! configuration objects that make queue sizes and quantums tunable, and manages thread affinity
 //! for the three-core deployment model.
@@ -9,7 +9,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UdpSocket;
 
 use crate::drr_scheduler::{Packet, Priority, PriorityTable};
 use crate::edf_scheduler::EDFScheduler;
@@ -70,7 +69,7 @@ impl Default for QueueConfig {
             }),
             edf_to_egress: PriorityTable::from_fn(|priority| match priority {
                 Priority::High => 16,
-                Priority::Medium | Priority::Low | Priority::BestEffort => 16,
+                Priority::Medium | Priority::Low | Priority::BestEffort => 64,
             }),
         }
     }
@@ -87,8 +86,8 @@ impl Default for IngressSchedulerConfig {
     fn default() -> Self {
         Self {
             quantums: PriorityTable::from_fn(|priority| match priority {
-                Priority::High => 16,
-                Priority::Medium => 4,
+                Priority::High => 32,
+                Priority::Medium => 8,
                 Priority::Low | Priority::BestEffort => 1,
             }),
         }
@@ -346,7 +345,7 @@ impl Pipeline {
         for config in &self.output_sockets {
             let addr = format!("{}:{}", config.address, config.port);
             let socket_addr = addr.parse::<SocketAddr>()?;
-            let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+            let socket = Arc::new(std::net::UdpSocket::bind("0.0.0.0:0")?);
 
             self.egress_drr
                 .add_output_socket(config.priority, socket, socket_addr);

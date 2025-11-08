@@ -1,16 +1,16 @@
 //! Egress Deficit Round Robin scheduler.
-//! 
+//!
 //! This stage drains EDF output queues in strict priority order, records latency metrics, and emits
 //! packets through UDP sockets. Metrics recording uses a lock-free channel so the hot path does not
 //! contend with the statistics thread.
 
 use crate::drr_scheduler::{Packet, Priority, PriorityTable};
+use crossbeam_channel::TryRecvError;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::net::UdpSocket;
 
 /// Egress DRR Scheduler - Reads from priority queues and writes to UDP sockets
 pub struct EgressDRRScheduler {
@@ -35,6 +35,9 @@ impl EgressDRRScheduler {
         socket: Arc<UdpSocket>,
         address: SocketAddr,
     ) {
+        socket
+            .set_nonblocking(true)
+            .expect("failed to set UDP socket to non-blocking");
         self.output_sockets
             .lock()
             .insert(priority, (socket, address));
@@ -55,39 +58,55 @@ impl EgressDRRScheduler {
             sockets.clone()
         };
 
-        tokio::spawn(async move {
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut next_index = 0usize;
+            let mut idle_cycles = 0usize;
+            let priorities = Priority::ALL;
+            let num_priorities = priorities.len();
+
             while running.load(std::sync::atomic::Ordering::Relaxed) {
-                let mut packet_opt = None;
-                for priority in Priority::ALL {
-                    if let Ok(packet) = receivers[priority].try_recv() {
-                        packet_opt = Some((priority, packet));
-                        break;
-                    }
-                }
+                let priority = priorities[next_index];
+                next_index = (next_index + 1) % num_priorities;
 
-                if let Some((priority, packet)) = packet_opt {
-                    // Record metrics before the attempt to send so dropped packets are still tracked.
-                    let latency = packet.timestamp.elapsed();
-                    let deadline = packet.timestamp + packet.latency_budget;
-                    let deadline_missed = Instant::now() > deadline;
-                    metrics_collector.record_packet(
-                        priority,
-                        latency,
-                        deadline_missed,
-                    );
+                match receivers[priority].try_recv() {
+                    Ok(packet) => {
+                        idle_cycles = 0;
 
-                    if let Some((socket, target_addr)) = socket_map.get(&priority) {
-                        let _ = socket.send_to(&packet.data, *target_addr).await;
-                    } else if priority == Priority::BestEffort {
-                        // Best effort packets without a configured socket are simply dropped
+                        // Record metrics before the attempt to send so dropped packets are still tracked.
+                        let latency = packet.timestamp.elapsed();
+                        let deadline = packet.timestamp + packet.latency_budget;
+                        let deadline_missed = Instant::now() > deadline;
+                        metrics_collector.record_packet(priority, latency, deadline_missed);
+
+                        if let Some((socket, target_addr)) = socket_map.get(&priority) {
+                            // Non-blocking send; retry on WouldBlock to preserve packet ordering.
+                            loop {
+                                match socket.send_to(packet.payload(), *target_addr) {
+                                    Ok(_) => break,
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        std::thread::yield_now();
+                                        continue;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        } else if priority == Priority::BestEffort {
+                            // Best effort packets without a configured socket are simply dropped
+                        }
                     }
-                } else {
-                    // No packets available - yield to other tasks
-                    tokio::task::yield_now().await;
+                    Err(TryRecvError::Empty) => {
+                        idle_cycles += 1;
+                        if idle_cycles >= num_priorities {
+                            std::thread::yield_now();
+                            idle_cycles = 0;
+                        }
+                    }
+                    Err(TryRecvError::Disconnected) => break,
                 }
             }
-        })
-        .await?;
+        });
+
+        handle.await?;
 
         Ok(())
     }

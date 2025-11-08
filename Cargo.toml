@@ -8,6 +8,9 @@ default-run = "aiedf-pipeline"
 name = "gui"
 path = "src/bin/gui.rs"
 
+[profile.release]
+debug = true
+
 [dependencies]
 tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
 crossbeam-channel = "0.5"

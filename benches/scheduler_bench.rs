@@ -17,7 +17,7 @@ fn bench_drr_scheduler(c: &mut Criterion) {
 
         let packet = Packet::new(
             aiedf_pipeline::drr_scheduler::Priority::High,
-            vec![0u8; 100],
+            &vec![0u8; 100],
             Duration::from_millis(1),
         );
 
@@ -48,7 +48,7 @@ fn bench_edf_scheduler(c: &mut Criterion) {
 
         let packet = Packet::new(
             aiedf_pipeline::drr_scheduler::Priority::High,
-            vec![0u8; 100],
+            &vec![0u8; 100],
             Duration::from_millis(1),
         );
 
@@ -81,7 +81,7 @@ fn bench_edf_scheduler(c: &mut Criterion) {
             };
             let packet = Packet::new(
                 priority,
-                vec![0u8; 100],
+                &vec![0u8; 100],
                 Duration::from_millis(i as u64 % 100 + 1),
             );
             input_senders[priority.index()].send(packet).unwrap();
@@ -101,7 +101,7 @@ fn bench_queue(c: &mut Criterion) {
 
         let packet = Packet::new(
             aiedf_pipeline::drr_scheduler::Priority::High,
-            vec![0u8; 100],
+            &vec![0u8; 100],
             Duration::from_millis(1),
         );
 

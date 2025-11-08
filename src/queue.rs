@@ -1,5 +1,5 @@
 //! Legacy bounded queue wrapper.
-//! 
+//!
 //! The main pipeline uses per-priority crossbeam channels directly, but some tests and metrics
 //! helpers still reference this minimal queue abstraction. It remains for backwards compatibility.
 
@@ -100,7 +100,7 @@ mod tests {
 
         let packet = Packet::new(
             crate::drr_scheduler::Priority::High,
-            vec![1, 2, 3],
+            &[1, 2, 3],
             Duration::from_millis(1),
         );
 
@@ -109,6 +109,6 @@ mod tests {
 
         let received = queue.recv().unwrap();
         assert_eq!(received.priority, packet.priority);
-        assert_eq!(received.data, packet.data);
+        assert_eq!(received.payload(), packet.payload());
     }
 }

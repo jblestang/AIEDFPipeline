@@ -12,7 +12,7 @@ mod tests {
         let queue = Queue::new();
         assert!(queue.is_empty());
 
-        let packet = Packet::new(Priority::High, vec![1, 2, 3], Duration::from_millis(1));
+        let packet = Packet::new(Priority::High, &[1, 2, 3], Duration::from_millis(1));
 
         queue.send(packet.clone()).unwrap();
         assert!(!queue.is_empty());

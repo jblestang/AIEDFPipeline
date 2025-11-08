@@ -1,26 +1,32 @@
 //! Ingress Deficit Round Robin scheduler.
-//! 
+//!
 //! A single Tokio runtime polls non-blocking UDP sockets, applies packet-count based DRR, and
 //! forwards packets into per-priority bounded channels destined for the EDF processor.
 
-use crate::drr_scheduler::{Packet, Priority, PriorityTable};
+use crate::drr_scheduler::{Packet, Priority, PriorityTable, MAX_PACKET_SIZE};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::UdpSocket as StdUdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// DRR state tracked per priority class.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct FlowState {
     /// Number of packets the flow can emit in the current round.
     quantum: usize,
-    /// Remaining credit within the current round.
-    deficit: usize,
+    /// Remaining credit within the current round (updated atomically).
+    deficit: AtomicUsize,
     /// Latency budget used when instantiating [`Packet`] objects.
-    #[allow(dead_code)]
     latency_budget: Duration,
+}
+
+/// Snapshot used during processing to avoid holding the state lock in the hot loop.
+#[derive(Clone)]
+struct FlowSnapshot {
+    socket: Arc<StdUdpSocket>,
+    state: Arc<FlowState>,
 }
 
 /// Combined state guarded by a single mutex so we can minimise lock churn while iterating flows.
@@ -28,8 +34,8 @@ struct FlowState {
 struct IngressDRRState {
     /// Socket configuration keyed by priority for O(1) lookup.
     socket_configs: HashMap<Priority, SocketConfig>,
-    /// Per-priority DRR state (quantum + deficit).
-    flow_states: HashMap<Priority, FlowState>,
+    /// Per-priority DRR state (quantum + deficit atomics).
+    flow_states: HashMap<Priority, Arc<FlowState>>,
     /// Ordered list of active flows used by the round-robin iterator.
     active_flows: Vec<Priority>,
     /// Index within `active_flows` that will be serviced next.
@@ -50,9 +56,6 @@ pub struct IngressDRRScheduler {
 #[derive(Debug, Clone)]
 pub struct SocketConfig {
     pub socket: Arc<StdUdpSocket>,
-    pub latency_budget: Duration,
-    #[allow(dead_code)]
-    pub quantum: usize,
 }
 
 impl IngressDRRScheduler {
@@ -84,23 +87,19 @@ impl IngressDRRScheduler {
         latency_budget: Duration,
         quantum: usize,
     ) {
-        let config = SocketConfig {
-            socket,
-            latency_budget,
-            quantum,
-        };
+        let config = SocketConfig { socket };
 
-        // Single lock acquisition captures socket details, DRR state, and active flow tracking.
+        // OPTIMISATION: Build per-flow state once and store atomics for deficit updates
+        let flow_state = Arc::new(FlowState {
+            quantum,
+            deficit: AtomicUsize::new(0),
+            latency_budget,
+        });
+
+        // OPTIMIZATION: Single lock acquisition for all state updates
         let mut state = self.state.lock();
         state.socket_configs.insert(priority, config);
-        state.flow_states.insert(
-            priority,
-            FlowState {
-                quantum,
-                deficit: 0,
-                latency_budget,
-            },
-        );
+        state.flow_states.insert(priority, flow_state);
         if !state.active_flows.contains(&priority) {
             state.active_flows.push(priority);
         }
@@ -113,7 +112,7 @@ impl IngressDRRScheduler {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         while running.load(Ordering::Relaxed) {
             // Snapshot shared state outside the hot loop so we keep the mutex hold time short.
-            let (active_flows, current_index, socket_configs_snapshot) = {
+            let (active_flows, current_index, snapshot_map) = {
                 let state = self.state.lock();
                 let is_empty = state.active_flows.is_empty();
                 let active_flows = if is_empty {
@@ -122,17 +121,23 @@ impl IngressDRRScheduler {
                     state.active_flows.clone()
                 };
                 let current_index = state.current_flow_index;
-                // Snapshot the sockets (Arc clones) so the inner loop does not lock.
-                let socket_configs_snapshot: HashMap<Priority, (Arc<StdUdpSocket>, Duration)> =
-                    state
-                        .socket_configs
-                        .iter()
-                        .map(|(priority, config)| {
-                            (*priority, (config.socket.clone(), config.latency_budget))
-                        })
-                        .collect();
+                let snapshot_map: HashMap<Priority, FlowSnapshot> = state
+                    .active_flows
+                    .iter()
+                    .filter_map(|priority| {
+                        let socket = state.socket_configs.get(priority)?;
+                        let flow_state = state.flow_states.get(priority)?;
+                        Some((
+                            *priority,
+                            FlowSnapshot {
+                                socket: socket.socket.clone(),
+                                state: flow_state.clone(),
+                            },
+                        ))
+                    })
+                    .collect();
                 drop(state); // Explicitly drop before await
-                (active_flows, current_index, socket_configs_snapshot)
+                (active_flows, current_index, snapshot_map)
             };
 
             if active_flows.is_empty() {
@@ -152,22 +157,19 @@ impl IngressDRRScheduler {
 
                 let priority = active_flows[flow_index];
 
-                // Look up socket and latency budget using the immutable snapshot.
-                let (socket, latency_budget) = match socket_configs_snapshot.get(&priority) {
-                    Some((s, l)) => (s.clone(), *l),
+                // Get socket and flow state from snapshot (no lock needed)
+                let flow_snapshot = match snapshot_map.get(&priority) {
+                    Some(snapshot) => snapshot.clone(),
                     None => continue,
                 };
+                let socket = flow_snapshot.socket;
+                let flow_state = flow_snapshot.state;
 
-                // Increment deficit inside a short lock scope.
-                let mut local_deficit = {
-                    let mut state = self.state.lock();
-                    if let Some(flow) = state.flow_states.get_mut(&priority) {
-                        flow.deficit += flow.quantum;
-                        flow.deficit
-                    } else {
-                        0
-                    }
-                };
+                // Atomically add quantum to deficit and retrieve local copy
+                let mut local_deficit = flow_state
+                    .deficit
+                    .fetch_add(flow_state.quantum, Ordering::Relaxed)
+                    + flow_state.quantum;
 
                 if local_deficit == 0 {
                     continue;
@@ -183,20 +185,17 @@ impl IngressDRRScheduler {
                     }
 
                     // Non-blocking read from UDP socket.
-                    let mut local_buf = [0u8; 1024];
+                    let mut local_buf = [0u8; MAX_PACKET_SIZE];
                     match socket.recv_from(&mut local_buf) {
                         Ok((size, _addr)) if size > 0 => {
                             local_deficit = local_deficit.saturating_sub(1);
 
                             // Materialise packet (including timestamp used for EDF deadlines).
-                            let data = Vec::from(&local_buf[..size]);
-                            let packet = Packet {
-                                flow_id: priority.flow_id(),
-                                data,
-                                timestamp: Instant::now(),
-                                latency_budget,
+                            let packet = Packet::new(
                                 priority,
-                            };
+                                &local_buf[..size],
+                                flow_state.latency_budget,
+                            );
 
                             let tx = &self.priority_queues[priority];
 
@@ -220,13 +219,8 @@ impl IngressDRRScheduler {
                     }
                 }
 
-                // Persist updated deficit for the next round.
-                {
-                    let mut state = self.state.lock();
-                    if let Some(flow) = state.flow_states.get_mut(&priority) {
-                        flow.deficit = local_deficit;
-                    }
-                }
+                // Persist updated deficit for the next round (no lock required)
+                flow_state.deficit.store(local_deficit, Ordering::Relaxed);
             }
 
             // Advance the round-robin pointer once we serviced everyone.

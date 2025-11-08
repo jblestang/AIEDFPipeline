@@ -1,5 +1,5 @@
 //! Earliest Deadline First processor.
-//! 
+//!
 //! The EDF stage receives packets from per-priority bounded channels, keeps at most one head-of-line
 //! packet buffered for each class, and always executes the task with the earliest absolute deadline.
 //! Packets are then forwarded to the egress DRR stage while maintaining drop counters for metrics.
@@ -145,28 +145,17 @@ impl EDFScheduler {
 
         let packet = task.packet;
 
-        // Deterministic processing time based on payload size and priority jitter.
-        let hash = packet
-            .data
-            .iter()
-            .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64));
+        // Deterministic processing time based on payload size and priority class.
 
-        let normalized = (hash % 1000) as f64 / 1000.0;
-
-        let base_ms = 0.2;
-        let extra_ms = if packet.data.len() > 200 {
-            base_ms * ((packet.data.len().min(1400) - 200) as f64 / 1200.0)
+        let base_ms = 0.10;
+        let extra_ms = if packet.len() > 200 {
+            let clamped = packet.len().min(1500);
+            0.2 * ((clamped - 200) as f64 / 1300.0)
         } else {
             0.0
         };
 
-        let priority_offset = match packet.priority {
-            Priority::High => normalized * 0.002,
-            Priority::Medium => normalized * 0.004,
-            Priority::Low | Priority::BestEffort => normalized * 0.006,
-        };
-
-        let processing_time_ms = base_ms + extra_ms + priority_offset;
+        let processing_time_ms = base_ms + extra_ms;
         let processing_time = std::time::Duration::from_secs_f64(processing_time_ms / 1000.0);
 
         let start = Instant::now();
@@ -250,7 +239,7 @@ mod tests {
             latency_budget: Duration,
             timestamp: Instant,
         ) {
-            let mut packet = Packet::new(priority, data, latency_budget);
+            let mut packet = Packet::new(priority, &data, latency_budget);
             packet.timestamp = timestamp;
             self.inputs[priority].send(packet).unwrap();
         }

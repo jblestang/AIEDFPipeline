@@ -1,5 +1,5 @@
 //! Metrics collection and reporting utilities.
-//! 
+//!
 //! The metrics pipeline records latency and deadline information on the egress hot path through a
 //! lock-free channel and aggregates statistics on the best-effort core before broadcasting them to
 //! GUI subscribers.
@@ -471,12 +471,7 @@ impl MetricsCollector {
     ///
     /// The caller is typically the egress scheduler. Events are pushed into a lock-free channel and
     /// processed on the statistics thread, so calling this method never blocks on mutexes.
-    pub fn record_packet(
-        &self,
-        priority: Priority,
-        latency: Duration,
-        deadline_missed: bool,
-    ) {
+    pub fn record_packet(&self, priority: Priority, latency: Duration, deadline_missed: bool) {
         let _ = self.events_tx.send(MetricsEvent {
             priority,
             latency,
@@ -682,11 +677,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let collector = MetricsCollector::new(tx, None, None);
 
-        collector.record_packet(
-            Priority::High,
-            Duration::from_millis(10),
-            false,
-        );
+        collector.record_packet(Priority::High, Duration::from_millis(10), false);
 
         // Wait for background thread to process the event (metrics are now processed asynchronously)
         std::thread::sleep(Duration::from_millis(10));
