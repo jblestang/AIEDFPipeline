@@ -177,21 +177,18 @@ impl IngressDRRScheduler {
                     None => continue,
                 };
 
-                // DRR Step 1: Add quantum to deficit for this flow (deficit carries over)
-                let flow_has_deficit = {
+                // Add quantum to deficit and retrieve local copy (limits lock scope)
+                let mut local_deficit = {
                     let mut state = self.state.lock();
                     if let Some(flow) = state.flow_states.get_mut(&flow_id) {
                         flow.deficit += flow.quantum;
-                        flow.deficit > 0
+                        flow.deficit
                     } else {
-                        false
+                        0
                     }
                 };
 
-                // DRR Step 2: Process packets for this flow while deficit > 0
-                // Decrement deficit by 1 for each packet read until deficit reaches 0
-                if !flow_has_deficit {
-                    // Flow has no deficit after adding quantum (shouldn't happen, but handle it)
+                if local_deficit == 0 {
                     continue;
                 }
 
@@ -200,17 +197,7 @@ impl IngressDRRScheduler {
                         break;
                     }
 
-                    // Check if we can process a packet (deficit > 0)
-                    let current_deficit = {
-                        let state = self.state.lock();
-                        state.flow_states.get(&flow_id)
-                            .map(|flow| flow.deficit)
-                            .unwrap_or(0)
-                    };
-
-                    if current_deficit == 0 {
-                        // Deficit is 0, go to next flow in round-robin
-                        // current_index already tracks our position, so just break and move to next
+                    if local_deficit == 0 {
                         break;
                     }
 
@@ -218,14 +205,8 @@ impl IngressDRRScheduler {
                     let mut local_buf = [0u8; 1024];
                     match socket.recv_from(&mut local_buf) {
                         Ok((size, _addr)) if size > 0 => {
-                            // DRR Step 3: Decrement deficit by 1 (packet count)
-                            {
-                                let mut state = self.state.lock();
-                                if let Some(flow) = state.flow_states.get_mut(&flow_id) {
-                                    flow.deficit -= 1;
-                                }
-                            }
-                            
+                            local_deficit = local_deficit.saturating_sub(1);
+
                             // Create packet
                             let data = Vec::from(&local_buf[..size]);
                             let packet = Packet {
@@ -272,17 +253,22 @@ impl IngressDRRScheduler {
                         _ => break,
                     }
                 }
+
+                // Write back updated deficit once per flow iteration
+                {
+                    let mut state = self.state.lock();
+                    if let Some(flow) = state.flow_states.get_mut(&flow_id) {
+                        flow.deficit = local_deficit;
+                    }
+                }
             }
             
             // Update current_index for next round (move to next flow after processing all flows)
             // Only update at the end of the outer loop, not inside the inner loop
             current_index = (current_index + 1) % active_flows.len();
 
-            // OPTIMIZATION: Single lock acquisition to update current index
-            {
-                let mut state = self.state.lock();
-                state.current_flow_index = current_index;
-            }
+            // OPTIMIZATION: Single lock acquisition to update current index and no other state
+            self.state.lock().current_flow_index = current_index;
 
             // If no packets were read, yield to avoid busy-waiting
             if packets_read == 0 {
