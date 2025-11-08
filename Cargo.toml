@@ -9,7 +9,7 @@ name = "gui"
 path = "src/bin/gui.rs"
 
 [dependencies]
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 egui = "0.24"
