@@ -150,7 +150,7 @@ impl EDFScheduler {
         let base_ms = 0.10;
         let extra_ms = if packet.len() > 200 {
             let clamped = packet.len().min(1500);
-            0.2 * ((clamped - 200) as f64 / 1300.0)
+            0.1 * ((clamped - 200) as f64 / 1300.0)
         } else {
             0.0
         };

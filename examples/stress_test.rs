@@ -223,7 +223,7 @@ fn main() {
     std::io::stdin().read_line(&mut input).unwrap();
 
     let test = StressTest::new();
-    let test_duration = Duration::from_secs(60); // Longer test duration
+    let test_duration = Duration::from_secs(120); // Longer test duration
 
     println!("\nStarting stress test...");
     println!(
