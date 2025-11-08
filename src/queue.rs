@@ -1,7 +1,13 @@
+//! Legacy bounded queue wrapper.
+//! 
+//! The main pipeline uses per-priority crossbeam channels directly, but some tests and metrics
+//! helpers still reference this minimal queue abstraction. It remains for backwards compatibility.
+
 use crate::drr_scheduler::Packet;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::sync::Arc;
 
+/// Thin wrapper around a bounded crossbeam channel for packets.
 pub struct Queue {
     sender: Sender<Packet>,
     receiver: Arc<Receiver<Packet>>, // crossbeam Receiver is already thread-safe, no mutex needed

@@ -1,3 +1,9 @@
+//! Pipeline orchestration.
+//! 
+//! This module wires the ingress DRR, EDF, and egress DRR schedulers together, exposes
+//! configuration objects that make queue sizes and quantums tunable, and manages thread affinity
+//! for the three-core deployment model.
+
 use crossbeam_channel::{unbounded, Receiver};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,18 +18,27 @@ use crate::ingress_drr::IngressDRRScheduler;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// UDP socket configuration shared by ingress and egress stages.
 #[derive(Debug, Clone)]
 pub struct SocketConfig {
+    /// IP address (typically loopback).
     pub address: String,
+    /// UDP port to bind/connect.
     pub port: u16,
+    /// Latency budget consumed by EDF for deadline calculations.
     pub latency_budget: Duration,
+    /// Priority associated with the socket (maps to scheduler queues).
     pub priority: Priority,
 }
 
+/// Core assignment for the three main runtime threads.
 #[derive(Debug, Clone)]
 pub struct CoreAssignment {
+    /// Core used by the ingress DRR runtime.
     pub ingress: usize,
+    /// Core dedicated to the EDF busy-spin loop.
     pub edf: usize,
+    /// Core used by egress plus metrics/statistics (best effort lane).
     pub egress: usize,
 }
 
@@ -37,9 +52,12 @@ impl Default for CoreAssignment {
     }
 }
 
+/// Channel capacity configuration linking the schedulers.
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
+    /// Capacity of ingress → EDF channels, per priority.
     pub ingress_to_edf: PriorityTable<usize>,
+    /// Capacity of EDF → egress channels, per priority.
     pub edf_to_egress: PriorityTable<usize>,
 }
 
@@ -58,8 +76,10 @@ impl Default for QueueConfig {
     }
 }
 
+/// Ingress DRR parameters.
 #[derive(Debug, Clone)]
 pub struct IngressSchedulerConfig {
+    /// Packet quantum (in units of packets) granted to each priority per round.
     pub quantums: PriorityTable<usize>,
 }
 
@@ -75,8 +95,10 @@ impl Default for IngressSchedulerConfig {
     }
 }
 
+/// EDF scheduler configuration.
 #[derive(Debug, Clone)]
 pub struct EdfSchedulerConfig {
+    /// Maximum heap size retained for compatibility; pending buffer remains one per priority.
     pub max_heap_size: usize,
 }
 
@@ -86,11 +108,16 @@ impl Default for EdfSchedulerConfig {
     }
 }
 
+/// Top-level pipeline configuration used during startup.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
+    /// CPU core layout (ingress, EDF, egress/metrics).
     pub cores: CoreAssignment,
+    /// Channel capacities connecting schedulers.
     pub queues: QueueConfig,
+    /// Ingress DRR tuning knobs.
     pub ingress: IngressSchedulerConfig,
+    /// EDF tuning knobs.
     pub edf: EdfSchedulerConfig,
 }
 
@@ -119,6 +146,7 @@ impl Pipeline {
     }
 }
 
+/// Complete pipeline wiring that owns schedulers, sockets, and metrics collectors.
 pub struct Pipeline {
     ingress_drr: Arc<IngressDRRScheduler>,
     edf: Arc<EDFScheduler>,
@@ -135,6 +163,7 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    /// Build the pipeline using the supplied configuration without starting any threads yet.
     pub async fn new(config: PipelineConfig) -> Result<Self, Box<dyn std::error::Error>> {
         set_cpu_affinity()?;
 
@@ -211,8 +240,10 @@ impl Pipeline {
         })
     }
 
-    /// Start a TCP server that broadcasts metrics to connected clients
-    /// This allows the GUI to connect as a separate process
+    /// Start the TCP metrics server that feeds the GUI.
+    ///
+    /// Spawns two Tokio tasks: one that converts internal metrics snapshots into JSON strings and
+    /// another that accepts TCP clients, forwarding the broadcast stream to each connection.
     pub async fn start_metrics_server(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         use tokio::sync::broadcast;
 
@@ -290,6 +321,10 @@ impl Pipeline {
         Ok(())
     }
 
+    /// Launch the ingress, EDF, and egress threads plus the statistics publisher.
+    ///
+    /// The method binds sockets, wires metrics, and then waits until `shutdown` flips the shared
+    /// running flag.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.running.store(true, Ordering::Relaxed);
 
@@ -425,11 +460,13 @@ impl Pipeline {
         Ok(())
     }
 
+    /// Signal all pipeline threads to stop.
     pub async fn shutdown(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
 }
 
+/// Configure CPU affinity for the process when available.
 fn set_cpu_affinity() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     {
@@ -453,6 +490,7 @@ fn set_cpu_affinity() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Attempt to set a cooperative thread priority on supported platforms.
 fn set_thread_priority(priority: i32) {
     #[cfg(target_os = "linux")]
     {
@@ -511,6 +549,7 @@ fn set_thread_priority(priority: i32) {
     }
 }
 
+/// Attempt to pin the current thread to a specific core when supported.
 fn set_thread_core(core_id: usize) {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -526,6 +565,7 @@ fn set_thread_core(core_id: usize) {
     }
 }
 
+/// Create bounded crossbeam channels for each priority class using the supplied capacities.
 fn build_priority_channels(
     capacities: &PriorityTable<usize>,
 ) -> (

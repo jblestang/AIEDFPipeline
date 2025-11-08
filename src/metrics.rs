@@ -1,3 +1,9 @@
+//! Metrics collection and reporting utilities.
+//! 
+//! The metrics pipeline records latency and deadline information on the egress hot path through a
+//! lock-free channel and aggregates statistics on the best-effort core before broadcasting them to
+//! GUI subscribers.
+
 use crate::drr_scheduler::{Priority, PriorityTable};
 use crossbeam_channel::{self, Sender};
 use parking_lot::Mutex;
@@ -13,6 +19,7 @@ pub(crate) struct LatencyMeasurement {
     timestamp: Instant,
 }
 
+/// Rolling statistics for a given priority class.
 #[derive(Debug)]
 pub struct Metrics {
     pub priority: Priority,
@@ -265,16 +272,7 @@ struct MetricsEvent {
     deadline_missed: bool,
 }
 
-pub struct MetricsCollector {
-    metrics: Arc<Mutex<std::collections::HashMap<Priority, Metrics>>>,
-    metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>,
-    // Lock-free channel for metrics events (hot path sends here, background thread processes)
-    events_tx: crossbeam_channel::Sender<MetricsEvent>,
-    queue1: Option<Arc<crate::queue::Queue>>,
-    queue2: Option<Arc<crate::queue::Queue>>,
-}
-
-// Helper struct to send metrics data
+/// Snapshot emitted to external listeners (GUI, tests, logging).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MetricsSnapshot {
     pub priority: Priority,
@@ -394,7 +392,18 @@ mod duration_millis_option {
     }
 }
 
+/// Metrics collector coordinates hot-path event ingestion and background aggregation.
+pub struct MetricsCollector {
+    metrics: Arc<Mutex<std::collections::HashMap<Priority, Metrics>>>,
+    metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>,
+    // Lock-free channel for metrics events (hot path sends here, background thread processes)
+    events_tx: crossbeam_channel::Sender<MetricsEvent>,
+    queue1: Option<Arc<crate::queue::Queue>>,
+    queue2: Option<Arc<crate::queue::Queue>>,
+}
+
 impl MetricsCollector {
+    /// Create a new collector backed by the provided metrics sender and optional queue probes.
     pub fn new(
         metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>,
         queue1: Option<Arc<crate::queue::Queue>>,
@@ -458,30 +467,30 @@ impl MetricsCollector {
         }
     }
 
-    /// Record packet metrics (LOCK-FREE: sends event to channel, never blocks)
-    /// This is called from the hot path (EgressDRR) and must not block
+    /// Record a single packet latency event from the hot path.
+    ///
+    /// The caller is typically the egress scheduler. Events are pushed into a lock-free channel and
+    /// processed on the statistics thread, so calling this method never blocks on mutexes.
     pub fn record_packet(
         &self,
         priority: Priority,
         latency: Duration,
         deadline_missed: bool,
-        _expected_max_latency: Duration,
+        expected_max_latency: Duration,
     ) {
-        // Send event to lock-free channel (non-blocking, never waits on mutex)
-        // If channel is full, drop the event (better than blocking packet processing)
-        let _ = self.events_tx.try_send(MetricsEvent {
+        let _ = self.events_tx.send(MetricsEvent {
             priority,
             latency,
             deadline_missed,
+            expected_max_latency,
         });
-
-        // Note: We don't send snapshots here anymore - that's done by the statistics thread
-        // This eliminates all mutex contention from the hot path
     }
 
-    /// Force send current metrics (useful for periodic updates)
-    /// OPTIMIZATION: Minimize lock hold time to reduce priority inversion risk
-    /// Clone metrics data quickly, then compute statistics outside the lock
+    /// Aggregate current metrics and send a snapshot to listeners.
+    ///
+    /// Called from the statistics thread running on the best-effort core. The method clones the
+    /// underlying structures while holding the mutex briefly, computes percentiles outside the lock,
+    /// and merges drop counters and queue occupancy information into the snapshot map.
     pub fn send_current_metrics(
         &self,
         expected_latencies: &PriorityTable<Duration>,

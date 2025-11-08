@@ -1,12 +1,18 @@
+//! Core scheduling primitives shared across the ingress/egress DRR stages and the EDF processor.
+//! 
+//! The module defines the global [`Priority`] ordering used throughout the pipeline, the
+//! [`Packet`] representation that flows between stages, and the [`PriorityTable`] helper that
+//! keeps APIs stable when new priority classes are introduced.
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::{Index, IndexMut};
 use std::time::{Duration, Instant};
 
-/// System-wide latency/priority classes.
+/// System-wide latency/priority classes ordered from most to least critical.
 ///
-/// The values are ordered from most critical to least critical so they can be
-/// used directly with comparisons, array indexes or sorting logic.
+/// The ordering is stable so schedulers can rely on integer indexes instead of branching on
+/// specific labels. Adding a new class only requires appending it to [`Priority::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Priority {
     High,
@@ -35,6 +41,9 @@ impl Priority {
     }
 
     /// Map a legacy numeric flow identifier to the associated priority class.
+    ///
+    /// This is retained for backwards compatibility with external workloads that still encode
+    /// priorities as integers on the wire.
     #[allow(dead_code)]
     pub const fn from_flow_id(flow_id: u64) -> Priority {
         match flow_id {
@@ -71,6 +80,10 @@ impl fmt::Display for Priority {
 }
 
 /// Lightweight representation of a work unit travelling through the pipeline.
+///
+/// Each [`Packet`] captures payload bytes, their latency budget, and the [`Priority`] used by the
+/// schedulers. The timestamp is filled when the packet enters the pipeline so downstream stages can
+/// compute latency and deadline misses.
 #[derive(Debug, Clone)]
 pub struct Packet {
     #[cfg_attr(not(test), allow(dead_code))]
@@ -97,9 +110,9 @@ impl Packet {
 
 /// Helper structure wrapping a value per [`Priority`].
 ///
-/// This allows APIs to remain stable when new priorities are introduced: as long
-/// as [`Priority::ALL`] is updated, the table automatically grows and all call
-/// sites iterate dynamically.
+/// This allows APIs to remain stable when new priorities are introduced: as long as
+/// [`Priority::ALL`] is updated, the table automatically grows and all call sites iterate
+/// dynamically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriorityTable<T> {
     values: Vec<T>,

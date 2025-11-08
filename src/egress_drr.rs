@@ -1,3 +1,9 @@
+//! Egress Deficit Round Robin scheduler.
+//! 
+//! This stage drains EDF output queues in strict priority order, records latency metrics, and emits
+//! packets through UDP sockets. Metrics recording uses a lock-free channel so the hot path does not
+//! contend with the statistics thread.
+
 use crate::drr_scheduler::{Packet, Priority, PriorityTable};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -14,6 +20,7 @@ pub struct EgressDRRScheduler {
 }
 
 impl EgressDRRScheduler {
+    /// Build a new egress scheduler using pre-created per-priority channels.
     pub fn new(priority_receivers: PriorityTable<crossbeam_channel::Receiver<Packet>>) -> Self {
         Self {
             priority_receivers,
@@ -21,6 +28,7 @@ impl EgressDRRScheduler {
         }
     }
 
+    /// Register an output socket that will receive packets for a given priority class.
     pub fn add_output_socket(
         &self,
         priority: Priority,
@@ -41,11 +49,7 @@ impl EgressDRRScheduler {
         let receivers =
             PriorityTable::from_fn(|priority| self.priority_receivers[priority].clone());
 
-        // OPTIMIZATION: Clone socket map once at start to avoid lock per packet
-        // NOTE: This means sockets added after process_queues starts won't be available
-        // until the next iteration. For now, we assume all sockets are added before
-        // process_queues is called.
-        // IMPORTANT: Clone socket map AFTER cloning receivers to ensure all sockets are added
+        // Clone sockets at start to avoid locking within the hot loop.
         let socket_map: HashMap<Priority, (Arc<UdpSocket>, SocketAddr)> = {
             let sockets = self.output_sockets.lock();
             sockets.clone()
@@ -62,7 +66,7 @@ impl EgressDRRScheduler {
                 }
 
                 if let Some((priority, packet)) = packet_opt {
-                    // Record metrics
+                    // Record metrics before the attempt to send so dropped packets are still tracked.
                     let latency = packet.timestamp.elapsed();
                     let deadline = packet.timestamp + packet.latency_budget;
                     let deadline_missed = Instant::now() > deadline;

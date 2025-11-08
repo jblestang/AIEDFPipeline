@@ -1,3 +1,6 @@
+//! AIEDF scheduling library exposing DRR and EDF primitives plus the configuration surface for the
+//! full pipeline.
+
 pub mod drr_scheduler;
 pub mod edf_scheduler;
 pub mod egress_drr;

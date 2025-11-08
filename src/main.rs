@@ -1,4 +1,7 @@
 // Main pipeline binary - runs the pipeline without GUI
+//
+// The binary creates a Tokio runtime, instantiates the pipeline with default configuration, starts
+// the metrics TCP server, and keeps the pipeline alive until Ctrl+C is received.
 
 mod drr_scheduler;
 mod edf_scheduler;

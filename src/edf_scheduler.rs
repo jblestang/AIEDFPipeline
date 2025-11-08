@@ -1,3 +1,9 @@
+//! Earliest Deadline First processor.
+//! 
+//! The EDF stage receives packets from per-priority bounded channels, keeps at most one head-of-line
+//! packet buffered for each class, and always executes the task with the earliest absolute deadline.
+//! Packets are then forwarded to the egress DRR stage while maintaining drop counters for metrics.
+
 use crate::drr_scheduler::{Packet, Priority, PriorityTable};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -33,21 +39,28 @@ impl PartialEq for EDFTask {
 
 impl Eq for EDFTask {}
 
+/// Drop counters exposed by the EDF stage.
 #[derive(Debug, Clone)]
 pub struct EDFDropCounters {
+    /// Heap drops remain for compatibility; the current algorithm never fills a heap.
     pub heap: u64,
+    /// Per priority drops recorded when the EDF → egress channel is full.
     pub output: PriorityTable<u64>,
 }
 
+/// EDF scheduler that keeps one buffered packet per priority and executes the earliest deadline.
 pub struct EDFScheduler {
     input_queues: PriorityTable<Arc<Receiver<Packet>>>,
     output_queues: PriorityTable<Sender<Packet>>,
     output_drop_counters: PriorityTable<Arc<AtomicU64>>,
+    /// Pending head-of-line packet for each priority.
     pending: Arc<Mutex<PriorityTable<Option<EDFTask>>>>,
+    /// Retained for configuration compatibility; no heap is used in the current implementation.
     _max_heap_size: usize,
 }
 
 impl EDFScheduler {
+    /// Construct a new EDF scheduler from per-priority channels and a heap size hint.
     pub fn new(
         input_queues: PriorityTable<Arc<Receiver<Packet>>>,
         output_queues: PriorityTable<Sender<Packet>>,
@@ -63,7 +76,7 @@ impl EDFScheduler {
         }
     }
 
-    /// Get drop counts (for metrics)
+    /// Return the currently recorded drop counts (used by metrics).
     pub fn get_drop_counts(&self) -> EDFDropCounters {
         EDFDropCounters {
             heap: 0,
@@ -73,6 +86,7 @@ impl EDFScheduler {
         }
     }
 
+    /// Enqueue a packet directly (used in unit tests to bypass channels).
     #[allow(dead_code)] // Used in tests
     pub fn enqueue_packet(
         &self,
@@ -92,9 +106,11 @@ impl EDFScheduler {
         Ok(())
     }
 
+    /// Process the next available packet (if any) and return it for testing convenience.
     pub fn process_next(&self) -> Option<Packet> {
         let mut buffers = self.pending.lock();
 
+        // Fill empty buffers with the head packet from each input queue.
         for priority in Priority::ALL {
             if buffers[priority].is_none() {
                 if let Ok(packet) = self.input_queues[priority].try_recv() {
@@ -104,6 +120,7 @@ impl EDFScheduler {
             }
         }
 
+        // Determine the earliest deadline among the buffered packets.
         let mut earliest: Option<(Priority, Instant)> = None;
         for priority in Priority::ALL {
             if let Some(task) = buffers[priority].as_ref() {
@@ -128,6 +145,7 @@ impl EDFScheduler {
 
         let packet = task.packet;
 
+        // Deterministic processing time based on payload size and priority jitter.
         let hash = packet
             .data
             .iter()
