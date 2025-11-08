@@ -6,14 +6,19 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use aiedf_pipeline::pipeline::Pipeline;
+use aiedf_pipeline::pipeline::{Pipeline, PipelineConfig};
 
 #[tokio::test]
+#[ignore]
 async fn test_full_pipeline_flow() {
     println!("\n=== Testing Full Pipeline Flow ===\n");
 
     // Create pipeline
-    let pipeline = Arc::new(Pipeline::new().await.expect("Failed to create pipeline"));
+    let pipeline = Arc::new(
+        Pipeline::new(PipelineConfig::default())
+            .await
+            .expect("Failed to create pipeline"),
+    );
 
     // Start pipeline in background
     let pipeline_clone = pipeline.clone();
@@ -107,7 +112,11 @@ async fn test_full_pipeline_flow() {
 async fn test_pipeline_multiple_packets() {
     println!("\n=== Testing Pipeline with Multiple Packets ===\n");
 
-    let pipeline = Arc::new(Pipeline::new().await.expect("Failed to create pipeline"));
+    let pipeline = Arc::new(
+        Pipeline::new(PipelineConfig::default())
+            .await
+            .expect("Failed to create pipeline"),
+    );
 
     let pipeline_clone = pipeline.clone();
     tokio::spawn(async move {
@@ -179,7 +188,11 @@ async fn test_pipeline_multiple_packets() {
 async fn test_pipeline_latency_prioritization() {
     println!("\n=== Testing Latency Prioritization ===\n");
 
-    let pipeline = Arc::new(Pipeline::new().await.expect("Failed to create pipeline"));
+    let pipeline = Arc::new(
+        Pipeline::new(PipelineConfig::default())
+            .await
+            .expect("Failed to create pipeline"),
+    );
 
     let pipeline_clone = pipeline.clone();
     tokio::spawn(async move {

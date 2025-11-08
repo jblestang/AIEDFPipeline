@@ -1,3 +1,4 @@
+use crate::drr_scheduler::{Priority, PriorityTable};
 use crossbeam_channel::{self, Sender};
 use parking_lot::Mutex;
 use std::cell::RefCell;
@@ -7,16 +8,16 @@ use std::time::{Duration, Instant};
 
 /// Latency measurement with timestamp for time-based windowing
 #[derive(Debug, Clone)]
-struct LatencyMeasurement {
+pub(crate) struct LatencyMeasurement {
     latency_us: f64,
     timestamp: Instant,
 }
 
 #[derive(Debug)]
 pub struct Metrics {
-    pub flow_id: u64,
+    pub priority: Priority,
     pub packet_count: u64,
-    pub latencies: VecDeque<LatencyMeasurement>, // Store latencies with timestamps for time-based windowing
+    pub(crate) latencies: VecDeque<LatencyMeasurement>, // Store latencies with timestamps for time-based windowing
     pub deadline_misses: u64,
     pub last_update: Instant,
     pub time_window: Duration, // Time window for latency history (e.g., 10 seconds)
@@ -31,7 +32,7 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
-            flow_id: 0,
+            priority: Priority::High,
             packet_count: 0,
             latencies: VecDeque::with_capacity(10000), // Pre-allocate for high packet rates
             deadline_misses: 0,
@@ -47,9 +48,9 @@ impl Default for Metrics {
 }
 
 impl Metrics {
-    pub fn new(flow_id: u64) -> Self {
+    pub fn new(priority: Priority) -> Self {
         Self {
-            flow_id,
+            priority,
             packet_count: 0,
             latencies: VecDeque::with_capacity(10000), // Pre-allocate for high packet rates
             deadline_misses: 0,
@@ -67,7 +68,7 @@ impl Metrics {
         self.packet_count += 1;
 
         let now = Instant::now();
-        
+
         // Store latency in microseconds with timestamp for time-based windowing
         let latency_us = latency.as_secs_f64() * 1_000_000.0;
         self.latencies.push_back(LatencyMeasurement {
@@ -147,7 +148,8 @@ impl Metrics {
         if self.latencies.len() < 2 {
             return None;
         }
-        let mean = self.latencies.iter().map(|m| m.latency_us).sum::<f64>() / self.latencies.len() as f64;
+        let mean =
+            self.latencies.iter().map(|m| m.latency_us).sum::<f64>() / self.latencies.len() as f64;
         let variance = self
             .latencies
             .iter()
@@ -162,7 +164,11 @@ impl Metrics {
         if self.latencies.is_empty() {
             return None;
         }
-        let min = self.latencies.iter().map(|m| m.latency_us).fold(f64::INFINITY, |a, b| a.min(b));
+        let min = self
+            .latencies
+            .iter()
+            .map(|m| m.latency_us)
+            .fold(f64::INFINITY, |a, b| a.min(b));
         Some(Duration::from_secs_f64(min / 1_000_000.0))
     }
 
@@ -185,7 +191,10 @@ impl Metrics {
 
     pub fn get_recent_latencies(&self, count: usize) -> Vec<f64> {
         let start = self.latencies.len().saturating_sub(count);
-        self.latencies.range(start..).map(|m| m.latency_us).collect()
+        self.latencies
+            .range(start..)
+            .map(|m| m.latency_us)
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -233,7 +242,7 @@ impl Metrics {
 impl Clone for Metrics {
     fn clone(&self) -> Self {
         Self {
-            flow_id: self.flow_id,
+            priority: self.priority,
             packet_count: self.packet_count,
             latencies: self.latencies.clone(),
             deadline_misses: self.deadline_misses,
@@ -251,14 +260,13 @@ impl Clone for Metrics {
 /// Metrics event for lock-free recording (sent from hot path)
 #[derive(Debug, Clone)]
 struct MetricsEvent {
-    flow_id: u64,
+    priority: Priority,
     latency: Duration,
     deadline_missed: bool,
-    expected_max_latency: Duration,
 }
 
 pub struct MetricsCollector {
-    metrics: Arc<Mutex<std::collections::HashMap<u64, Metrics>>>,
+    metrics: Arc<Mutex<std::collections::HashMap<Priority, Metrics>>>,
     metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>,
     // Lock-free channel for metrics events (hot path sends here, background thread processes)
     events_tx: crossbeam_channel::Sender<MetricsEvent>,
@@ -269,7 +277,7 @@ pub struct MetricsCollector {
 // Helper struct to send metrics data
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MetricsSnapshot {
-    pub flow_id: u64,
+    pub priority: Priority,
     pub packet_count: u64,
     #[serde(with = "duration_millis")]
     pub avg_latency: Duration,
@@ -303,13 +311,13 @@ pub struct MetricsSnapshot {
     pub queue2_capacity: usize,
     // Packet drop metrics (per flow, aggregated from all drop points)
     #[serde(default = "default_zero_u64")]
-    pub ingress_drops: u64,      // Drops at IngressDRR → Input Queue
+    pub ingress_drops: u64, // Drops at IngressDRR → Input Queue
     #[serde(default = "default_zero_u64")]
-    pub edf_heap_drops: u64,     // Drops at EDF Heap
+    pub edf_heap_drops: u64, // Drops at EDF Heap
     #[serde(default = "default_zero_u64")]
-    pub edf_output_drops: u64,   // Drops at EDF → Output Queue
+    pub edf_output_drops: u64, // Drops at EDF → Output Queue
     #[serde(default = "default_zero_u64")]
-    pub total_drops: u64,        // Total drops for this flow
+    pub total_drops: u64, // Total drops for this flow
     #[serde(skip, default = "default_instant")]
     #[allow(dead_code)]
     pub last_update: Instant,
@@ -393,11 +401,15 @@ impl MetricsCollector {
         queue2: Option<Arc<crate::queue::Queue>>,
     ) -> Self {
         // Create lock-free channel for metrics events (bounded to prevent unbounded growth)
-        let (events_tx, events_rx): (crossbeam_channel::Sender<MetricsEvent>, crossbeam_channel::Receiver<MetricsEvent>) = crossbeam_channel::bounded(10000);
-        
-        let metrics: Arc<Mutex<std::collections::HashMap<u64, Metrics>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (events_tx, events_rx): (
+            crossbeam_channel::Sender<MetricsEvent>,
+            crossbeam_channel::Receiver<MetricsEvent>,
+        ) = crossbeam_channel::bounded(10000);
+
+        let metrics: Arc<Mutex<std::collections::HashMap<Priority, Metrics>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
         let metrics_clone = metrics.clone();
-        
+
         // Background thread to process metrics events (doesn't block hot path)
         std::thread::Builder::new()
             .name("Metrics-Processor".to_string())
@@ -413,30 +425,30 @@ impl MetricsCollector {
                             Err(crossbeam_channel::TryRecvError::Disconnected) => return, // Shutdown
                         }
                     }
-                    
+
                     if batch.is_empty() {
                         // No events, yield briefly
                         std::thread::yield_now();
                         continue;
                     }
-                    
+
                     // Process batch: update metrics (lock only once per batch)
                     {
                         let mut metrics_map = metrics_clone.lock();
                         for event in &batch {
                             let metrics = metrics_map
-                                .entry(event.flow_id)
-                                .or_insert_with(|| Metrics::new(event.flow_id));
+                                .entry(event.priority)
+                                .or_insert_with(|| Metrics::new(event.priority));
                             metrics.record_latency(event.latency, event.deadline_missed);
                         }
                     } // Lock released
-                    
+
                     // Clear batch for next iteration
                     batch.clear();
                 }
             })
             .expect("Failed to spawn metrics processor thread");
-        
+
         Self {
             metrics,
             metrics_tx,
@@ -450,20 +462,19 @@ impl MetricsCollector {
     /// This is called from the hot path (EgressDRR) and must not block
     pub fn record_packet(
         &self,
-        flow_id: u64,
+        priority: Priority,
         latency: Duration,
         deadline_missed: bool,
-        expected_max_latency: Duration,
+        _expected_max_latency: Duration,
     ) {
         // Send event to lock-free channel (non-blocking, never waits on mutex)
         // If channel is full, drop the event (better than blocking packet processing)
         let _ = self.events_tx.try_send(MetricsEvent {
-            flow_id,
+            priority,
             latency,
             deadline_missed,
-            expected_max_latency,
         });
-        
+
         // Note: We don't send snapshots here anymore - that's done by the statistics thread
         // This eliminates all mutex contention from the hot path
     }
@@ -473,9 +484,9 @@ impl MetricsCollector {
     /// Clone metrics data quickly, then compute statistics outside the lock
     pub fn send_current_metrics(
         &self,
-        flow_id_to_expected_latency: &std::collections::HashMap<u64, Duration>,
-        ingress_drops: Option<(u64, u64, u64)>, // (high, medium, low) drops from IngressDRR
-        edf_drops: Option<(u64, u64, u64, u64)>, // (heap, high_out, medium_out, low_out) drops from EDF
+        expected_latencies: &PriorityTable<Duration>,
+        ingress_drops: Option<PriorityTable<u64>>,
+        edf_drops: Option<(u64, PriorityTable<u64>)>,
     ) {
         // Get queue occupancy (no lock needed)
         let queue1_occupancy = self.queue1.as_ref().map(|q| q.occupancy()).unwrap_or(0);
@@ -485,41 +496,29 @@ impl MetricsCollector {
 
         // Quick clone to minimize lock hold time (reduces priority inversion risk)
         // Statistics computation happens outside the lock
-        let metrics_clone: std::collections::HashMap<u64, Metrics> = {
+        let metrics_clone: std::collections::HashMap<Priority, Metrics> = {
             let metrics = self.metrics.lock();
             metrics.clone() // Clone while holding lock (fast operation)
         }; // Lock released here
 
-        // Map drop counts to flow_id (HIGH=1, MEDIUM=2, LOW=3)
-        let (ingress_high_drops, ingress_medium_drops, ingress_low_drops) = 
-            ingress_drops.unwrap_or((0, 0, 0));
-        let (edf_heap_drops, edf_high_out_drops, edf_medium_out_drops, edf_low_out_drops) = 
-            edf_drops.unwrap_or((0, 0, 0, 0));
+        let ingress_table = ingress_drops.unwrap_or_else(|| PriorityTable::from_fn(|_| 0));
+        let (edf_heap_drops, edf_table) = edf_drops.unwrap_or((0, PriorityTable::from_fn(|_| 0)));
 
         // Compute statistics outside the lock (no blocking of other threads)
         let mut snapshot = std::collections::HashMap::new();
-        for (fid, m) in metrics_clone.iter() {
-            let expected_max = flow_id_to_expected_latency
-                .get(fid)
-                .copied()
-                .unwrap_or(Duration::from_millis(200));
-            
-            // Map drop counts to this flow_id
-            let (ingress_drops_for_flow, edf_output_drops_for_flow) = match *fid {
-                1 => (ingress_high_drops, edf_high_out_drops),      // HIGH priority
-                2 => (ingress_medium_drops, edf_medium_out_drops), // MEDIUM priority
-                3 => (ingress_low_drops, edf_low_out_drops),       // LOW priority
-                _ => (0, 0),
-            };
-            
+        for (priority, m) in metrics_clone.iter() {
+            let expected_max = expected_latencies[*priority];
+            let ingress_drops_for_flow = ingress_table[*priority];
+            let edf_output_drops_for_flow = edf_table[*priority];
+
             // EDF heap drops are shared across all flows (we'll attribute to all flows for visibility)
             // In practice, heap drops affect all priorities, but we show it per flow for monitoring
             let total_drops = ingress_drops_for_flow + edf_heap_drops + edf_output_drops_for_flow;
-            
+
             snapshot.insert(
-                *fid,
+                *priority,
                 MetricsSnapshot {
-                    flow_id: m.flow_id,
+                    priority: m.priority,
                     packet_count: m.packet_count,
                     avg_latency: m.average_latency(),
                     min_latency: m.min_latency(),
@@ -545,14 +544,18 @@ impl MetricsCollector {
                 },
             );
         }
-        let _ = self.metrics_tx.try_send(snapshot);
+        let serialized_snapshot: std::collections::HashMap<u64, MetricsSnapshot> = snapshot
+            .into_iter()
+            .map(|(priority, metrics)| (priority.flow_id(), metrics))
+            .collect();
+        let _ = self.metrics_tx.try_send(serialized_snapshot);
     }
 
     #[allow(dead_code)]
     pub fn get_metrics_snapshot(
         &self,
-        flow_id_to_expected_latency: &std::collections::HashMap<u64, Duration>,
-    ) -> std::collections::HashMap<u64, MetricsSnapshot> {
+        expected_latencies: &PriorityTable<Duration>,
+    ) -> std::collections::HashMap<Priority, MetricsSnapshot> {
         // Get queue occupancy
         let queue1_occupancy = self.queue1.as_ref().map(|q| q.occupancy()).unwrap_or(0);
         let queue1_capacity = self.queue1.as_ref().map(|q| q.capacity()).unwrap_or(0);
@@ -561,15 +564,12 @@ impl MetricsCollector {
 
         let metrics = self.metrics.lock();
         let mut snapshot = std::collections::HashMap::new();
-        for (flow_id, m) in metrics.iter() {
-            let expected_max = flow_id_to_expected_latency
-                .get(flow_id)
-                .copied()
-                .unwrap_or(Duration::from_millis(100));
+        for (priority, m) in metrics.iter() {
+            let expected_max = expected_latencies[*priority];
             snapshot.insert(
-                *flow_id,
+                *priority,
                 MetricsSnapshot {
-                    flow_id: m.flow_id,
+                    priority: m.priority,
                     packet_count: m.packet_count,
                     avg_latency: m.average_latency(),
                     min_latency: m.min_latency(),
@@ -599,7 +599,7 @@ impl MetricsCollector {
     }
 
     #[allow(dead_code)]
-    pub fn get_metrics(&self) -> std::collections::HashMap<u64, Metrics> {
+    pub fn get_metrics(&self) -> std::collections::HashMap<Priority, Metrics> {
         self.metrics.lock().clone()
     }
 }
@@ -610,14 +610,14 @@ mod tests {
 
     #[test]
     fn test_metrics_creation() {
-        let metrics = Metrics::new(1);
-        assert_eq!(metrics.flow_id, 1);
+        let metrics = Metrics::new(Priority::High);
+        assert_eq!(metrics.priority, Priority::High);
         assert_eq!(metrics.packet_count, 0);
     }
 
     #[test]
     fn test_record_latency() {
-        let mut metrics = Metrics::new(1);
+        let mut metrics = Metrics::new(Priority::High);
         metrics.record_latency(Duration::from_millis(10), false);
         metrics.record_latency(Duration::from_millis(20), false);
         metrics.record_latency(Duration::from_millis(5), true);
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn test_average_latency() {
-        let mut metrics = Metrics::new(1);
+        let mut metrics = Metrics::new(Priority::High);
         metrics.record_latency(Duration::from_millis(10), false);
         metrics.record_latency(Duration::from_millis(20), false);
 
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_standard_deviation() {
-        let mut metrics = Metrics::new(1);
+        let mut metrics = Metrics::new(Priority::High);
         metrics.record_latency(Duration::from_millis(10), false);
         metrics.record_latency(Duration::from_millis(20), false);
         metrics.record_latency(Duration::from_millis(15), false);
@@ -676,17 +676,17 @@ mod tests {
         let collector = MetricsCollector::new(tx, None, None);
 
         collector.record_packet(
-            1,
+            Priority::High,
             Duration::from_millis(10),
             false,
             Duration::from_millis(100),
         );
-        
+
         // Wait for background thread to process the event (metrics are now processed asynchronously)
         std::thread::sleep(Duration::from_millis(10));
-        
+
         let metrics = collector.get_metrics();
-        assert!(metrics.contains_key(&1));
-        assert_eq!(metrics[&1].packet_count, 1);
+        assert!(metrics.contains_key(&Priority::High));
+        assert_eq!(metrics[&Priority::High].packet_count, 1);
     }
 }

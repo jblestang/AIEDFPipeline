@@ -8,4 +8,7 @@ pub mod pipeline;
 pub mod queue;
 
 // Re-export for easier testing
-pub use pipeline::{Pipeline, SocketConfig};
+pub use pipeline::{
+    CoreAssignment, EdfSchedulerConfig, IngressSchedulerConfig, Pipeline, PipelineConfig,
+    QueueConfig, SocketConfig,
+};

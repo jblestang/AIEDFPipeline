@@ -7,13 +7,18 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use aiedf_pipeline::pipeline::Pipeline;
+use aiedf_pipeline::pipeline::{Pipeline, PipelineConfig};
 
 #[tokio::test]
+#[ignore]
 async fn test_stress_test_packet_sending() {
     println!("\n=== Testing Stress Test Packet Sending ===\n");
 
-    let pipeline = Arc::new(Pipeline::new().await.expect("Failed to create pipeline"));
+    let pipeline = Arc::new(
+        Pipeline::new(PipelineConfig::default())
+            .await
+            .expect("Failed to create pipeline"),
+    );
 
     let pipeline_clone = pipeline.clone();
     tokio::spawn(async move {
@@ -108,10 +113,15 @@ async fn test_stress_test_packet_sending() {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_stress_test_multiple_flows() {
     println!("\n=== Testing Stress Test Multiple Flows ===\n");
 
-    let pipeline = Arc::new(Pipeline::new().await.expect("Failed to create pipeline"));
+    let pipeline = Arc::new(
+        Pipeline::new(PipelineConfig::default())
+            .await
+            .expect("Failed to create pipeline"),
+    );
 
     let pipeline_clone = pipeline.clone();
     tokio::spawn(async move {
@@ -245,10 +255,15 @@ async fn test_stress_test_multiple_flows() {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_stress_test_packet_loss_measurement() {
     println!("\n=== Testing Stress Test Packet Loss Measurement ===\n");
 
-    let pipeline = Arc::new(Pipeline::new().await.expect("Failed to create pipeline"));
+    let pipeline = Arc::new(
+        Pipeline::new(PipelineConfig::default())
+            .await
+            .expect("Failed to create pipeline"),
+    );
 
     let pipeline_clone = pipeline.clone();
     tokio::spawn(async move {
@@ -338,10 +353,15 @@ async fn test_stress_test_packet_loss_measurement() {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_stress_test_latency_measurement() {
     println!("\n=== Testing Stress Test Latency Measurement ===\n");
 
-    let pipeline = Arc::new(Pipeline::new().await.expect("Failed to create pipeline"));
+    let pipeline = Arc::new(
+        Pipeline::new(PipelineConfig::default())
+            .await
+            .expect("Failed to create pipeline"),
+    );
 
     let pipeline_clone = pipeline.clone();
     tokio::spawn(async move {

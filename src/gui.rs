@@ -228,9 +228,24 @@ fn update_ui(
 
                                 let plot_width = ui.available_width().max(400.0);
 
-                                let stats_definitions: Vec<(&str, egui::Color32, Box<dyn Fn(&StatisticsPoint) -> f64>, Option<(String, Vec<[f64; 2]>)>)> = vec![
-                                    ("Average", egui::Color32::BLUE, Box::new(|p: &StatisticsPoint| p.avg), None),
-                                    ("Minimum", egui::Color32::GREEN, Box::new(|p: &StatisticsPoint| p.min), None),
+                                let stats_definitions: Vec<(
+                                    &str,
+                                    egui::Color32,
+                                    Box<dyn Fn(&StatisticsPoint) -> f64>,
+                                    Option<(String, Vec<[f64; 2]>)>,
+                                )> = vec![
+                                    (
+                                        "Average",
+                                        egui::Color32::BLUE,
+                                        Box::new(|p: &StatisticsPoint| p.avg),
+                                        None,
+                                    ),
+                                    (
+                                        "Minimum",
+                                        egui::Color32::GREEN,
+                                        Box::new(|p: &StatisticsPoint| p.min),
+                                        None,
+                                    ),
                                     (
                                         "Maximum",
                                         egui::Color32::RED,
@@ -238,8 +253,20 @@ fn update_ui(
                                         Some((
                                             "Expected Max".to_string(),
                                             vec![
-                                                [0.0, to_log_y(metrics.expected_max_latency.as_secs_f64() * 1000.0)],
-                                                [time_range, to_log_y(metrics.expected_max_latency.as_secs_f64() * 1000.0)],
+                                                [
+                                                    0.0,
+                                                    to_log_y(
+                                                        metrics.expected_max_latency.as_secs_f64()
+                                                            * 1000.0,
+                                                    ),
+                                                ],
+                                                [
+                                                    time_range,
+                                                    to_log_y(
+                                                        metrics.expected_max_latency.as_secs_f64()
+                                                            * 1000.0,
+                                                    ),
+                                                ],
                                             ],
                                         )),
                                     ),
@@ -267,7 +294,9 @@ fn update_ui(
                                     .num_columns(2)
                                     .spacing([16.0, 10.0])
                                     .show(ui, |grid_ui| {
-                                        for (index, (title, color, accessor, extra_line)) in stats_definitions.iter().enumerate() {
+                                        for (index, (title, color, accessor, extra_line)) in
+                                            stats_definitions.iter().enumerate()
+                                        {
                                             let data: Vec<[f64; 2]> = flow_stats
                                                 .points
                                                 .iter()
@@ -290,45 +319,65 @@ fn update_ui(
                                             let y_min_log = to_log_y(y_min_linear);
                                             let y_max_log = to_log_y(y_max_linear);
 
-                                            Plot::new(format!("flow_{}_{}_plot", flow_id, title.replace(' ', "_")))
-                                                .width(plot_width / 2.0 - 8.0)
-                                                .height(220.0)
-                                                .x_axis_label("Time (seconds)")
-                                                .y_axis_label("Latency (ms) - Log Scale")
-                                                .y_axis_formatter(|val, _range, _| {
-                                                    let linear_val = 10f64.powf(val);
-                                                    if linear_val < 1.0 {
-                                                        format!("{:.3}", linear_val)
-                                                    } else {
-                                                        format!("{:.2}", linear_val)
-                                                    }
-                                                })
-                                                .x_axis_formatter(|val, _range, _| format!("{:.1}s", val))
-                                                .label_formatter(|name, point| {
-                                                    let linear_y = 10f64.powf(point.y);
-                                                    let y_str = if linear_y < 1.0 {
-                                                        format!("{:.3} ms", linear_y)
-                                                    } else {
-                                                        format!("{:.2} ms", linear_y)
-                                                    };
-                                                    format!("{}\n{:.1}s, {}", name, point.x, y_str)
-                                                })
-                                                .include_x(0.0)
-                                                .include_x(time_range)
-                                                .include_y(y_min_log)
-                                                .include_y(y_max_log)
-                                                .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
-                                                .show(grid_ui, |plot_ui| {
-                                                    plot_ui.line(Line::new(data.clone()).name(*title).color(*color));
+                                            Plot::new(format!(
+                                                "flow_{}_{}_plot",
+                                                flow_id,
+                                                title.replace(' ', "_")
+                                            ))
+                                            .width(plot_width / 2.0 - 8.0)
+                                            .height(220.0)
+                                            .x_axis_label("Time (seconds)")
+                                            .y_axis_label("Latency (ms) - Log Scale")
+                                            .y_axis_formatter(|val, _range, _| {
+                                                let linear_val = 10f64.powf(val);
+                                                if linear_val < 1.0 {
+                                                    format!("{:.3}", linear_val)
+                                                } else {
+                                                    format!("{:.2}", linear_val)
+                                                }
+                                            })
+                                            .x_axis_formatter(|val, _range, _| {
+                                                format!("{:.1}s", val)
+                                            })
+                                            .label_formatter(|name, point| {
+                                                let linear_y = 10f64.powf(point.y);
+                                                let y_str = if linear_y < 1.0 {
+                                                    format!("{:.3} ms", linear_y)
+                                                } else {
+                                                    format!("{:.2} ms", linear_y)
+                                                };
+                                                format!("{}\n{:.1}s, {}", name, point.x, y_str)
+                                            })
+                                            .include_x(0.0)
+                                            .include_x(time_range)
+                                            .include_y(y_min_log)
+                                            .include_y(y_max_log)
+                                            .legend(
+                                                egui_plot::Legend::default()
+                                                    .position(egui_plot::Corner::RightTop),
+                                            )
+                                            .show(
+                                                grid_ui,
+                                                |plot_ui| {
+                                                    plot_ui.line(
+                                                        Line::new(data.clone())
+                                                            .name(*title)
+                                                            .color(*color),
+                                                    );
                                                     if let Some((name, extra_points)) = extra_line {
                                                         plot_ui.line(
                                                             Line::new(extra_points.clone())
                                                                 .name(name.clone())
                                                                 .color(egui::Color32::RED)
-                                                                .style(egui_plot::LineStyle::Dashed { length: 5.0 }),
+                                                                .style(
+                                                                    egui_plot::LineStyle::Dashed {
+                                                                        length: 5.0,
+                                                                    },
+                                                                ),
                                                         );
                                                     }
-                                                });
+                                                },
+                                            );
 
                                             if index % 2 == 1 {
                                                 grid_ui.end_row();
@@ -386,23 +435,30 @@ fn update_ui(
                                                 p.ingress_drops
                                                     .max(p.edf_heap_drops)
                                                     .max(p.edf_output_drops)
-                                                    .max(p.total_drops) as f64
+                                                    .max(p.total_drops)
+                                                    as f64
                                             })
                                             .fold(0.0, f64::max)
                                             .max(1.0); // At least 1 for visibility
 
-                                        let time_range = if let Some(last) = flow_stats.points.back() {
-                                            last.time.max(1.0)
-                                        } else {
-                                            1.0
-                                        };
+                                        let time_range =
+                                            if let Some(last) = flow_stats.points.back() {
+                                                last.time.max(1.0)
+                                            } else {
+                                                1.0
+                                            };
 
                                         Plot::new(format!("flow_{}_drops_plot", flow_id))
                                             .width(ui.available_width())
                                             .height(300.0)
-                                            .x_axis_formatter(|val, _range, _| format!("{:.1}s", val))
+                                            .x_axis_formatter(|val, _range, _| {
+                                                format!("{:.1}s", val)
+                                            })
                                             .label_formatter(|name, point| {
-                                                format!("{}\n{:.1}s, {:.0} drops", name, point.x, point.y)
+                                                format!(
+                                                    "{}\n{:.1}s, {:.0} drops",
+                                                    name, point.x, point.y
+                                                )
                                             })
                                             .include_x(0.0)
                                             .include_x(time_range)
@@ -417,7 +473,9 @@ fn update_ui(
                                                 plot_ui.line(
                                                     Line::new(edf_heap_points)
                                                         .name("EDF Heap Drops")
-                                                        .color(egui::Color32::from_rgb(255, 165, 0)),
+                                                        .color(egui::Color32::from_rgb(
+                                                            255, 165, 0,
+                                                        )),
                                                 );
                                                 plot_ui.line(
                                                     Line::new(edf_output_points)
@@ -447,7 +505,6 @@ fn update_ui(
                     std::process::exit(0);
                 }
             });
-
     });
 
     // Request repaint less frequently to reduce flickering (200ms instead of 100ms)
@@ -668,7 +725,6 @@ fn update_ui_client(
 
                 ui.separator();
 
-
                 // Real-time statistics plots
                 ui.heading("Real-Time Statistics Plots");
 
@@ -687,13 +743,14 @@ fn update_ui_client(
                                 // Helper function to safely convert to log scale
                                 let to_log_y = |y: f64| y.max(0.0001).log10();
 
-                                let build_points = |f: &dyn Fn(&StatisticsPoint) -> f64| -> PlotPoints {
-                                    flow_stats
-                                        .points
-                                        .iter()
-                                        .map(|p| [p.time, to_log_y(f(p))])
-                                        .collect()
-                                };
+                                let build_points =
+                                    |f: &dyn Fn(&StatisticsPoint) -> f64| -> PlotPoints {
+                                        flow_stats
+                                            .points
+                                            .iter()
+                                            .map(|p| [p.time, to_log_y(f(p))])
+                                            .collect()
+                                    };
 
                                 let avg_points = build_points(&|p| p.avg);
                                 let min_points = build_points(&|p| p.min);
@@ -704,7 +761,8 @@ fn update_ui_client(
                                 let p100_points = build_points(&|p| p.p100);
                                 let std_dev_points = build_points(&|p| p.std_dev);
 
-                                let expected_max_ms = metrics.expected_max_latency.as_secs_f64() * 1000.0;
+                                let expected_max_ms =
+                                    metrics.expected_max_latency.as_secs_f64() * 1000.0;
                                 let time_range = flow_stats
                                     .points
                                     .back()
@@ -741,17 +799,36 @@ fn update_ui_client(
                                         };
                                         format!("{}\n{:.1}s, {}", name, point.x, y_str)
                                     })
-                                    .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
+                                    .legend(
+                                        egui_plot::Legend::default()
+                                            .position(egui_plot::Corner::RightTop),
+                                    )
                                     .show(ui, |plot_ui| {
-                                        plot_ui.line(Line::new(avg_points).name("Avg").color(egui::Color32::BLUE));
-                                        plot_ui.line(Line::new(min_points).name("Min").color(egui::Color32::GREEN));
-                                        plot_ui.line(Line::new(max_points).name("Max").color(egui::Color32::RED));
+                                        plot_ui.line(
+                                            Line::new(avg_points)
+                                                .name("Avg")
+                                                .color(egui::Color32::BLUE),
+                                        );
+                                        plot_ui.line(
+                                            Line::new(min_points)
+                                                .name("Min")
+                                                .color(egui::Color32::GREEN),
+                                        );
+                                        plot_ui.line(
+                                            Line::new(max_points)
+                                                .name("Max")
+                                                .color(egui::Color32::RED),
+                                        );
                                         plot_ui.line(
                                             Line::new(p50_points)
                                                 .name("P50")
                                                 .color(egui::Color32::from_rgb(0, 255, 255)),
                                         );
-                                        plot_ui.line(Line::new(p95_points).name("P95").color(egui::Color32::YELLOW));
+                                        plot_ui.line(
+                                            Line::new(p95_points)
+                                                .name("P95")
+                                                .color(egui::Color32::YELLOW),
+                                        );
                                         plot_ui.line(
                                             Line::new(p99_points)
                                                 .name("P99")
@@ -771,7 +848,9 @@ fn update_ui_client(
                                             Line::new(expected_line)
                                                 .name("Expected Max")
                                                 .color(egui::Color32::RED)
-                                                .style(egui_plot::LineStyle::Dashed { length: 5.0 }),
+                                                .style(egui_plot::LineStyle::Dashed {
+                                                    length: 5.0,
+                                                }),
                                         );
                                     });
                             });
@@ -823,23 +902,30 @@ fn update_ui_client(
                                                 p.ingress_drops
                                                     .max(p.edf_heap_drops)
                                                     .max(p.edf_output_drops)
-                                                    .max(p.total_drops) as f64
+                                                    .max(p.total_drops)
+                                                    as f64
                                             })
                                             .fold(0.0, f64::max)
                                             .max(1.0);
 
-                                        let time_range = if let Some(last) = flow_stats.points.back() {
-                                            last.time.max(1.0)
-                                        } else {
-                                            1.0
-                                        };
+                                        let time_range =
+                                            if let Some(last) = flow_stats.points.back() {
+                                                last.time.max(1.0)
+                                            } else {
+                                                1.0
+                                            };
 
                                         Plot::new(format!("flow_{}_drops_plot_client", flow_id))
                                             .width(ui.available_width())
                                             .height(300.0)
-                                            .x_axis_formatter(|val, _range, _| format!("{:.1}s", val))
+                                            .x_axis_formatter(|val, _range, _| {
+                                                format!("{:.1}s", val)
+                                            })
                                             .label_formatter(|name, point| {
-                                                format!("{}\n{:.1}s, {:.0} drops", name, point.x, point.y)
+                                                format!(
+                                                    "{}\n{:.1}s, {:.0} drops",
+                                                    name, point.x, point.y
+                                                )
                                             })
                                             .include_x(0.0)
                                             .include_x(time_range)
@@ -854,7 +940,9 @@ fn update_ui_client(
                                                 plot_ui.line(
                                                     Line::new(edf_heap_points)
                                                         .name("EDF Heap Drops")
-                                                        .color(egui::Color32::from_rgb(255, 165, 0)),
+                                                        .color(egui::Color32::from_rgb(
+                                                            255, 165, 0,
+                                                        )),
                                                 );
                                                 plot_ui.line(
                                                     Line::new(edf_output_points)

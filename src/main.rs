@@ -8,7 +8,7 @@ mod metrics;
 mod pipeline;
 mod queue;
 
-use pipeline::Pipeline;
+use pipeline::{Pipeline, PipelineConfig};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
 
     // Initialize pipeline
-    let pipeline = Arc::new(rt.block_on(Pipeline::new())?);
+    let pipeline = Arc::new(rt.block_on(Pipeline::new(PipelineConfig::default()))?);
 
     // Start metrics server on port 9999
     let pipeline_for_metrics = pipeline.clone();

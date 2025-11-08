@@ -1,12 +1,11 @@
 use crossbeam_channel::{unbounded, Receiver};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 
-use crate::drr_scheduler::Priority;
+use crate::drr_scheduler::{Packet, Priority, PriorityTable};
 use crate::edf_scheduler::EDFScheduler;
 use crate::egress_drr::EgressDRRScheduler;
 use crate::ingress_drr::IngressDRRScheduler;
@@ -21,13 +20,100 @@ pub struct SocketConfig {
     pub priority: Priority,
 }
 
+#[derive(Debug, Clone)]
+pub struct CoreAssignment {
+    pub ingress: usize,
+    pub edf: usize,
+    pub egress: usize,
+}
+
+impl Default for CoreAssignment {
+    fn default() -> Self {
+        Self {
+            ingress: 0,
+            edf: 1,
+            egress: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QueueConfig {
+    pub ingress_to_edf: PriorityTable<usize>,
+    pub edf_to_egress: PriorityTable<usize>,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            ingress_to_edf: PriorityTable::from_fn(|priority| match priority {
+                Priority::High => 2,
+                Priority::Medium | Priority::Low | Priority::BestEffort => 1,
+            }),
+            edf_to_egress: PriorityTable::from_fn(|priority| match priority {
+                Priority::High => 2,
+                Priority::Medium | Priority::Low | Priority::BestEffort => 1,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IngressSchedulerConfig {
+    pub quantums: PriorityTable<usize>,
+}
+
+impl Default for IngressSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            quantums: PriorityTable::from_fn(|priority| match priority {
+                Priority::High => 16,
+                Priority::Medium => 4,
+                Priority::Low | Priority::BestEffort => 1,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EdfSchedulerConfig {
+    pub max_heap_size: usize,
+}
+
+impl Default for EdfSchedulerConfig {
+    fn default() -> Self {
+        Self { max_heap_size: 1 }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    pub cores: CoreAssignment,
+    pub queues: QueueConfig,
+    pub ingress: IngressSchedulerConfig,
+    pub edf: EdfSchedulerConfig,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            cores: CoreAssignment::default(),
+            queues: QueueConfig::default(),
+            ingress: IngressSchedulerConfig::default(),
+            edf: EdfSchedulerConfig::default(),
+        }
+    }
+}
+
 // Make Pipeline accessible for testing
 #[cfg(test)]
 impl Pipeline {
+    #[allow(dead_code)]
     pub fn get_input_sockets(&self) -> &[SocketConfig] {
         &self.input_sockets
     }
 
+    #[allow(dead_code)]
     pub fn get_output_sockets(&self) -> &[SocketConfig] {
         &self.output_sockets
     }
@@ -45,98 +131,70 @@ pub struct Pipeline {
     // Store scheduler references for drop count collection
     ingress_drr_for_drops: Arc<IngressDRRScheduler>,
     edf_for_drops: Arc<EDFScheduler>,
+    config: PipelineConfig,
 }
 
 impl Pipeline {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // Set CPU affinity to 3 cores
+    pub async fn new(config: PipelineConfig) -> Result<Self, Box<dyn std::error::Error>> {
         set_cpu_affinity()?;
 
-        // Define multiple input sockets with different latency budgets
         let input_sockets = vec![
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 8080,
-                latency_budget: Duration::from_millis(5),
-                priority: Priority::HIGH,
+                latency_budget: Duration::from_millis(1),
+                priority: Priority::High,
             },
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 8081,
-                latency_budget: Duration::from_millis(50),
-                priority: Priority::MEDIUM,
+                latency_budget: Duration::from_millis(10),
+                priority: Priority::Medium,
             },
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 8082,
                 latency_budget: Duration::from_millis(100),
-                priority: Priority::LOW,
+                priority: Priority::Low,
             },
         ];
 
-        // Define multiple output sockets with matching latency budgets
         let output_sockets = vec![
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 9080,
-                latency_budget: Duration::from_millis(5),
-                priority: Priority::HIGH,
+                latency_budget: Duration::from_millis(1),
+                priority: Priority::High,
             },
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 9081,
-                latency_budget: Duration::from_millis(50),
-                priority: Priority::MEDIUM,
+                latency_budget: Duration::from_millis(10),
+                priority: Priority::Medium,
             },
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 9082,
                 latency_budget: Duration::from_millis(100),
-                priority: Priority::LOW,
+                priority: Priority::Low,
             },
         ];
 
-        // Create priority queues for EDF input (from IngressDRRScheduler)
-        let (high_priority_input_tx, high_priority_input_rx) = crossbeam_channel::bounded(128);
-        let (medium_priority_input_tx, medium_priority_input_rx) = crossbeam_channel::bounded(128);
-        let (low_priority_input_tx, low_priority_input_rx) = crossbeam_channel::bounded(128);
+        let (ingress_input_txs, ingress_input_rxs) =
+            build_priority_channels(&config.queues.ingress_to_edf);
+        let (edf_output_txs, edf_output_rxs) =
+            build_priority_channels(&config.queues.edf_to_egress);
 
-        // Create priority queues for EDF output (to EgressDRRScheduler)
-        let (high_priority_output_tx, high_priority_output_rx) = crossbeam_channel::bounded(128);
-        let (medium_priority_output_tx, medium_priority_output_rx) =
-            crossbeam_channel::bounded(128);
-        let (low_priority_output_tx, low_priority_output_rx) = crossbeam_channel::bounded(128);
-
-        // Create IngressDRRScheduler (reads from UDP sockets, routes to priority queues)
-        let ingress_drr = Arc::new(IngressDRRScheduler::new(
-            high_priority_input_tx,
-            medium_priority_input_tx,
-            low_priority_input_tx,
-        ));
-
-        // Create EDF scheduler (input from 3 priority queues, output to 3 priority queues)
+        let ingress_drr = Arc::new(IngressDRRScheduler::new(ingress_input_txs.clone()));
         let edf = Arc::new(EDFScheduler::new(
-            Arc::new(high_priority_input_rx),
-            Arc::new(medium_priority_input_rx),
-            Arc::new(low_priority_input_rx),
-            high_priority_output_tx,
-            medium_priority_output_tx,
-            low_priority_output_tx,
+            PriorityTable::from_fn(|priority| Arc::new(ingress_input_rxs[priority].clone())),
+            edf_output_txs.clone(),
+            config.edf.max_heap_size,
         ));
+        let egress_drr = Arc::new(EgressDRRScheduler::new(edf_output_rxs.clone()));
 
-        // Create EgressDRRScheduler (reads from priority queues, writes to UDP sockets)
-        let egress_drr = Arc::new(EgressDRRScheduler::new(
-            high_priority_output_rx,
-            medium_priority_output_rx,
-            low_priority_output_rx,
-        ));
-
-        // Create metrics collector
         let (metrics_tx, metrics_rx) = unbounded();
-        let metrics_collector = Arc::new(MetricsCollector::new(
-            metrics_tx, None, // No queue references for now
-            None,
-        ));
+        let metrics_collector = Arc::new(MetricsCollector::new(metrics_tx, None, None));
 
         Ok(Self {
             ingress_drr: ingress_drr.clone(),
@@ -149,9 +207,9 @@ impl Pipeline {
             output_sockets,
             ingress_drr_for_drops: ingress_drr,
             edf_for_drops: edf,
+            config,
         })
     }
-
 
     /// Start a TCP server that broadcasts metrics to connected clients
     /// This allows the GUI to connect as a separate process
@@ -242,23 +300,11 @@ impl Pipeline {
             std_socket.set_nonblocking(true)?;
             let socket = Arc::new(std_socket);
 
-            // Determine quantum based on priority
-            // Balanced quantums: HIGH gets more bandwidth but not overwhelming
-            let quantum = match config.priority {
-                Priority::HIGH => 32768,   // High quantum for HIGH priority (was 65536, too high)
-                Priority::MEDIUM => 4096,   // Medium quantum for MEDIUM priority
-                Priority::LOW => 1024,      // Lower quantum for LOW priority
-            };
-
-            // Derive flow_id from priority for backward compatibility with IngressDRRScheduler
-            let flow_id = match config.priority {
-                Priority::HIGH => 1,
-                Priority::MEDIUM => 2,
-                Priority::LOW => 3,
-            };
+            let priority = config.priority;
+            let quantum = self.config.ingress.quantums[priority];
 
             self.ingress_drr
-                .add_socket(socket, flow_id, config.latency_budget, quantum);
+                .add_socket(socket, priority, config.latency_budget, quantum);
         }
 
         // Create output sockets and add to EgressDRRScheduler
@@ -266,37 +312,41 @@ impl Pipeline {
             let addr = format!("{}:{}", config.address, config.port);
             let socket_addr = addr.parse::<SocketAddr>()?;
             let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-            
-            // Derive flow_id from priority for backward compatibility with EgressDRRScheduler
-            let flow_id = match config.priority {
-                Priority::HIGH => 1,
-                Priority::MEDIUM => 2,
-                Priority::LOW => 3,
-            };
-            
+
             self.egress_drr
-                .add_output_socket(flow_id, socket, socket_addr);
+                .add_output_socket(config.priority, socket, socket_addr);
         }
 
         // Start IngressDRRScheduler (reads from UDP sockets, routes to priority queues)
         let ingress_drr_clone = self.ingress_drr.clone();
         let running_ingress = self.running.clone();
-        tokio::spawn(async move {
-            let _ = ingress_drr_clone.process_sockets(running_ingress).await;
-        });
+        let ingress_core = self.config.cores.ingress;
+        std::thread::Builder::new()
+            .name("Ingress-DRR".to_string())
+            .spawn(move || {
+                set_thread_priority(2);
+                set_thread_core(ingress_core);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let _ = ingress_drr_clone.process_sockets(running_ingress).await;
+                });
+            })?;
 
         // EDF processing thread with high priority
         let edf_clone = self.edf.clone();
         let running_edf = self.running.clone();
+        let edf_core = self.config.cores.edf;
 
         std::thread::Builder::new()
             .name("EDF-Processor".to_string())
             .spawn(move || {
-                set_thread_priority(2); // Higher priority for EDF
+                set_thread_priority(2);
+                set_thread_core(edf_core);
                 while running_edf.load(Ordering::Relaxed) {
-                    // EDF processes packets and routes to output priority queues
                     let _ = edf_clone.process_next();
-                    // No packets available - use spin loop for minimal latency
                     std::hint::spin_loop();
                 }
             })?;
@@ -305,38 +355,43 @@ impl Pipeline {
         let egress_drr_clone = self.egress_drr.clone();
         let metrics_clone = self.metrics_collector.clone();
         let running_egress = self.running.clone();
-        tokio::spawn(async move {
-            let _ = egress_drr_clone
-                .process_queues(running_egress, metrics_clone)
-                .await;
-        });
+        let egress_core = self.config.cores.egress;
+        std::thread::Builder::new()
+            .name("Egress-DRR".to_string())
+            .spawn(move || {
+                set_thread_priority(1);
+                set_thread_core(egress_core);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let _ = egress_drr_clone
+                        .process_queues(running_egress, metrics_clone)
+                        .await;
+                });
+            })?;
 
         // Spawn a thread to periodically send metrics updates (even when no packets are processed)
         // This ensures the GUI always has current data
         // Use lower priority thread for statistics to not interfere with packet processing
         let metrics_collector_periodic = self.metrics_collector.clone();
         let running_periodic = self.running.clone();
-        // Map priority to expected latency, but convert to flow_id for metrics (backward compatibility)
-        let flow_id_to_expected_latency: HashMap<u64, Duration> = self
-            .output_sockets
-            .iter()
-            .map(|config| {
-                let flow_id = match config.priority {
-                    Priority::HIGH => 1,
-                    Priority::MEDIUM => 2,
-                    Priority::LOW => 3,
-                };
-                (flow_id, config.latency_budget)
-            })
-            .collect();
-        let flow_id_to_expected_latency_arc = Arc::new(flow_id_to_expected_latency);
-        let flow_map_clone = flow_id_to_expected_latency_arc.clone();
+        // Map priority to expected latency for metrics reporting
+        let mut expected_latencies = PriorityTable::from_fn(|_| Duration::from_millis(200));
+        for socket in &self.output_sockets {
+            expected_latencies[socket.priority] = socket.latency_budget;
+        }
+        let expected_latencies_arc = Arc::new(expected_latencies);
+        let expected_clone = expected_latencies_arc.clone();
         let ingress_drr_for_drops = self.ingress_drr_for_drops.clone();
         let edf_for_drops = self.edf_for_drops.clone();
+        let stats_core = self.config.cores.egress;
         std::thread::Builder::new()
             .name("Statistics-Thread".to_string())
             .spawn(move || {
                 set_thread_priority(1); // Lower priority for statistics (EDF is 2)
+                set_thread_core(stats_core);
                 let mut interval = std::time::Instant::now();
                 loop {
                     // Check shutdown flag first
@@ -347,14 +402,14 @@ impl Pipeline {
                     // Use spin loop with periodic check instead of sleep
                     // This allows more responsive shutdown while still batching updates
                     if interval.elapsed() >= Duration::from_millis(100) {
-                        let map: HashMap<u64, Duration> =
-                            flow_map_clone.iter().map(|(k, v)| (*k, *v)).collect();
-                        
                         // Collect drop counts from schedulers
                         let ingress_drops = ingress_drr_for_drops.get_drop_counts();
                         let edf_drops = edf_for_drops.get_drop_counts();
-                        
-                        metrics_collector_periodic.send_current_metrics(&map, Some(ingress_drops), Some(edf_drops));
+                        metrics_collector_periodic.send_current_metrics(
+                            expected_clone.as_ref(),
+                            Some(ingress_drops.clone()),
+                            Some((edf_drops.heap, edf_drops.output.clone())),
+                        );
                         interval = std::time::Instant::now();
                     } else {
                         std::hint::spin_loop();
@@ -454,4 +509,39 @@ fn set_thread_priority(priority: i32) {
         // Thread priority setting not implemented for this platform
         let _ = priority;
     }
+}
+
+fn set_thread_core(core_id: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use libc::{cpu_set_t, pthread_self, pthread_setaffinity_np, CPU_SET, CPU_ZERO};
+        let mut set: cpu_set_t = std::mem::zeroed();
+        CPU_ZERO(&mut set);
+        CPU_SET(core_id, &mut set);
+        let _ = pthread_setaffinity_np(pthread_self(), std::mem::size_of::<cpu_set_t>(), &set);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = core_id;
+    }
+}
+
+fn build_priority_channels(
+    capacities: &PriorityTable<usize>,
+) -> (
+    PriorityTable<crossbeam_channel::Sender<Packet>>,
+    PriorityTable<crossbeam_channel::Receiver<Packet>>,
+) {
+    let mut senders = Vec::new();
+    let mut receivers = Vec::new();
+    for priority in Priority::ALL {
+        let capacity = capacities[priority];
+        let (tx, rx) = crossbeam_channel::bounded(capacity);
+        senders.push(tx);
+        receivers.push(rx);
+    }
+    (
+        PriorityTable::from_vec(senders),
+        PriorityTable::from_vec(receivers),
+    )
 }

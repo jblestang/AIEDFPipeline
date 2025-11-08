@@ -97,13 +97,13 @@ tasks.push(task);
 **Location**: `src/edf_scheduler.rs:205, 208, 211`
 ```rust
 match packet.priority {
-    Priority::HIGH => {
+    Priority::High => {
         let _ = self.high_priority_output_tx.try_send(packet);  // DROPS IF FULL
     }
-    Priority::MEDIUM => {
+    Priority::Medium => {
         let _ = self.medium_priority_output_tx.try_send(packet);  // DROPS IF FULL
     }
-    Priority::LOW => {
+    Priority::Low => {
         let _ = self.low_priority_output_tx.try_send(packet);  // DROPS IF FULL
     }
 }

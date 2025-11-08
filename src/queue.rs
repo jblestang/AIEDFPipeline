@@ -11,7 +11,7 @@ pub struct Queue {
 #[allow(dead_code)] // Old Queue struct, kept for reference but not used in new architecture
 impl Queue {
     pub fn new() -> Self {
-        let capacity = 128;
+        let capacity = 1;
         let (tx, rx) = bounded(capacity);
         Self {
             sender: tx,
@@ -80,7 +80,7 @@ impl Default for Queue {
 mod tests {
     use super::*;
     use crate::drr_scheduler::Packet;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn test_queue_creation() {
@@ -92,19 +92,17 @@ mod tests {
     fn test_queue_send_recv() {
         let queue = Queue::new();
 
-        let packet = Packet {
-            flow_id: 1,
-            data: vec![1, 2, 3],
-            timestamp: Instant::now(),
-            latency_budget: Duration::from_millis(1),
-            priority: crate::drr_scheduler::Priority::from_flow_id(1),
-        };
+        let packet = Packet::new(
+            crate::drr_scheduler::Priority::High,
+            vec![1, 2, 3],
+            Duration::from_millis(1),
+        );
 
         queue.send(packet.clone()).unwrap();
         assert!(!queue.is_empty());
 
         let received = queue.recv().unwrap();
-        assert_eq!(received.flow_id, packet.flow_id);
+        assert_eq!(received.priority, packet.priority);
         assert_eq!(received.data, packet.data);
     }
 }

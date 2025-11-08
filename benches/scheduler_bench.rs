@@ -16,12 +16,11 @@ fn bench_drr_scheduler(c: &mut Criterion) {
         let scheduler = Arc::new(DRRScheduler::new(tx));
         scheduler.add_flow(1, 1024, Duration::from_millis(1));
 
-        let packet = Packet {
-            flow_id: 1,
-            data: vec![0u8; 100],
-            timestamp: Instant::now(),
-            latency_budget: Duration::from_millis(1),
-        };
+        let packet = Packet::new(
+            aiedf_pipeline::drr_scheduler::Priority::High,
+            vec![0u8; 100],
+            Duration::from_millis(1),
+        );
 
         b.iter(|| {
             scheduler
@@ -48,12 +47,11 @@ fn bench_edf_scheduler(c: &mut Criterion) {
         let (tx2, _rx2) = unbounded();
         let scheduler = Arc::new(EDFScheduler::new(Arc::new(Mutex::new(rx1)), tx2));
 
-        let packet = Packet {
-            flow_id: 1,
-            data: vec![0u8; 100],
-            timestamp: Instant::now(),
-            latency_budget: Duration::from_millis(1),
-        };
+        let packet = Packet::new(
+            aiedf_pipeline::drr_scheduler::Priority::High,
+            vec![0u8; 100],
+            Duration::from_millis(1),
+        );
 
         b.iter(|| {
             scheduler.enqueue_packet(black_box(packet.clone())).unwrap();
@@ -67,12 +65,16 @@ fn bench_edf_scheduler(c: &mut Criterion) {
 
         // Pre-populate with packets
         for i in 0..100 {
-            let packet = Packet {
-                flow_id: i % 3 + 1,
-                data: vec![0u8; 100],
-                timestamp: Instant::now(),
-                latency_budget: Duration::from_millis(i as u64 % 100 + 1),
+            let priority = match i % 3 {
+                0 => aiedf_pipeline::drr_scheduler::Priority::High,
+                1 => aiedf_pipeline::drr_scheduler::Priority::Medium,
+                _ => aiedf_pipeline::drr_scheduler::Priority::Low,
             };
+            let packet = Packet::new(
+                priority,
+                vec![0u8; 100],
+                Duration::from_millis(i as u64 % 100 + 1),
+            );
             scheduler.enqueue_packet(packet).unwrap();
         }
 
@@ -88,12 +90,11 @@ fn bench_queue(c: &mut Criterion) {
     group.bench_function("send_recv", |b| {
         let queue = Arc::new(Queue::new());
 
-        let packet = Packet {
-            flow_id: 1,
-            data: vec![0u8; 100],
-            timestamp: Instant::now(),
-            latency_budget: Duration::from_millis(1),
-        };
+        let packet = Packet::new(
+            aiedf_pipeline::drr_scheduler::Priority::High,
+            vec![0u8; 100],
+            Duration::from_millis(1),
+        );
 
         b.iter(|| {
             queue.send(black_box(packet.clone())).unwrap();

@@ -179,7 +179,7 @@ The GUI window shows:
 
 ## Advanced: Custom Socket Configuration
 
-To change socket configurations, edit `src/pipeline.rs` in the `Pipeline::new()` method:
+To change socket configurations, edit `src/pipeline.rs` in the `Pipeline::new(PipelineConfig)` method:
 
 ```rust
 let input_sockets = vec![

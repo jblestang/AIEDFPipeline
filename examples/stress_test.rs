@@ -20,21 +20,33 @@ impl StressTest {
         }
     }
 
-    fn send_packets(&self, flow_id: u64, port: u16, count: usize, delay_ms: u64) {
+    fn send_packets(&self, flow_id: u64, port: u16, count: usize, interval: Duration) {
         let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind sender socket");
         let packets_sent = self.packets_sent.clone();
 
         thread::spawn(move || {
+            let mut rng_state = (flow_id << 32)
+                ^ (count as u64)
+                ^ (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64);
             for i in 0..count {
-                let message = format!("Flow{}_Packet{}", flow_id, i);
-                if let Err(e) = socket.send_to(message.as_bytes(), format!("127.0.0.1:{}", port)) {
+                rng_state ^= rng_state << 7;
+                rng_state ^= rng_state >> 9;
+                let random = rng_state.wrapping_add(i as u64);
+                let size = 64 + (random as usize % 1337); // 64..1400 bytes
+                let payload_byte = b'A' + ((i as usize + flow_id as usize) % 26) as u8;
+                let payload = vec![payload_byte; size];
+
+                if let Err(e) = socket.send_to(&payload, format!("127.0.0.1:{}", port)) {
                     eprintln!("Error sending packet {} to flow {}: {}", i, flow_id, e);
                 } else {
                     packets_sent.fetch_add(1, Ordering::Relaxed);
                 }
 
                 // Small delay between packets
-                thread::sleep(Duration::from_millis(delay_ms));
+                thread::sleep(interval);
             }
         });
     }
@@ -211,7 +223,7 @@ fn main() {
     std::io::stdin().read_line(&mut input).unwrap();
 
     let test = StressTest::new();
-    let test_duration = Duration::from_secs(240); // Longer test duration
+    let test_duration = Duration::from_secs(60); // Longer test duration
 
     println!("\nStarting stress test...");
     println!(
@@ -219,20 +231,21 @@ fn main() {
         test_duration.as_secs()
     );
 
-    let factor = 5;
+    let factor  = 20;
 
-    // Configuration - different data rates per flow (DOUBLED)
-    // Flow 1 (1ms deadline): Low latency = Low data rate (fewer packets)
-    // Flow 2 (50ms deadline): Medium latency = Medium data rate
-    // Flow 3 (100ms deadline): High latency = High data rate (more packets)
-    let packets_flow1 = 20 * factor * test_duration.as_secs(); // Low data rate for low latency flow (doubled)
-    let packets_flow2 = 100 * factor * test_duration.as_secs(); // Medium data rate (doubled)
-    let packets_flow3 = 200 * factor * test_duration.as_secs(); // High data rate for high latency flow (doubled)
+    let rate_flow1 = 128u64 * factor; // packets per second
+    let rate_flow2 = 256u64 * factor;
+    let rate_flow3 = 512u64 * factor;
 
-    // Different send rates to simulate different data rates (doubled = halved delays)
-    let send_delay_flow1 = test_duration.as_secs() * 1000 / packets_flow1  ; // Send every 50ms (20 packets/sec, doubled from 10)
-    let send_delay_flow2 = test_duration.as_secs() * 1000 / packets_flow2 ; // Send every 10ms (100 packets/sec, doubled from 50)
-    let send_delay_flow3 = test_duration.as_secs() * 1000 / packets_flow3 ; // Send every 5ms (200 packets/sec, doubled from 100)
+    let packets_flow1 = rate_flow1 * test_duration.as_secs();
+    let packets_flow2 = rate_flow2 * test_duration.as_secs();
+    let packets_flow3 = rate_flow3 * test_duration.as_secs();
+
+    let interval_flow1 = Duration::from_micros((1_000_000.0 / rate_flow1 as f64) as u64);
+    let interval_flow2 = Duration::from_micros((1_000_000.0 / rate_flow2 as f64) as u64);
+    let interval_flow3 = Duration::from_micros((1_000_000.0 / rate_flow3 as f64) as u64);
+
+    println!("rate_flow1: {}, rate_flow2: {}, rate_flow3: {}", rate_flow1, rate_flow2, rate_flow3);
 
     // Start receiving threads for each flow
     let receiver_handles: Vec<_> = vec![(1, 9080), (2, 9081), (3, 9082)]
@@ -256,25 +269,31 @@ fn main() {
 
     println!("Sending packets with different data rates:");
     println!(
-        "  Flow 1 (1ms deadline): {} packets at {} ms intervals (low data rate)",
-        packets_flow1, send_delay_flow1
+        "  Flow 1 (1ms deadline): {} packets at {:.2} ms intervals ({} pps)",
+        packets_flow1,
+        interval_flow1.as_secs_f64() * 1000.0,
+        rate_flow1
     );
     println!(
-        "  Flow 2 (50ms deadline): {} packets at {} ms intervals (medium data rate)",
-        packets_flow2, send_delay_flow2
+        "  Flow 2 (50ms deadline): {} packets at {:.2} ms intervals ({} pps)",
+        packets_flow2,
+        interval_flow2.as_secs_f64() * 1000.0,
+        rate_flow2
     );
     println!(
-        "  Flow 3 (100ms deadline): {} packets at {} ms intervals (high data rate)",
-        packets_flow3, send_delay_flow3
+        "  Flow 3 (100ms deadline): {} packets at {:.2} ms intervals ({} pps)",
+        packets_flow3,
+        interval_flow3.as_secs_f64() * 1000.0,
+        rate_flow3
     );
     println!();
 
     // Start sending threads for each flow with different rates
-    test.send_packets(1, 8080, packets_flow1 as usize, send_delay_flow1);
+    test.send_packets(1, 8080, packets_flow1 as usize, interval_flow1);
     thread::sleep(Duration::from_millis(10)); // Small offset
-    test.send_packets(2, 8081, packets_flow2 as usize, send_delay_flow2);
+    test.send_packets(2, 8081, packets_flow2 as usize, interval_flow2);
     thread::sleep(Duration::from_millis(10)); // Small offset
-    test.send_packets(3, 8082, packets_flow3 as usize, send_delay_flow3);
+    test.send_packets(3, 8082, packets_flow3 as usize, interval_flow3);
 
     // Wait for test duration
     thread::sleep(test_duration);
