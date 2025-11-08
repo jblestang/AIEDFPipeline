@@ -476,13 +476,11 @@ impl MetricsCollector {
         priority: Priority,
         latency: Duration,
         deadline_missed: bool,
-        expected_max_latency: Duration,
     ) {
         let _ = self.events_tx.send(MetricsEvent {
             priority,
             latency,
             deadline_missed,
-            expected_max_latency,
         });
     }
 
@@ -688,7 +686,6 @@ mod tests {
             Priority::High,
             Duration::from_millis(10),
             false,
-            Duration::from_millis(100),
         );
 
         // Wait for background thread to process the event (metrics are now processed asynchronously)

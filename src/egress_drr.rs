@@ -74,7 +74,6 @@ impl EgressDRRScheduler {
                         priority,
                         latency,
                         deadline_missed,
-                        packet.latency_budget,
                     );
 
                     if let Some((socket, target_addr)) = socket_map.get(&priority) {
