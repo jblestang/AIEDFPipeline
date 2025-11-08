@@ -2,7 +2,7 @@ use crate::metrics::MetricsSnapshot;
 use crossbeam_channel::Receiver;
 use eframe::egui;
 use egui::scroll_area::ScrollBarVisibility;
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{Corner, Legend, Line, LineStyle, Plot, PlotPoints};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -328,17 +328,15 @@ fn update_ui(
                                             .height(220.0)
                                             .x_axis_label("Time (seconds)")
                                             .y_axis_label("Latency (ms) - Log Scale")
-                                            .y_axis_formatter(|val, _range, _| {
-                                                let linear_val = 10f64.powf(val);
+                                            .y_axis_formatter(|mark, _range| {
+                                                let linear_val = 10f64.powf(mark.value);
                                                 if linear_val < 1.0 {
                                                     format!("{:.3}", linear_val)
                                                 } else {
                                                     format!("{:.2}", linear_val)
                                                 }
                                             })
-                                            .x_axis_formatter(|val, _range, _| {
-                                                format!("{:.1}s", val)
-                                            })
+                                            .x_axis_formatter(|mark, _range| format!("{:.1}s", mark.value))
                                             .label_formatter(|name, point| {
                                                 let linear_y = 10f64.powf(point.y);
                                                 let y_str = if linear_y < 1.0 {
@@ -353,24 +351,22 @@ fn update_ui(
                                             .include_y(y_min_log)
                                             .include_y(y_max_log)
                                             .legend(
-                                                egui_plot::Legend::default()
-                                                    .position(egui_plot::Corner::RightTop),
+                                                Legend::default()
+                                                    .position(Corner::RightTop),
                                             )
                                             .show(
                                                 grid_ui,
                                                 |plot_ui| {
-                                                    plot_ui.line(
-                                                        Line::new(data.clone())
-                                                            .name(*title)
-                                                            .color(*color),
-                                                    );
+                                                        plot_ui.line(
+                                                            Line::new(*title, data.clone())
+                                                                .color(*color),
+                                                        );
                                                     if let Some((name, extra_points)) = extra_line {
                                                         plot_ui.line(
-                                                            Line::new(extra_points.clone())
-                                                                .name(name.clone())
+                                                            Line::new(name.clone(), extra_points.clone())
                                                                 .color(egui::Color32::RED)
                                                                 .style(
-                                                                    egui_plot::LineStyle::Dashed {
+                                                                    LineStyle::Dashed {
                                                                         length: 5.0,
                                                                     },
                                                                 ),
@@ -451,8 +447,8 @@ fn update_ui(
                                         Plot::new(format!("flow_{}_drops_plot", flow_id))
                                             .width(ui.available_width())
                                             .height(300.0)
-                                            .x_axis_formatter(|val, _range, _| {
-                                                format!("{:.1}s", val)
+                                            .x_axis_formatter(|mark, _range| {
+                                                format!("{:.1}s", mark.value)
                                             })
                                             .label_formatter(|name, point| {
                                                 format!(
@@ -466,25 +462,24 @@ fn update_ui(
                                             .include_y(y_max)
                                             .show(ui, |plot_ui| {
                                                 plot_ui.line(
-                                                    Line::new(ingress_points)
-                                                        .name("Ingress Drops")
+                                                    Line::new("Ingress Drops", ingress_points)
                                                         .color(egui::Color32::RED),
                                                 );
                                                 plot_ui.line(
-                                                    Line::new(edf_heap_points)
-                                                        .name("EDF Heap Drops")
+                                                    Line::new("EDF Heap Drops", edf_heap_points)
                                                         .color(egui::Color32::from_rgb(
                                                             255, 165, 0,
                                                         )),
                                                 );
                                                 plot_ui.line(
-                                                    Line::new(edf_output_points)
-                                                        .name("EDF Output Drops")
-                                                        .color(egui::Color32::YELLOW),
+                                                    Line::new(
+                                                        "EDF Output Drops",
+                                                        edf_output_points,
+                                                    )
+                                                    .color(egui::Color32::YELLOW),
                                                 );
                                                 plot_ui.line(
-                                                    Line::new(total_points)
-                                                        .name("Total Drops")
+                                                    Line::new("Total Drops", total_points)
                                                         .color(egui::Color32::BLUE),
                                                 );
                                             });
@@ -781,15 +776,15 @@ fn update_ui_client(
                                     .height(250.0)
                                     .x_axis_label("Time (seconds)")
                                     .y_axis_label("Latency (ms) - Log Scale")
-                                    .y_axis_formatter(|val, _range, _| {
-                                        let linear = 10f64.powf(val);
+                                    .y_axis_formatter(|mark, _range| {
+                                        let linear = 10f64.powf(mark.value);
                                         if linear < 1.0 {
                                             format!("{:.3}", linear)
                                         } else {
                                             format!("{:.2}", linear)
                                         }
                                     })
-                                    .x_axis_formatter(|val, _range, _| format!("{:.1}s", val))
+                                    .x_axis_formatter(|mark, _range| format!("{:.1}s", mark.value))
                                     .label_formatter(|name, point| {
                                         let linear = 10f64.powf(point.y);
                                         let y_str = if linear < 1.0 {
@@ -800,55 +795,46 @@ fn update_ui_client(
                                         format!("{}\n{:.1}s, {}", name, point.x, y_str)
                                     })
                                     .legend(
-                                        egui_plot::Legend::default()
-                                            .position(egui_plot::Corner::RightTop),
+                                        Legend::default()
+                                            .position(Corner::RightTop),
                                     )
                                     .show(ui, |plot_ui| {
                                         plot_ui.line(
-                                            Line::new(avg_points)
-                                                .name("Avg")
+                                            Line::new("Avg", avg_points)
                                                 .color(egui::Color32::BLUE),
                                         );
                                         plot_ui.line(
-                                            Line::new(min_points)
-                                                .name("Min")
+                                            Line::new("Min", min_points)
                                                 .color(egui::Color32::GREEN),
                                         );
                                         plot_ui.line(
-                                            Line::new(max_points)
-                                                .name("Max")
+                                            Line::new("Max", max_points)
                                                 .color(egui::Color32::RED),
                                         );
                                         plot_ui.line(
-                                            Line::new(p50_points)
-                                                .name("P50")
+                                            Line::new("P50", p50_points)
                                                 .color(egui::Color32::from_rgb(0, 255, 255)),
                                         );
                                         plot_ui.line(
-                                            Line::new(p95_points)
-                                                .name("P95")
+                                            Line::new("P95", p95_points)
                                                 .color(egui::Color32::YELLOW),
                                         );
                                         plot_ui.line(
-                                            Line::new(p99_points)
-                                                .name("P99")
+                                            Line::new("P99", p99_points)
                                                 .color(egui::Color32::from_rgb(255, 165, 0)),
                                         );
                                         plot_ui.line(
-                                            Line::new(p100_points)
-                                                .name("P100")
+                                            Line::new("P100", p100_points)
                                                 .color(egui::Color32::from_rgb(255, 0, 255)),
                                         );
                                         plot_ui.line(
-                                            Line::new(std_dev_points)
-                                                .name("StdDev")
+                                            Line::new("StdDev", std_dev_points)
                                                 .color(egui::Color32::from_rgb(128, 0, 128)),
                                         );
                                         plot_ui.line(
-                                            Line::new(expected_line)
-                                                .name("Expected Max")
+                                            Line::new("Expected Max", expected_line)
                                                 .color(egui::Color32::RED)
-                                                .style(egui_plot::LineStyle::Dashed {
+                                                .style(LineStyle::Dashed {
                                                     length: 5.0,
                                                 }),
                                         );
@@ -918,8 +904,8 @@ fn update_ui_client(
                                         Plot::new(format!("flow_{}_drops_plot_client", flow_id))
                                             .width(ui.available_width())
                                             .height(300.0)
-                                            .x_axis_formatter(|val, _range, _| {
-                                                format!("{:.1}s", val)
+                                            .x_axis_formatter(|mark, _range| {
+                                                format!("{:.1}s", mark.value)
                                             })
                                             .label_formatter(|name, point| {
                                                 format!(
@@ -933,25 +919,25 @@ fn update_ui_client(
                                             .include_y(y_max)
                                             .show(ui, |plot_ui| {
                                                 plot_ui.line(
-                                                    Line::new(ingress_points)
-                                                        .name("Ingress Drops")
+                                                    Line::new("Ingress Drops", ingress_points)
                                                         .color(egui::Color32::RED),
                                                 );
                                                 plot_ui.line(
-                                                    Line::new(edf_heap_points)
-                                                        .name("EDF Heap Drops")
-                                                        .color(egui::Color32::from_rgb(
-                                                            255, 165, 0,
-                                                        )),
+                                                    Line::new(
+                                                        "EDF Heap Drops",
+                                                        edf_heap_points,
+                                                    )
+                                                    .color(egui::Color32::from_rgb(255, 165, 0)),
                                                 );
                                                 plot_ui.line(
-                                                    Line::new(edf_output_points)
-                                                        .name("EDF Output Drops")
-                                                        .color(egui::Color32::YELLOW),
+                                                    Line::new(
+                                                        "EDF Output Drops",
+                                                        edf_output_points,
+                                                    )
+                                                    .color(egui::Color32::YELLOW),
                                                 );
                                                 plot_ui.line(
-                                                    Line::new(total_points)
-                                                        .name("Total Drops")
+                                                    Line::new("Total Drops", total_points)
                                                         .color(egui::Color32::BLUE),
                                                 );
                                             });

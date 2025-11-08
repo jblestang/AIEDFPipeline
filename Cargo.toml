@@ -12,15 +12,16 @@ path = "src/bin/gui.rs"
 tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
-egui = { version = "0.24", default-features = false, features = ["default_fonts"] }
-eframe = { version = "0.24", default-features = false, features = ["default_fonts", "glow"] }
-egui_plot = { version = "0.24", default-features = false }
+egui = { version = "0.33", default-features = false, features = ["default_fonts"] }
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"] }
+egui_extras = { version = "0.33", default-features = false}
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 instant = "0.1"
 libc = "0.2"
 num_cpus = "1.16"
 ctrlc = "3.5"
+egui_plot = "0.34.0"
 
 [dev-dependencies]
 criterion = "0.7"
