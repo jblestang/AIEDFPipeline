@@ -5,6 +5,7 @@
 //! GUI subscribers.
 
 use crate::drr_scheduler::{Priority, PriorityTable};
+use crate::multi_worker_edf::MultiWorkerStats;
 use crossbeam_channel::{self, Sender};
 use parking_lot::Mutex;
 use std::cell::RefCell;
@@ -307,6 +308,12 @@ pub struct MetricsSnapshot {
     pub queue2_occupancy: usize,
     #[serde(default = "default_queue_capacity")]
     pub queue2_capacity: usize,
+    #[serde(default = "default_worker_depths")]
+    pub worker_queue_depths: Vec<usize>,
+    #[serde(default)]
+    pub worker_queue_capacity: usize,
+    #[serde(default)]
+    pub dispatcher_backlog: usize,
     // Packet drop metrics (per flow, aggregated from all drop points)
     #[serde(default = "default_zero_u64")]
     pub ingress_drops: u64, // Drops at IngressDRR → Input Queue
@@ -325,6 +332,16 @@ pub struct MetricsSnapshot {
     pub recent_latencies: Vec<f64>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct WorkerLoadSnapshot {
+    #[serde(default = "default_worker_depths")]
+    pub worker_queue_depths: Vec<usize>,
+    #[serde(default)]
+    pub worker_queue_capacity: usize,
+    #[serde(default)]
+    pub dispatcher_backlog: usize,
+}
+
 fn default_instant() -> Instant {
     Instant::now()
 }
@@ -339,6 +356,10 @@ fn default_queue_capacity() -> usize {
 
 fn default_zero_u64() -> u64 {
     0
+}
+
+fn default_worker_depths() -> Vec<usize> {
+    Vec::new()
 }
 
 mod duration_millis {
@@ -400,6 +421,7 @@ pub struct MetricsCollector {
     events_tx: crossbeam_channel::Sender<MetricsEvent>,
     queue1: Option<Arc<crate::queue::Queue>>,
     queue2: Option<Arc<crate::queue::Queue>>,
+    worker_stats: Arc<Mutex<Option<WorkerLoadSnapshot>>>,
 }
 
 impl MetricsCollector {
@@ -464,6 +486,7 @@ impl MetricsCollector {
             events_tx,
             queue1,
             queue2,
+            worker_stats: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -479,6 +502,16 @@ impl MetricsCollector {
         });
     }
 
+    /// Update worker queue statistics (multi-worker EDF only).
+    pub fn update_worker_stats(&self, stats: Option<MultiWorkerStats>) {
+        let mut guard = self.worker_stats.lock();
+        *guard = stats.map(|s| WorkerLoadSnapshot {
+            worker_queue_depths: s.worker_queue_depths,
+            worker_queue_capacity: s.worker_queue_capacity,
+            dispatcher_backlog: s.dispatcher_backlog,
+        });
+    }
+
     /// Aggregate current metrics and send a snapshot to listeners.
     ///
     /// Called from the statistics thread running on the best-effort core. The method clones the
@@ -490,7 +523,7 @@ impl MetricsCollector {
         ingress_drops: Option<PriorityTable<u64>>,
         edf_drops: Option<(u64, PriorityTable<u64>)>,
     ) {
-        // Get queue occupancy (no lock needed)
+        // Get queue occupancy
         let queue1_occupancy = self.queue1.as_ref().map(|q| q.occupancy()).unwrap_or(0);
         let queue1_capacity = self.queue1.as_ref().map(|q| q.capacity()).unwrap_or(0);
         let queue2_occupancy = self.queue2.as_ref().map(|q| q.occupancy()).unwrap_or(0);
@@ -502,6 +535,7 @@ impl MetricsCollector {
             let metrics = self.metrics.lock();
             metrics.clone() // Clone while holding lock (fast operation)
         }; // Lock released here
+        let worker_stats_snapshot = { self.worker_stats.lock().clone() };
 
         let ingress_table = ingress_drops.unwrap_or_else(|| PriorityTable::from_fn(|_| 0));
         let (edf_heap_drops, edf_table) = edf_drops.unwrap_or((0, PriorityTable::from_fn(|_| 0)));
@@ -537,6 +571,18 @@ impl MetricsCollector {
                     queue1_capacity,
                     queue2_occupancy,
                     queue2_capacity,
+                    worker_queue_depths: worker_stats_snapshot
+                        .as_ref()
+                        .map(|s| s.worker_queue_depths.clone())
+                        .unwrap_or_default(),
+                    worker_queue_capacity: worker_stats_snapshot
+                        .as_ref()
+                        .map(|s| s.worker_queue_capacity)
+                        .unwrap_or(0),
+                    dispatcher_backlog: worker_stats_snapshot
+                        .as_ref()
+                        .map(|s| s.dispatcher_backlog)
+                        .unwrap_or(0),
                     ingress_drops: ingress_drops_for_flow,
                     edf_heap_drops, // Shared across all flows
                     edf_output_drops: edf_output_drops_for_flow,
@@ -559,10 +605,9 @@ impl MetricsCollector {
         expected_latencies: &PriorityTable<Duration>,
     ) -> std::collections::HashMap<Priority, MetricsSnapshot> {
         // Get queue occupancy
-        let queue1_occupancy = self.queue1.as_ref().map(|q| q.occupancy()).unwrap_or(0);
         let queue1_capacity = self.queue1.as_ref().map(|q| q.capacity()).unwrap_or(0);
-        let queue2_occupancy = self.queue2.as_ref().map(|q| q.occupancy()).unwrap_or(0);
         let queue2_capacity = self.queue2.as_ref().map(|q| q.capacity()).unwrap_or(0);
+        let worker_stats_snapshot = self.worker_stats.lock().clone();
 
         let metrics = self.metrics.lock();
         let mut snapshot = std::collections::HashMap::new();
@@ -584,10 +629,22 @@ impl MetricsCollector {
                     std_dev: m.standard_deviation(),
                     deadline_misses: m.deadline_misses,
                     expected_max_latency: expected_max,
-                    queue1_occupancy,
+                    queue1_occupancy: 0,
                     queue1_capacity,
-                    queue2_occupancy,
+                    queue2_occupancy: 0,
                     queue2_capacity,
+                    worker_queue_depths: worker_stats_snapshot
+                        .as_ref()
+                        .map(|s| s.worker_queue_depths.clone())
+                        .unwrap_or_default(),
+                    worker_queue_capacity: worker_stats_snapshot
+                        .as_ref()
+                        .map(|s| s.worker_queue_capacity)
+                        .unwrap_or(0),
+                    dispatcher_backlog: worker_stats_snapshot
+                        .as_ref()
+                        .map(|s| s.dispatcher_backlog)
+                        .unwrap_or(0),
                     ingress_drops: 0,
                     edf_heap_drops: 0,
                     edf_output_drops: 0,

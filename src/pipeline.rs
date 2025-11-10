@@ -15,7 +15,20 @@ use crate::edf_scheduler::EDFScheduler;
 use crate::egress_drr::EgressDRRScheduler;
 use crate::ingress_drr::IngressDRRScheduler;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
+use crate::multi_worker_edf::MultiWorkerScheduler;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerKind {
+    Single,
+    MultiWorker,
+}
+
+impl Default for SchedulerKind {
+    fn default() -> Self {
+        SchedulerKind::Single
+    }
+}
 
 /// UDP socket configuration shared by ingress and egress stages.
 #[derive(Debug, Clone)]
@@ -35,8 +48,10 @@ pub struct SocketConfig {
 pub struct CoreAssignment {
     /// Core used by the ingress DRR runtime.
     pub ingress: usize,
-    /// Core dedicated to the EDF busy-spin loop.
-    pub edf: usize,
+    /// Core dedicated to the EDF dispatcher when using the multi-worker scheduler.
+    pub edf_dispatcher: usize,
+    /// Worker cores used by the EDF multi-worker scheduler (falls back to dispatcher core when empty).
+    pub edf_workers: Vec<usize>,
     /// Core used by egress plus metrics/statistics (best effort lane).
     pub egress: usize,
 }
@@ -45,7 +60,8 @@ impl Default for CoreAssignment {
     fn default() -> Self {
         Self {
             ingress: 0,
-            edf: 1,
+            edf_dispatcher: 1,
+            edf_workers: vec![1, 2],
             egress: 2,
         }
     }
@@ -103,7 +119,7 @@ pub struct EdfSchedulerConfig {
 
 impl Default for EdfSchedulerConfig {
     fn default() -> Self {
-        Self { max_heap_size: 16 }
+        Self { max_heap_size: 1 }
     }
 }
 
@@ -118,6 +134,8 @@ pub struct PipelineConfig {
     pub ingress: IngressSchedulerConfig,
     /// EDF tuning knobs.
     pub edf: EdfSchedulerConfig,
+    /// Scheduler strategy (single-thread EDF vs multi-worker EDF).
+    pub scheduler: SchedulerKind,
 }
 
 impl Default for PipelineConfig {
@@ -127,6 +145,7 @@ impl Default for PipelineConfig {
             queues: QueueConfig::default(),
             ingress: IngressSchedulerConfig::default(),
             edf: EdfSchedulerConfig::default(),
+            scheduler: SchedulerKind::default(),
         }
     }
 }
@@ -148,16 +167,16 @@ impl Pipeline {
 /// Complete pipeline wiring that owns schedulers, sockets, and metrics collectors.
 pub struct Pipeline {
     ingress_drr: Arc<IngressDRRScheduler>,
-    edf: Arc<EDFScheduler>,
+    edf_single: Option<Arc<EDFScheduler>>,
+    edf_multi: Option<Arc<MultiWorkerScheduler>>,
     egress_drr: Arc<EgressDRRScheduler>,
     metrics_collector: Arc<MetricsCollector>,
     metrics_receiver: Receiver<std::collections::HashMap<u64, MetricsSnapshot>>,
     running: Arc<AtomicBool>, // Use AtomicBool instead of Mutex for lock-free reads
     input_sockets: Vec<SocketConfig>,
     output_sockets: Vec<SocketConfig>,
-    // Store scheduler references for drop count collection
     ingress_drr_for_drops: Arc<IngressDRRScheduler>,
-    edf_for_drops: Arc<EDFScheduler>,
+    scheduler_kind: SchedulerKind,
     config: PipelineConfig,
 }
 
@@ -214,11 +233,31 @@ impl Pipeline {
             build_priority_channels(&config.queues.edf_to_egress);
 
         let ingress_drr = Arc::new(IngressDRRScheduler::new(ingress_input_txs.clone()));
-        let edf = Arc::new(EDFScheduler::new(
-            PriorityTable::from_fn(|priority| Arc::new(ingress_input_rxs[priority].clone())),
-            edf_output_txs.clone(),
-            config.edf.max_heap_size,
-        ));
+        let scheduler_kind = config.scheduler;
+        let (edf_single, edf_multi): (
+            Option<Arc<EDFScheduler>>,
+            Option<Arc<MultiWorkerScheduler>>,
+        ) = match scheduler_kind {
+            SchedulerKind::Single => {
+                let edf = Arc::new(EDFScheduler::new(
+                    PriorityTable::from_fn(|priority| {
+                        Arc::new(ingress_input_rxs[priority].clone())
+                    }),
+                    edf_output_txs.clone(),
+                    config.edf.max_heap_size,
+                ));
+                (Some(edf), None)
+            }
+            SchedulerKind::MultiWorker => {
+                let multi = Arc::new(MultiWorkerScheduler::new(
+                    PriorityTable::from_fn(|priority| {
+                        Arc::new(ingress_input_rxs[priority].clone())
+                    }),
+                    edf_output_txs.clone(),
+                ));
+                (None, Some(multi))
+            }
+        };
         let egress_drr = Arc::new(EgressDRRScheduler::new(edf_output_rxs.clone()));
 
         let (metrics_tx, metrics_rx) = unbounded();
@@ -226,7 +265,8 @@ impl Pipeline {
 
         Ok(Self {
             ingress_drr: ingress_drr.clone(),
-            edf: edf.clone(),
+            edf_single: edf_single.clone(),
+            edf_multi: edf_multi.clone(),
             egress_drr,
             metrics_collector,
             metrics_receiver: metrics_rx,
@@ -234,7 +274,7 @@ impl Pipeline {
             input_sockets,
             output_sockets,
             ingress_drr_for_drops: ingress_drr,
-            edf_for_drops: edf,
+            scheduler_kind,
             config,
         })
     }
@@ -369,21 +409,48 @@ impl Pipeline {
                 });
             })?;
 
-        // EDF processing thread with high priority
-        let edf_clone = self.edf.clone();
-        let running_edf = self.running.clone();
-        let edf_core = self.config.cores.edf;
+        match self.scheduler_kind {
+            SchedulerKind::Single => {
+                let edf_clone = self
+                    .edf_single
+                    .as_ref()
+                    .expect("single EDF scheduler must be present")
+                    .clone();
+                let running_edf = self.running.clone();
+                let edf_core = self.config.cores.edf_dispatcher;
 
-        std::thread::Builder::new()
-            .name("EDF-Processor".to_string())
-            .spawn(move || {
-                set_thread_priority(2);
-                set_thread_core(edf_core);
-                while running_edf.load(Ordering::Relaxed) {
-                    let _ = edf_clone.process_next();
-                    std::hint::spin_loop();
-                }
-            })?;
+                std::thread::Builder::new()
+                    .name("EDF-Processor".to_string())
+                    .spawn(move || {
+                        set_thread_priority(2);
+                        set_thread_core(edf_core);
+                        while running_edf.load(Ordering::Relaxed) {
+                            if edf_clone.process_next().is_none() {
+                                std::hint::spin_loop();
+                            }
+                        }
+                    })?;
+            }
+            SchedulerKind::MultiWorker => {
+                let scheduler = self
+                    .edf_multi
+                    .as_ref()
+                    .expect("multi-worker scheduler must be present")
+                    .clone();
+                let running_multi = self.running.clone();
+                let worker_cores = if self.config.cores.edf_workers.is_empty() {
+                    vec![self.config.cores.edf_dispatcher]
+                } else {
+                    self.config.cores.edf_workers.clone()
+                };
+                scheduler.spawn_threads(
+                    running_multi,
+                    set_thread_priority,
+                    set_thread_core,
+                    &worker_cores,
+                );
+            }
+        }
 
         // Start EgressDRRScheduler (reads from priority queues, writes to UDP sockets)
         let egress_drr_clone = self.egress_drr.clone();
@@ -419,7 +486,9 @@ impl Pipeline {
         let expected_latencies_arc = Arc::new(expected_latencies);
         let expected_clone = expected_latencies_arc.clone();
         let ingress_drr_for_drops = self.ingress_drr_for_drops.clone();
-        let edf_for_drops = self.edf_for_drops.clone();
+        let edf_single_for_drops = self.edf_single.clone();
+        let edf_multi_for_drops = self.edf_multi.clone();
+        let scheduler_kind = self.scheduler_kind;
         let stats_core = self.config.cores.egress;
         std::thread::Builder::new()
             .name("Statistics-Thread".to_string())
@@ -438,7 +507,21 @@ impl Pipeline {
                     if interval.elapsed() >= Duration::from_millis(100) {
                         // Collect drop counts from schedulers
                         let ingress_drops = ingress_drr_for_drops.get_drop_counts();
-                        let edf_drops = edf_for_drops.get_drop_counts();
+                        let edf_drops = match scheduler_kind {
+                            SchedulerKind::Single => edf_single_for_drops
+                                .as_ref()
+                                .expect("single EDF should exist")
+                                .get_drop_counts(),
+                            SchedulerKind::MultiWorker => edf_multi_for_drops
+                                .as_ref()
+                                .expect("multi EDF should exist")
+                                .get_drop_counts(),
+                        };
+                        if let Some(multi) = edf_multi_for_drops.as_ref() {
+                            metrics_collector_periodic.update_worker_stats(Some(multi.stats()));
+                        } else {
+                            metrics_collector_periodic.update_worker_stats(None);
+                        }
                         metrics_collector_periodic.send_current_metrics(
                             expected_clone.as_ref(),
                             Some(ingress_drops.clone()),

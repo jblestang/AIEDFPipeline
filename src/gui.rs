@@ -2,6 +2,7 @@ use crate::metrics::MetricsSnapshot;
 use crossbeam_channel::Receiver;
 use eframe::egui;
 use egui::scroll_area::ScrollBarVisibility;
+use egui::widgets::ProgressBar;
 use egui_plot::{Corner, Legend, Line, LineStyle, Plot, PlotPoints};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
@@ -84,8 +85,6 @@ fn update_ui(
             // Don't reset start_time if flow already exists - use the original start_time
             let elapsed = now.duration_since(flow_stats.start_time).as_secs_f64();
 
-            // Always add a new point - accumulate all statistics over time
-            // Convert to milliseconds for plotting (latencies are stored in microseconds internally)
             let point = StatisticsPoint {
                 time: elapsed,
                 avg: snapshot.avg_latency.as_secs_f64() * 1000.0,
@@ -194,6 +193,26 @@ fn update_ui(
                         ui.label(format_latency(metrics.std_dev.unwrap_or(Duration::ZERO)));
                         ui.label(format!("{}", metrics.deadline_misses));
                     });
+                }
+
+                if let Some(sample_snapshot) = latest_metrics.values().next() {
+                    if !sample_snapshot.worker_queue_depths.is_empty() {
+                        ui.separator();
+                        ui.heading("EDF Worker Load");
+                        ui.label(format!(
+                            "Dispatcher backlog: {}",
+                            sample_snapshot.dispatcher_backlog
+                        ));
+                        for (idx, depth) in sample_snapshot.worker_queue_depths.iter().enumerate() {
+                            let capacity = sample_snapshot.worker_queue_capacity.max(1);
+                            let fraction = (*depth as f32 / capacity as f32).clamp(0.0, 1.0);
+                            let label = format!(
+                                "Worker {}: {}/{}",
+                                idx, depth, sample_snapshot.worker_queue_capacity
+                            );
+                            ui.add(ProgressBar::new(fraction).text(label));
+                        }
+                    }
                 }
 
                 ui.separator();
@@ -568,8 +587,6 @@ pub fn run_gui_client(server_addr: &str, shutdown_flag: Arc<AtomicBool>) {
                                                 // Don't reset start_time if flow already exists - use the original start_time
                                                 let elapsed = now.duration_since(flow_stats.start_time).as_secs_f64();
 
-                                                // Always add a new point - accumulate all statistics over time
-                                                // Convert to milliseconds for plotting (latencies are stored in microseconds internally)
                                                 let point = StatisticsPoint {
                                                     time: elapsed,
                                                     avg: v.avg_latency.as_secs_f64() * 1000.0,
@@ -717,6 +734,26 @@ fn update_ui_client(
                         ui.label(format_latency(metrics.std_dev.unwrap_or(Duration::ZERO)));
                         ui.label(format!("{}", metrics.deadline_misses));
                     });
+                }
+
+                if let Some(sample_snapshot) = latest_metrics.values().next() {
+                    if !sample_snapshot.worker_queue_depths.is_empty() {
+                        ui.separator();
+                        ui.heading("EDF Worker Load");
+                        ui.label(format!(
+                            "Dispatcher backlog: {}",
+                            sample_snapshot.dispatcher_backlog
+                        ));
+                        for (idx, depth) in sample_snapshot.worker_queue_depths.iter().enumerate() {
+                            let capacity = sample_snapshot.worker_queue_capacity.max(1);
+                            let fraction = (*depth as f32 / capacity as f32).clamp(0.0, 1.0);
+                            let label = format!(
+                                "Worker {}: {}/{}",
+                                idx, depth, sample_snapshot.worker_queue_capacity
+                            );
+                            ui.add(ProgressBar::new(fraction).text(label));
+                        }
+                    }
                 }
 
                 ui.separator();

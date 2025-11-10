@@ -7,7 +7,10 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::{Index, IndexMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+static PACKET_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// System-wide latency/priority classes ordered from most to least critical.
 ///
@@ -91,6 +94,7 @@ pub const MAX_PACKET_SIZE: usize = 1500;
 pub struct Packet {
     #[cfg_attr(not(test), allow(dead_code))]
     pub flow_id: u64,
+    pub id: u64,
     data: [u8; MAX_PACKET_SIZE],
     len: usize,
     pub timestamp: Instant,
@@ -107,10 +111,51 @@ impl Packet {
         data[..len].copy_from_slice(&payload[..len]);
         Packet {
             flow_id: priority.flow_id(),
+            id: PACKET_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             priority,
             timestamp: Instant::now(),
             latency_budget,
             data,
+            len,
+        }
+    }
+
+    /// Create a packet from a pre-allocated buffer.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_buffer(
+        priority: Priority,
+        data: [u8; MAX_PACKET_SIZE],
+        len: usize,
+        latency_budget: Duration,
+    ) -> Packet {
+        let len = len.min(MAX_PACKET_SIZE);
+        Packet {
+            flow_id: priority.flow_id(),
+            id: PACKET_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            priority,
+            timestamp: Instant::now(),
+            latency_budget,
+            data,
+            len,
+        }
+    }
+
+    /// Create a packet from a pre-allocated buffer.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn from_buffer(
+        priority: Priority,
+        buf: [u8; MAX_PACKET_SIZE],
+        len: usize,
+        latency_budget: Duration,
+    ) -> Packet {
+        let len = len.min(MAX_PACKET_SIZE);
+        Packet {
+            flow_id: priority.flow_id(),
+            id: PACKET_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            priority,
+            timestamp: Instant::now(),
+            latency_budget,
+            data: buf,
             len,
         }
     }
