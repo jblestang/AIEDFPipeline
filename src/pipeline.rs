@@ -152,8 +152,8 @@ impl Default for PipelineConfig {
             ingress: IngressSchedulerConfig::default(),
             edf: EdfSchedulerConfig::default(),
             scheduler: SchedulerKind::default(),
-        }
     }
+}
 }
 
 /// Complete pipeline wiring that owns schedulers, sockets, and metrics collectors.
@@ -268,7 +268,7 @@ impl Pipeline {
                         Arc::new(ingress_input_rxs[priority].clone())
                     }),
                     edf_output_txs.clone(),
-                ));
+        ));
                 (None, None, Some(global), None)
             }
             SchedulerKind::GlobalVD => {
@@ -277,7 +277,7 @@ impl Pipeline {
                         Arc::new(ingress_input_rxs[priority].clone())
                     }),
                     edf_output_txs.clone(),
-                ));
+        ));
                 (None, None, None, Some(global_vd))
             }
         };
@@ -414,7 +414,7 @@ impl Pipeline {
             let addr = format!("{}:{}", config.address, config.port);
             let socket_addr = addr.parse::<SocketAddr>()?;
             let socket = Arc::new(std::net::UdpSocket::bind("0.0.0.0:0")?);
-
+            
             self.egress_drr
                 .add_output_socket(config.priority, socket, socket_addr);
         }
@@ -433,8 +433,8 @@ impl Pipeline {
                     .build()
                     .unwrap();
                 rt.block_on(async move {
-                    let _ = ingress_drr_clone.process_sockets(running_ingress).await;
-                });
+            let _ = ingress_drr_clone.process_sockets(running_ingress).await;
+        });
             })?;
 
         match self.scheduler_kind {
@@ -444,20 +444,20 @@ impl Pipeline {
                     .as_ref()
                     .expect("single EDF scheduler must be present")
                     .clone();
-                let running_edf = self.running.clone();
+        let running_edf = self.running.clone();
                 let edf_core = self.config.cores.edf_dispatcher;
 
-                std::thread::Builder::new()
-                    .name("EDF-Processor".to_string())
-                    .spawn(move || {
+        std::thread::Builder::new()
+            .name("EDF-Processor".to_string())
+            .spawn(move || {
                         set_thread_priority(2);
                         set_thread_core(edf_core);
-                        while running_edf.load(Ordering::Relaxed) {
+                while running_edf.load(Ordering::Relaxed) {
                             if edf_clone.process_next().is_none() {
-                                std::hint::spin_loop();
+                    std::hint::spin_loop();
                             }
-                        }
-                    })?;
+                }
+            })?;
             }
             SchedulerKind::MultiWorker => {
                 let scheduler = self
@@ -535,10 +535,10 @@ impl Pipeline {
                     .build()
                     .unwrap();
                 rt.block_on(async move {
-                    let _ = egress_drr_clone
-                        .process_queues(running_egress, metrics_clone)
-                        .await;
-                });
+            let _ = egress_drr_clone
+                .process_queues(running_egress, metrics_clone)
+                .await;
+        });
             })?;
 
         // Spawn a thread to periodically send metrics updates (even when no packets are processed)

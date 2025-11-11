@@ -564,15 +564,15 @@ fn spawn_pipeline(path: &Path, scheduler: &str, metrics_port: u16) -> io::Result
 
 fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<StressRunRecord> {
     if interactive {
-        println!("=== AIEDF Pipeline Stress Test ===\n");
-        println!("This test verifies latency prioritization by:");
-        println!("  1. Sending packets to all three flows simultaneously");
-        println!("  2. Verifying that Flow 1 (1ms deadline) is prioritized by EDF");
-        println!("  3. Measuring packet arrival times and throughput");
+    println!("=== AIEDF Pipeline Stress Test ===\n");
+    println!("This test verifies latency prioritization by:");
+    println!("  1. Sending packets to all three flows simultaneously");
+    println!("  2. Verifying that Flow 1 (1ms deadline) is prioritized by EDF");
+    println!("  3. Measuring packet arrival times and throughput");
         println!("  4. Recording metrics for scheduler-to-scheduler comparisons.\n");
         println!("Make sure the pipeline is running before starting this test!");
-        println!("Press Enter to start...");
-        let mut input = String::new();
+    println!("Press Enter to start...");
+    let mut input = String::new();
         let _ = std::io::stdin().read_line(&mut input);
     } else {
         println!("\n>>> Starting automated run for scheduler \"{label}\"");

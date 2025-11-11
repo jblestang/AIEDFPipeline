@@ -73,7 +73,7 @@ impl Metrics {
         self.packet_count += 1;
 
         let now = Instant::now();
-
+        
         // Store latency in microseconds with timestamp for time-based windowing
         let latency_us = latency.as_secs_f64() * 1_000_000.0;
         self.latencies.push_back(LatencyMeasurement {
@@ -387,11 +387,11 @@ impl MetricsCollector {
             crossbeam_channel::Sender<MetricsEvent>,
             crossbeam_channel::Receiver<MetricsEvent>,
         ) = crossbeam_channel::bounded(10000);
-
+        
         let metrics: Arc<Mutex<std::collections::HashMap<Priority, Metrics>>> =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
         let metrics_clone = metrics.clone();
-
+        
         // Background thread to process metrics events (doesn't block hot path)
         std::thread::Builder::new()
             .name("Metrics-Processor".to_string())
@@ -407,13 +407,13 @@ impl MetricsCollector {
                             Err(crossbeam_channel::TryRecvError::Disconnected) => return, // Shutdown
                         }
                     }
-
+                    
                     if batch.is_empty() {
                         // No events, yield briefly
                         std::thread::yield_now();
                         continue;
                     }
-
+                    
                     // Process batch: update metrics (lock only once per batch)
                     {
                         let mut metrics_map = metrics_clone.lock();
@@ -424,13 +424,13 @@ impl MetricsCollector {
                             metrics.record_latency(event.latency, event.deadline_missed);
                         }
                     } // Lock released
-
+                    
                     // Clear batch for next iteration
                     batch.clear();
                 }
             })
             .expect("Failed to spawn metrics processor thread");
-
+        
         Self {
             metrics,
             metrics_tx,
@@ -496,11 +496,11 @@ impl MetricsCollector {
             let expected_max = expected_latencies[*priority];
             let ingress_drops_for_flow = ingress_table[*priority];
             let edf_output_drops_for_flow = edf_table[*priority];
-
+            
             // EDF heap drops are shared across all flows (we'll attribute to all flows for visibility)
             // In practice, heap drops affect all priorities, but we show it per flow for monitoring
             let total_drops = ingress_drops_for_flow + edf_heap_drops + edf_output_drops_for_flow;
-
+            
             snapshot.insert(
                 *priority,
                 MetricsSnapshot {
@@ -631,10 +631,10 @@ mod tests {
         let collector = MetricsCollector::new(tx);
 
         collector.record_packet(Priority::High, Duration::from_millis(10), false);
-
+        
         // Wait for background thread to process the event (metrics are now processed asynchronously)
         std::thread::sleep(Duration::from_millis(10));
-
+        
         let metrics = collector.metrics_snapshot();
         assert!(metrics.contains_key(&Priority::High));
         assert_eq!(metrics[&Priority::High].packet_count, 1);
