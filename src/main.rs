@@ -4,12 +4,10 @@
 // the metrics TCP server, and keeps the pipeline alive until Ctrl+C is received.
 
 mod buffer_pool;
-mod drr_scheduler;
 mod metrics;
 mod packet;
 mod pipeline;
 mod priority;
-mod queue;
 mod scheduler;
 mod threading;
 

@@ -1,6 +1,8 @@
 //! Packet representation shared by all scheduler stages.
 
-use crate::buffer_pool::{lease, BufferHandle};
+#[cfg(test)]
+use crate::buffer_pool::lease;
+use crate::buffer_pool::BufferHandle;
 use crate::priority::Priority;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -17,8 +19,6 @@ pub const MAX_PACKET_SIZE: usize = 1500;
 /// compute latency and deadline misses.
 #[derive(Debug, Clone)]
 pub struct Packet {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub flow_id: u64,
     pub id: u64,
     buffer: BufferHandle,
     len: usize,
@@ -28,24 +28,6 @@ pub struct Packet {
 }
 
 impl Packet {
-    /// Create a packet while ensuring the flow/priorities are consistent.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn new(priority: Priority, payload: &[u8], latency_budget: Duration) -> Packet {
-        let len = payload.len().min(MAX_PACKET_SIZE);
-        let mut lease = lease(len);
-        lease.as_mut_slice()[..len].copy_from_slice(&payload[..len]);
-        let buffer = lease.freeze(len);
-        Packet {
-            flow_id: priority.flow_id(),
-            id: PACKET_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-            priority,
-            timestamp: Instant::now(),
-            latency_budget,
-            len,
-            buffer,
-        }
-    }
-
     /// Instantiate a packet directly from a pooled buffer.
     pub fn from_buffer(
         priority: Priority,
@@ -54,7 +36,6 @@ impl Packet {
     ) -> Packet {
         let len = buffer.len().min(MAX_PACKET_SIZE);
         Packet {
-            flow_id: priority.flow_id(),
             id: PACKET_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             priority,
             timestamp: Instant::now(),
@@ -83,9 +64,11 @@ mod tests {
 
     #[test]
     fn packet_builder_sets_priority() {
-        let p = Packet::new(Priority::Medium, &[1, 2, 3], Duration::from_millis(10));
+        let mut lease = lease(3);
+        lease.as_mut_slice()[..3].copy_from_slice(&[1, 2, 3]);
+        let buffer = lease.freeze(3);
+        let p = Packet::from_buffer(Priority::Medium, buffer, Duration::from_millis(10));
         assert_eq!(p.priority, Priority::Medium);
-        assert_eq!(p.flow_id, Priority::Medium.flow_id());
         assert_eq!(p.payload(), &[1, 2, 3]);
     }
 }

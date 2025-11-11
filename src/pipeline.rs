@@ -156,20 +156,6 @@ impl Default for PipelineConfig {
     }
 }
 
-// Make Pipeline accessible for testing
-#[cfg(test)]
-impl Pipeline {
-    #[allow(dead_code)]
-    pub fn get_input_sockets(&self) -> &[SocketConfig] {
-        &self.input_sockets
-    }
-
-    #[allow(dead_code)]
-    pub fn get_output_sockets(&self) -> &[SocketConfig] {
-        &self.output_sockets
-    }
-}
-
 /// Complete pipeline wiring that owns schedulers, sockets, and metrics collectors.
 pub struct Pipeline {
     ingress_drr: Arc<IngressDRRScheduler>,
@@ -298,7 +284,7 @@ impl Pipeline {
         let egress_drr = Arc::new(EgressDRRScheduler::new(edf_output_rxs.clone()));
 
         let (metrics_tx, metrics_rx) = unbounded();
-        let metrics_collector = Arc::new(MetricsCollector::new(metrics_tx, None, None));
+        let metrics_collector = Arc::new(MetricsCollector::new(metrics_tx));
 
         Ok(Self {
             ingress_drr: ingress_drr.clone(),

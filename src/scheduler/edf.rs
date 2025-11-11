@@ -87,26 +87,6 @@ impl EDFScheduler {
         }
     }
 
-    /// Enqueue a packet directly (used in unit tests to bypass channels).
-    #[allow(dead_code)] // Used in tests
-    pub fn enqueue_packet(
-        &self,
-        packet: Packet,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let deadline = packet.timestamp + packet.latency_budget;
-        let task = EDFTask { packet, deadline };
-        let priority = task.packet.priority;
-
-        let mut pending = self.pending.lock();
-        if let Some(existing) = pending[priority].as_ref() {
-            if existing.deadline <= task.deadline {
-                return Ok(());
-            }
-        }
-        pending[priority] = Some(task);
-        Ok(())
-    }
-
     /// Process the next available packet (if any) and return it for testing convenience.
     pub fn process_next(&self) -> Option<Packet> {
         let mut buffers = self.pending.lock();
@@ -171,23 +151,6 @@ impl EDFScheduler {
 
         None
     }
-
-    #[allow(dead_code)]
-    pub fn has_tasks(&self) -> bool {
-        {
-            let pending = self.pending.lock();
-            if Priority::ALL
-                .iter()
-                .any(|priority| pending[*priority].is_some())
-            {
-                return true;
-            }
-        }
-
-        Priority::ALL
-            .iter()
-            .any(|priority| !self.input_queues[*priority].is_empty())
-    }
 }
 
 #[cfg(test)]
@@ -240,13 +203,24 @@ mod tests {
             latency_budget: Duration,
             timestamp: Instant,
         ) {
-            let mut packet = Packet::new(priority, &data, latency_budget);
+            let len = data.len();
+            let mut lease = crate::buffer_pool::lease(len);
+            lease.as_mut_slice()[..len].copy_from_slice(&data);
+            let mut packet = Packet::from_buffer(priority, lease.freeze(len), latency_budget);
             packet.timestamp = timestamp;
             self.inputs[priority].send(packet).unwrap();
         }
 
         fn step(&self) {
             let _ = self.scheduler.process_next();
+        }
+
+        fn outputs(&self) -> &PriorityTable<crossbeam_channel::Receiver<Packet>> {
+            &self.outputs
+        }
+
+        fn scheduler(&self) -> &EDFScheduler {
+            &self.scheduler
         }
     }
 
@@ -268,10 +242,48 @@ mod tests {
 
         let mut observed = Vec::new();
         for priority in Priority::ALL {
-            while let Ok(packet) = harness.outputs[priority].try_recv() {
+            while let Ok(packet) = harness.outputs()[priority].try_recv() {
                 observed.push(packet.priority);
             }
         }
         assert_eq!(observed, vec![Priority::High]);
+    }
+
+    #[test]
+    fn scheduler_picks_earliest_deadline() {
+        let harness = SchedulerHarness::new(4, 16);
+        let now = Instant::now();
+
+        harness.enqueue(Priority::High, vec![1], Duration::from_millis(100), now);
+        harness.enqueue(Priority::Medium, vec![2], Duration::from_millis(5), now);
+
+        harness.step();
+
+        let medium_packet = harness.outputs()[Priority::Medium]
+            .try_recv()
+            .expect("expected medium priority packet first");
+        assert_eq!(medium_packet.priority, Priority::Medium);
+
+        harness.step();
+        let high_packet = harness.outputs()[Priority::High]
+            .try_recv()
+            .expect("expected high priority packet afterwards");
+        assert_eq!(high_packet.priority, Priority::High);
+    }
+
+    #[test]
+    fn scheduler_counts_drops_when_output_full() {
+        let harness = SchedulerHarness::new(1, 16);
+        let now = Instant::now();
+
+        harness.enqueue(Priority::High, vec![1], Duration::from_millis(5), now);
+        harness.step();
+
+        // Leave the first packet in the output queue so it remains full.
+        harness.enqueue(Priority::High, vec![2], Duration::from_millis(5), now);
+        harness.step();
+
+        let drop_counts = harness.scheduler().get_drop_counts();
+        assert_eq!(drop_counts.output[Priority::High], 1);
     }
 }

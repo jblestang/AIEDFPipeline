@@ -35,23 +35,7 @@ impl Priority {
         }
     }
 
-    /// Map a legacy numeric flow identifier to the associated priority class.
-    ///
-    /// This is retained for backwards compatibility with external workloads that still encode
-    /// priorities as integers on the wire.
-    #[allow(dead_code)]
-    pub const fn from_flow_id(flow_id: u64) -> Priority {
-        match flow_id {
-            1 => Priority::High,
-            2 => Priority::Medium,
-            3 => Priority::Low,
-            4 => Priority::BestEffort,
-            _ => Priority::BestEffort,
-        }
-    }
-
     /// Numeric identifier for compatibility with legacy metrics and IO code.
-    #[allow(dead_code)]
     pub const fn flow_id(self) -> u64 {
         match self {
             Priority::High => 1,
@@ -94,16 +78,6 @@ impl<T> PriorityTable<T> {
         PriorityTable { values }
     }
 
-    /// Try to build a table while propagating errors from the generator.
-    #[allow(dead_code)]
-    pub fn try_from_fn<E>(mut f: impl FnMut(Priority) -> Result<T, E>) -> Result<Self, E> {
-        let mut values = Vec::with_capacity(Priority::ALL.len());
-        for priority in Priority::ALL {
-            values.push(f(priority)?);
-        }
-        Ok(PriorityTable { values })
-    }
-
     /// Borrow the value for a given priority.
     pub fn get(&self, priority: Priority) -> &T {
         &self.values[priority.index()]
@@ -114,12 +88,6 @@ impl<T> PriorityTable<T> {
         &mut self.values[priority.index()]
     }
 
-    /// Consume the table and return the underlying vector.
-    #[allow(dead_code)]
-    pub fn into_vec(self) -> Vec<T> {
-        self.values
-    }
-
     /// Build a table from a vector ordered according to [`Priority::ALL`].
     pub fn from_vec(values: Vec<T>) -> Self {
         assert!(
@@ -128,29 +96,6 @@ impl<T> PriorityTable<T> {
             Priority::ALL.len(),
             values.len()
         );
-        PriorityTable { values }
-    }
-
-    /// Iterate over `(Priority, &T)` pairs.
-    #[allow(dead_code)]
-    pub fn iter(&self) -> impl Iterator<Item = (Priority, &T)> {
-        Priority::ALL.iter().copied().zip(self.values.iter())
-    }
-
-    /// Iterate over `(Priority, &mut T)` pairs.
-    #[allow(dead_code)]
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Priority, &mut T)> {
-        Priority::ALL.iter().copied().zip(self.values.iter_mut())
-    }
-
-    /// Map the values into a new `PriorityTable`.
-    #[allow(dead_code)]
-    pub fn map<U>(self, mut f: impl FnMut(Priority, T) -> U) -> PriorityTable<U> {
-        let mut values = Vec::with_capacity(self.values.len());
-        for (idx, value) in self.values.into_iter().enumerate() {
-            let priority = Priority::ALL[idx];
-            values.push(f(priority, value));
-        }
         PriorityTable { values }
     }
 }
@@ -186,10 +131,5 @@ mod tests {
         let table = PriorityTable::from_fn(|p| p.index());
         assert_eq!(table[Priority::High], 0);
         assert_eq!(table[Priority::BestEffort], 3);
-
-        let mapped = table
-            .clone()
-            .map(|priority, value| value + priority.index());
-        assert_eq!(mapped[Priority::Medium], 2);
     }
 }

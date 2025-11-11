@@ -32,12 +32,7 @@ num_cpus = "1.16"
 ctrlc = "3.5"
 
 [dev-dependencies]
-criterion = "0.7"
 indicatif = "0.17"
-
-[[bench]]
-name = "scheduler_bench"
-harness = false
 
 [[example]]
 name = "stress_test"

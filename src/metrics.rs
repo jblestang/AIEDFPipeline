@@ -27,7 +27,6 @@ pub struct Metrics {
     pub packet_count: u64,
     pub(crate) latencies: VecDeque<LatencyMeasurement>, // Store latencies with timestamps for time-based windowing
     pub deadline_misses: u64,
-    pub last_update: Instant,
     pub time_window: Duration, // Time window for latency history (e.g., 10 seconds)
     // Cached statistics to avoid expensive recalculations (using RefCell for interior mutability)
     cached_p50: RefCell<Option<Duration>>,
@@ -44,7 +43,6 @@ impl Default for Metrics {
             packet_count: 0,
             latencies: VecDeque::with_capacity(10000), // Pre-allocate for high packet rates
             deadline_misses: 0,
-            last_update: Instant::now(),
             time_window: Duration::from_secs(10), // Keep last 10 seconds of latency data
             cached_p50: RefCell::new(None),
             cached_p95: RefCell::new(None),
@@ -62,7 +60,6 @@ impl Metrics {
             packet_count: 0,
             latencies: VecDeque::with_capacity(10000), // Pre-allocate for high packet rates
             deadline_misses: 0,
-            last_update: Instant::now(),
             time_window: Duration::from_secs(10), // Keep last 10 seconds of latency data
             cached_p50: RefCell::new(None),
             cached_p95: RefCell::new(None),
@@ -104,8 +101,6 @@ impl Metrics {
         if deadline_missed {
             self.deadline_misses += 1;
         }
-
-        self.last_update = now;
     }
 
     // Compute all percentiles at once and cache them (more efficient than computing individually)
@@ -192,40 +187,6 @@ impl Metrics {
         Some(Duration::from_secs_f64(max / 1_000_000.0))
     }
 
-    #[allow(dead_code)]
-    pub fn get_latency_history(&self) -> Vec<f64> {
-        self.latencies.iter().map(|m| m.latency_us).collect()
-    }
-
-    pub fn get_recent_latencies(&self, count: usize) -> Vec<f64> {
-        let start = self.latencies.len().saturating_sub(count);
-        self.latencies
-            .range(start..)
-            .map(|m| m.latency_us)
-            .collect()
-    }
-
-    #[allow(dead_code)]
-    pub fn percentile(&self, percentile: f64) -> Option<Duration> {
-        // For common percentiles, use cache; otherwise compute on demand
-        match percentile {
-            50.0 => self.p50(),
-            95.0 => self.p95(),
-            99.0 => self.p99(),
-            99.9 => self.p999(),
-            _ => {
-                if self.latencies.is_empty() {
-                    return None;
-                }
-                let mut sorted: Vec<f64> = self.latencies.iter().map(|m| m.latency_us).collect();
-                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let index = (sorted.len() as f64 * percentile / 100.0).ceil() as usize - 1;
-                let index = index.min(sorted.len() - 1);
-                Some(Duration::from_secs_f64(sorted[index] / 1_000_000.0))
-            }
-        }
-    }
-
     pub fn p50(&self) -> Option<Duration> {
         self.compute_and_cache_percentiles();
         *self.cached_p50.borrow()
@@ -254,7 +215,6 @@ impl Clone for Metrics {
             packet_count: self.packet_count,
             latencies: self.latencies.clone(),
             deadline_misses: self.deadline_misses,
-            last_update: self.last_update,
             time_window: self.time_window,
             cached_p50: RefCell::new(None),
             cached_p95: RefCell::new(None),
@@ -325,13 +285,6 @@ pub struct MetricsSnapshot {
     pub edf_output_drops: u64, // Drops at EDF → Output Queue
     #[serde(default = "default_zero_u64")]
     pub total_drops: u64, // Total drops for this flow
-    #[serde(skip, default = "default_instant")]
-    #[allow(dead_code)]
-    pub last_update: Instant,
-    // Store recent latency history for plotting (last 1000 samples)
-    #[serde(skip)]
-    #[allow(dead_code)]
-    pub recent_latencies: Vec<f64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -344,10 +297,6 @@ pub struct WorkerLoadSnapshot {
     pub dispatcher_backlog: usize,
     #[serde(default = "default_worker_priority_depths")]
     pub worker_priority_depths: Vec<Vec<usize>>,
-}
-
-fn default_instant() -> Instant {
-    Instant::now()
 }
 
 fn default_zero() -> usize {
@@ -427,18 +376,12 @@ pub struct MetricsCollector {
     metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>,
     // Lock-free channel for metrics events (hot path sends here, background thread processes)
     events_tx: crossbeam_channel::Sender<MetricsEvent>,
-    queue1: Option<Arc<crate::queue::Queue>>,
-    queue2: Option<Arc<crate::queue::Queue>>,
     worker_stats: Arc<Mutex<Option<WorkerLoadSnapshot>>>,
 }
 
 impl MetricsCollector {
     /// Create a new collector backed by the provided metrics sender and optional queue probes.
-    pub fn new(
-        metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>,
-        queue1: Option<Arc<crate::queue::Queue>>,
-        queue2: Option<Arc<crate::queue::Queue>>,
-    ) -> Self {
+    pub fn new(metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>) -> Self {
         // Create lock-free channel for metrics events (bounded to prevent unbounded growth)
         let (events_tx, events_rx): (
             crossbeam_channel::Sender<MetricsEvent>,
@@ -492,8 +435,6 @@ impl MetricsCollector {
             metrics,
             metrics_tx,
             events_tx,
-            queue1,
-            queue2,
             worker_stats: Arc::new(Mutex::new(None)),
         }
     }
@@ -533,10 +474,10 @@ impl MetricsCollector {
         edf_drops: Option<(u64, PriorityTable<u64>)>,
     ) {
         // Get queue occupancy
-        let queue1_occupancy = self.queue1.as_ref().map(|q| q.occupancy()).unwrap_or(0);
-        let queue1_capacity = self.queue1.as_ref().map(|q| q.capacity()).unwrap_or(0);
-        let queue2_occupancy = self.queue2.as_ref().map(|q| q.occupancy()).unwrap_or(0);
-        let queue2_capacity = self.queue2.as_ref().map(|q| q.capacity()).unwrap_or(0);
+        let queue1_occupancy = 0;
+        let queue1_capacity = 0;
+        let queue2_occupancy = 0;
+        let queue2_capacity = 0;
 
         // Quick clone to minimize lock hold time (reduces priority inversion risk)
         // Statistics computation happens outside the lock
@@ -600,8 +541,6 @@ impl MetricsCollector {
                     edf_heap_drops, // Shared across all flows
                     edf_output_drops: edf_output_drops_for_flow,
                     total_drops,
-                    last_update: m.last_update,
-                    recent_latencies: m.get_recent_latencies(1000),
                 },
             );
         }
@@ -611,71 +550,11 @@ impl MetricsCollector {
             .collect();
         let _ = self.metrics_tx.try_send(serialized_snapshot);
     }
+}
 
-    #[allow(dead_code)]
-    pub fn get_metrics_snapshot(
-        &self,
-        expected_latencies: &PriorityTable<Duration>,
-    ) -> std::collections::HashMap<Priority, MetricsSnapshot> {
-        // Get queue occupancy
-        let queue1_capacity = self.queue1.as_ref().map(|q| q.capacity()).unwrap_or(0);
-        let queue2_capacity = self.queue2.as_ref().map(|q| q.capacity()).unwrap_or(0);
-        let worker_stats_snapshot = self.worker_stats.lock().clone();
-
-        let metrics = self.metrics.lock();
-        let mut snapshot = std::collections::HashMap::new();
-        for (priority, m) in metrics.iter() {
-            let expected_max = expected_latencies[*priority];
-            snapshot.insert(
-                *priority,
-                MetricsSnapshot {
-                    priority: m.priority,
-                    packet_count: m.packet_count,
-                    avg_latency: m.average_latency(),
-                    min_latency: m.min_latency(),
-                    max_latency: m.max_latency(),
-                    p50: m.p50(),
-                    p95: m.p95(),
-                    p99: m.p99(),
-                    p999: m.p999(),
-                    p100: m.max_latency(), // P100 is the same as max (100th percentile)
-                    std_dev: m.standard_deviation(),
-                    deadline_misses: m.deadline_misses,
-                    expected_max_latency: expected_max,
-                    queue1_occupancy: 0,
-                    queue1_capacity,
-                    queue2_occupancy: 0,
-                    queue2_capacity,
-                    worker_queue_depths: worker_stats_snapshot
-                        .as_ref()
-                        .map(|s| s.worker_queue_depths.clone())
-                        .unwrap_or_default(),
-                    worker_queue_capacities: worker_stats_snapshot
-                        .as_ref()
-                        .map(|s| s.worker_queue_capacities.clone())
-                        .unwrap_or_default(),
-                    dispatcher_backlog: worker_stats_snapshot
-                        .as_ref()
-                        .map(|s| s.dispatcher_backlog)
-                        .unwrap_or(0),
-                    worker_priority_depths: worker_stats_snapshot
-                        .as_ref()
-                        .map(|s| s.worker_priority_depths.clone())
-                        .unwrap_or_default(),
-                    ingress_drops: 0,
-                    edf_heap_drops: 0,
-                    edf_output_drops: 0,
-                    total_drops: 0,
-                    last_update: m.last_update,
-                    recent_latencies: m.get_recent_latencies(1000),
-                },
-            );
-        }
-        snapshot
-    }
-
-    #[allow(dead_code)]
-    pub fn get_metrics(&self) -> std::collections::HashMap<Priority, Metrics> {
+#[cfg(test)]
+impl MetricsCollector {
+    fn metrics_snapshot(&self) -> std::collections::HashMap<Priority, Metrics> {
         self.metrics.lock().clone()
     }
 }
@@ -749,14 +628,14 @@ mod tests {
     #[test]
     fn test_metrics_collector() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let collector = MetricsCollector::new(tx, None, None);
+        let collector = MetricsCollector::new(tx);
 
         collector.record_packet(Priority::High, Duration::from_millis(10), false);
 
         // Wait for background thread to process the event (metrics are now processed asynchronously)
         std::thread::sleep(Duration::from_millis(10));
 
-        let metrics = collector.get_metrics();
+        let metrics = collector.metrics_snapshot();
         assert!(metrics.contains_key(&Priority::High));
         assert_eq!(metrics[&Priority::High].packet_count, 1);
     }

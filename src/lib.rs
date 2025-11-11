@@ -2,14 +2,12 @@
 //! full pipeline.
 
 pub mod buffer_pool;
-pub mod drr_scheduler;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod metrics;
 pub mod packet;
 pub mod pipeline;
 pub mod priority;
-pub mod queue;
 pub mod scheduler;
 pub mod threading;
 
