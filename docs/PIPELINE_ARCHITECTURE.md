@@ -74,7 +74,7 @@ PriorityTable<Sender<Packet>> bounded channels (default 16 each)
 │ Statistics thread (core 2, priority 1 – Best Effort lane)     │
 │  - Drains metrics events from lock-free channel               │
 │  - Computes percentiles, queue occupancy, drop counts         │
-│  - Broadcasts JSON snapshots via TCP 127.0.0.1:9999           │
+│  - Broadcasts JSON snapshots via TCP (default 127.0.0.1:9999, overridable with `--metrics-bind`) │
 └──────────────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────┐
 │ GUI / external clients                                        │
@@ -97,6 +97,17 @@ Because these structs embed `PriorityTable`, adding a new priority only requires
 2. Events go into a lock-free `crossbeam_channel` so the hot path avoids mutexes.
 3. The statistics thread (Best Effort priority) aggregates metrics, merges ingress/EDF drop counters, and streams snapshots.
 4. The GUI plots latency percentiles, queue usage, and drop series with a legend identifying ingress versus EDF drops.
+
+## Adaptive Load Balancing
+The multi-worker EDF scheduler uses an adaptive controller that keeps latency budgets on track:
+
+- **Processing-time EMA** – every worker feeds its observed processing duration back into a per-priority exponential moving average (default decay `7/8 ↔ 1/8`).
+- **Capacity estimation** – every 100 ms we estimate the safe backlog per priority via `target ≈ 0.9 × budget / avg_processing`, clamped between 1 and 512 packets.
+- **Quota distribution** – High priority is anchored on Worker 0, with small spillover allowances on workers 1 and 2. Medium and Low are split across their eligible workers with hard caps (e.g. Medium ≤160 per worker, Low ≤192).
+- **Guard tuning** – the same pass adjusts guard thresholds (how long Medium/Low wait for a late High arrival) and the guard slice width; High always preempts immediately, whereas Medium only guards while the High backlog is empty.
+- **Dynamic atomics** – all limits/thresholds live in atomics so workers read them lock-free each loop. A dedicated `EDF-AutoBalance` thread rewrites the atomics every 100 ms based on the latest EMA and queue depth.
+
+This feedback loop keeps High P50 close to the processing floor while capping P99 under the configured 1 ms budget even under bursty load.
 
 ## License & Compliance
 - All networking remains on localhost UDP.

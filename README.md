@@ -73,8 +73,16 @@ cargo run --release
 The binary:
 - Binds UDP inputs on `127.0.0.1:{8080,8081,8082}` for High/Medium/Low classes.
 - Emits processed packets to `127.0.0.1:{9080,9081,9082}`.
-- Starts the metrics TCP server on `127.0.0.1:9999`.
+- Starts the metrics TCP server on `127.0.0.1:9999` by default.
 - Spawns ingress/egress runtimes plus a statistics thread pinned to the best-effort core.
+
+Override the metrics bind address (IP or DNS name, optional port) with:
+
+```bash
+cargo run --release -- --metrics-bind=0.0.0.0:9999
+```
+
+If the port is omitted the default `9999` is used, e.g. `--metrics-host=metrics.internal`.
 
 ### GUI Client
 Launch the egui dashboard after the pipeline is running:

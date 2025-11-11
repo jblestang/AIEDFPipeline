@@ -231,7 +231,7 @@ fn main() {
         test_duration.as_secs()
     );
 
-    let factor = 1;
+    let factor = 2;
 
     let rate_flow1 = 64u64 * factor; // packets per second
     let rate_flow2 = 128u64 * factor;

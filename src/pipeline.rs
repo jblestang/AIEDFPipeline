@@ -227,6 +227,14 @@ impl Pipeline {
             },
         ];
 
+        let mut latency_table = PriorityTable::from_fn(|_| Duration::from_millis(200));
+        for socket in &input_sockets {
+            latency_table[socket.priority] = socket.latency_budget;
+        }
+        for socket in &output_sockets {
+            latency_table[socket.priority] = socket.latency_budget;
+        }
+
         let (ingress_input_txs, ingress_input_rxs) =
             build_priority_channels(&config.queues.ingress_to_edf);
         let (edf_output_txs, edf_output_rxs) =
@@ -254,6 +262,7 @@ impl Pipeline {
                         Arc::new(ingress_input_rxs[priority].clone())
                     }),
                     edf_output_txs.clone(),
+                    latency_table.clone(),
                 ));
                 (None, Some(multi))
             }
@@ -283,10 +292,13 @@ impl Pipeline {
     ///
     /// Spawns two Tokio tasks: one that converts internal metrics snapshots into JSON strings and
     /// another that accepts TCP clients, forwarding the broadcast stream to each connection.
-    pub async fn start_metrics_server(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start_metrics_server(
+        &self,
+        bind_addr: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use tokio::sync::broadcast;
 
-        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
         let metrics_rx = self.metrics_receiver.clone();
         let running_metrics = self.running.clone();
@@ -479,11 +491,20 @@ impl Pipeline {
         let metrics_collector_periodic = self.metrics_collector.clone();
         let running_periodic = self.running.clone();
         // Map priority to expected latency for metrics reporting
-        let mut expected_latencies = PriorityTable::from_fn(|_| Duration::from_millis(200));
-        for socket in &self.output_sockets {
-            expected_latencies[socket.priority] = socket.latency_budget;
-        }
-        let expected_latencies_arc = Arc::new(expected_latencies);
+        let expected_latencies_arc = Arc::new(PriorityTable::from_fn(|priority| {
+            let mut budget = Duration::from_millis(200);
+            for socket in &self.input_sockets {
+                if socket.priority == priority {
+                    budget = socket.latency_budget;
+                }
+            }
+            for socket in &self.output_sockets {
+                if socket.priority == priority {
+                    budget = budget.min(socket.latency_budget);
+                }
+            }
+            budget
+        }));
         let expected_clone = expected_latencies_arc.clone();
         let ingress_drr_for_drops = self.ingress_drr_for_drops.clone();
         let edf_single_for_drops = self.edf_single.clone();
@@ -576,14 +597,26 @@ fn set_cpu_affinity() -> Result<(), Box<dyn std::error::Error>> {
 fn set_thread_priority(priority: i32) {
     #[cfg(target_os = "linux")]
     {
-        use libc::{getpid, sched_param, sched_setscheduler, SCHED_FIFO};
+        use libc::{
+            pthread_self, pthread_setschedparam, sched_param, SCHED_FIFO, SCHED_OTHER, SCHED_RR,
+        };
         use std::mem;
+
+        let (policy, sched_priority) = if priority >= 3 {
+            (SCHED_FIFO, 90)
+        } else if priority == 2 {
+            (SCHED_FIFO, 70)
+        } else if priority == 1 {
+            (SCHED_RR, 30)
+        } else {
+            (SCHED_OTHER, 0)
+        };
 
         unsafe {
             let mut param: sched_param = mem::zeroed();
-            param.sched_priority = priority;
-            let pid = getpid();
-            let _ = sched_setscheduler(pid, SCHED_FIFO, &param);
+            param.sched_priority = sched_priority;
+            let thread = pthread_self();
+            let _ = pthread_setschedparam(thread, policy, &param);
         }
     }
     #[cfg(target_os = "macos")]
