@@ -7,6 +7,8 @@ mod buffer_pool;
 mod drr_scheduler;
 mod edf_scheduler;
 mod egress_drr;
+mod gedf_scheduler;
+mod gedf_vd_scheduler;
 mod ingress_drr;
 mod metrics;
 mod multi_worker_edf;
@@ -41,6 +43,8 @@ fn parse_cli_options() -> CliOptions {
                 "--scheduler" => {
                     scheduler = match value.to_ascii_lowercase().as_str() {
                         "multi" | "multi-worker" | "multi_worker" => SchedulerKind::MultiWorker,
+                        "gedf" | "g-edf" | "global" => SchedulerKind::Global,
+                        "gedf-vd" | "g-edf-vd" | "global-vd" => SchedulerKind::GlobalVD,
                         "single" | "legacy" => SchedulerKind::Single,
                         _ => scheduler,
                     };
@@ -54,6 +58,8 @@ fn parse_cli_options() -> CliOptions {
             if let Some(value) = args.next() {
                 scheduler = match value.to_ascii_lowercase().as_str() {
                     "multi" | "multi-worker" | "multi_worker" => SchedulerKind::MultiWorker,
+                    "gedf" | "g-edf" | "global" => SchedulerKind::Global,
+                    "gedf-vd" | "g-edf-vd" | "global-vd" => SchedulerKind::GlobalVD,
                     "single" | "legacy" => SchedulerKind::Single,
                     _ => scheduler,
                 };

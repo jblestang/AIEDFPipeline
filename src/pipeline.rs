@@ -13,6 +13,8 @@ use tokio::io::AsyncWriteExt;
 use crate::drr_scheduler::{Packet, Priority, PriorityTable};
 use crate::edf_scheduler::EDFScheduler;
 use crate::egress_drr::EgressDRRScheduler;
+use crate::gedf_scheduler::GEDFScheduler;
+use crate::gedf_vd_scheduler::GEDFVDScheduler;
 use crate::ingress_drr::IngressDRRScheduler;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::multi_worker_edf::MultiWorkerScheduler;
@@ -22,6 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub enum SchedulerKind {
     Single,
     MultiWorker,
+    Global,
+    GlobalVD,
 }
 
 impl Default for SchedulerKind {
@@ -169,6 +173,8 @@ pub struct Pipeline {
     ingress_drr: Arc<IngressDRRScheduler>,
     edf_single: Option<Arc<EDFScheduler>>,
     edf_multi: Option<Arc<MultiWorkerScheduler>>,
+    edf_global: Option<Arc<GEDFScheduler>>,
+    edf_global_vd: Option<Arc<GEDFVDScheduler>>,
     egress_drr: Arc<EgressDRRScheduler>,
     metrics_collector: Arc<MetricsCollector>,
     metrics_receiver: Receiver<std::collections::HashMap<u64, MetricsSnapshot>>,
@@ -242,9 +248,11 @@ impl Pipeline {
 
         let ingress_drr = Arc::new(IngressDRRScheduler::new(ingress_input_txs.clone()));
         let scheduler_kind = config.scheduler;
-        let (edf_single, edf_multi): (
+        let (edf_single, edf_multi, edf_global, edf_global_vd): (
             Option<Arc<EDFScheduler>>,
             Option<Arc<MultiWorkerScheduler>>,
+            Option<Arc<GEDFScheduler>>,
+            Option<Arc<GEDFVDScheduler>>,
         ) = match scheduler_kind {
             SchedulerKind::Single => {
                 let edf = Arc::new(EDFScheduler::new(
@@ -254,7 +262,7 @@ impl Pipeline {
                     edf_output_txs.clone(),
                     config.edf.max_heap_size,
                 ));
-                (Some(edf), None)
+                (Some(edf), None, None, None)
             }
             SchedulerKind::MultiWorker => {
                 let multi = Arc::new(MultiWorkerScheduler::new(
@@ -264,7 +272,25 @@ impl Pipeline {
                     edf_output_txs.clone(),
                     latency_table.clone(),
                 ));
-                (None, Some(multi))
+                (None, Some(multi), None, None)
+            }
+            SchedulerKind::Global => {
+                let global = Arc::new(GEDFScheduler::new(
+                    PriorityTable::from_fn(|priority| {
+                        Arc::new(ingress_input_rxs[priority].clone())
+                    }),
+                    edf_output_txs.clone(),
+                ));
+                (None, None, Some(global), None)
+            }
+            SchedulerKind::GlobalVD => {
+                let global_vd = Arc::new(GEDFVDScheduler::new(
+                    PriorityTable::from_fn(|priority| {
+                        Arc::new(ingress_input_rxs[priority].clone())
+                    }),
+                    edf_output_txs.clone(),
+                ));
+                (None, None, None, Some(global_vd))
             }
         };
         let egress_drr = Arc::new(EgressDRRScheduler::new(edf_output_rxs.clone()));
@@ -276,6 +302,8 @@ impl Pipeline {
             ingress_drr: ingress_drr.clone(),
             edf_single: edf_single.clone(),
             edf_multi: edf_multi.clone(),
+            edf_global: edf_global.clone(),
+            edf_global_vd: edf_global_vd.clone(),
             egress_drr,
             metrics_collector,
             metrics_receiver: metrics_rx,
@@ -462,6 +490,46 @@ impl Pipeline {
                     &worker_cores,
                 );
             }
+            SchedulerKind::Global => {
+                let scheduler = self
+                    .edf_global
+                    .as_ref()
+                    .expect("global EDF scheduler must be present")
+                    .clone();
+                let running_global = self.running.clone();
+                let worker_cores = if self.config.cores.edf_workers.is_empty() {
+                    vec![self.config.cores.edf_dispatcher]
+                } else {
+                    self.config.cores.edf_workers.clone()
+                };
+                scheduler.spawn_threads(
+                    running_global,
+                    set_thread_priority,
+                    set_thread_core,
+                    self.config.cores.edf_dispatcher,
+                    &worker_cores,
+                );
+            }
+            SchedulerKind::GlobalVD => {
+                let scheduler = self
+                    .edf_global_vd
+                    .as_ref()
+                    .expect("GEDF-VD scheduler must be present")
+                    .clone();
+                let running_global = self.running.clone();
+                let worker_cores = if self.config.cores.edf_workers.is_empty() {
+                    vec![self.config.cores.edf_dispatcher]
+                } else {
+                    self.config.cores.edf_workers.clone()
+                };
+                scheduler.spawn_threads(
+                    running_global,
+                    set_thread_priority,
+                    set_thread_core,
+                    self.config.cores.edf_dispatcher,
+                    &worker_cores,
+                );
+            }
         }
 
         // Start EgressDRRScheduler (reads from priority queues, writes to UDP sockets)
@@ -509,6 +577,8 @@ impl Pipeline {
         let ingress_drr_for_drops = self.ingress_drr_for_drops.clone();
         let edf_single_for_drops = self.edf_single.clone();
         let edf_multi_for_drops = self.edf_multi.clone();
+        let edf_global_for_drops = self.edf_global.clone();
+        let edf_global_vd_for_drops = self.edf_global_vd.clone();
         let scheduler_kind = self.scheduler_kind;
         let stats_core = self.config.cores.egress;
         std::thread::Builder::new()
@@ -536,6 +606,14 @@ impl Pipeline {
                             SchedulerKind::MultiWorker => edf_multi_for_drops
                                 .as_ref()
                                 .expect("multi EDF should exist")
+                                .get_drop_counts(),
+                            SchedulerKind::Global => edf_global_for_drops
+                                .as_ref()
+                                .expect("global EDF should exist")
+                                .get_drop_counts(),
+                            SchedulerKind::GlobalVD => edf_global_vd_for_drops
+                                .as_ref()
+                                .expect("GEDF-VD should exist")
                                 .get_drop_counts(),
                         };
                         if let Some(multi) = edf_multi_for_drops.as_ref() {

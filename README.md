@@ -70,6 +70,22 @@ Rust 1.74+ is recommended. Linux and macOS are fully supported; macOS ignores CP
 cargo run --release
 ```
 
+Available scheduler strategies:
+
+```bash
+# Single-thread EDF (default)
+cargo run --release -- --scheduler single
+
+# Multi-worker EDF with adaptive balancing
+cargo run --release -- --scheduler multi
+
+# Global EDF (G-EDF) with shared run queue
+cargo run --release -- --scheduler gedf
+
+# Global EDF with Virtual Deadlines (G-EDF-VD)
+cargo run --release -- --scheduler gedf-vd
+```
+
 The binary:
 - Binds UDP inputs on `127.0.0.1:{8080,8081,8082}` for High/Medium/Low classes.
 - Emits processed packets to `127.0.0.1:{9080,9081,9082}`.
@@ -87,7 +103,7 @@ If the port is omitted the default `9999` is used, e.g. `--metrics-host=metrics.
 ### GUI Client
 Launch the egui dashboard after the pipeline is running:
 ```bash
-cargo run --release --bin gui -- --server metrics.myhost:9999
+cargo run --release --features gui --bin gui -- --server metrics.myhost:9999
 ```
 
 Omit `--server` to default to `127.0.0.1:9999`. The GUI subscribes to the metrics stream and visualizes latency percentiles, deadline misses, queue occupancy, and drop counters. A legend highlights ingress versus EDF drop sources on the plots.

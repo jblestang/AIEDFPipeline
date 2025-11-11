@@ -119,7 +119,7 @@ impl CompletionRouter {
     }
 }
 
-fn processing_duration(packet: &Packet) -> Duration {
+pub(crate) fn processing_duration(packet: &Packet) -> Duration {
     // Base duration tuned for 0.05 ms when payload <= 200B and up to ~0.15 ms at MTU.
     let base_ms = 0.05;
     let extra_ms = if packet.len() > 200 {

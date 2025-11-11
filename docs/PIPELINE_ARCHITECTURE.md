@@ -104,10 +104,18 @@ The multi-worker EDF scheduler uses an adaptive controller that keeps latency bu
 - **Processing-time EMA** – every worker feeds its observed processing duration back into a per-priority exponential moving average (default decay `7/8 ↔ 1/8`).
 - **Capacity estimation** – every 100 ms we estimate the safe backlog per priority via `target ≈ 0.9 × budget / avg_processing`, clamped between 1 and 512 packets.
 - **Quota distribution** – High priority is anchored on Worker 0, with small spillover allowances on workers 1 and 2. Medium and Low are split across their eligible workers with hard caps (e.g. Medium ≤160 per worker, Low ≤192).
-- **Guard tuning** – the same pass adjusts guard thresholds (how long Medium/Low wait for a late High arrival) and the guard slice width; High always preempts immediately, whereas Medium only guards while the High backlog is empty.
+- **Guard tuning** – Medium/Low guard windows are capped at roughly 80 µs. High always preempts immediately, whereas Medium only guards while the local High backlog is empty.
 - **Dynamic atomics** – all limits/thresholds live in atomics so workers read them lock-free each loop. A dedicated `EDF-AutoBalance` thread rewrites the atomics every 100 ms based on the latest EMA and queue depth.
 
 This feedback loop keeps High P50 close to the processing floor while capping P99 under the configured 1 ms budget even under bursty load.
+
+## Scheduler Options
+- **Single** – classic single-thread EDF (default).
+- **MultiWorker** – adaptive per-priority workers with local quotas.
+- **Global (G-EDF)** – shared run queue serviced by multiple workers; the earliest deadline across all priorities always wins.
+- **Global VD (G-EDF-VD)** – global EDF with per-priority virtual deadlines (High keeps real deadlines, lower priorities are tightened) to reduce deadline misses for critical traffic.
+
+Select the strategy at runtime via `--scheduler single|multi|gedf|gedf-vd`.
 
 ## License & Compliance
 - All networking remains on localhost UDP.
