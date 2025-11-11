@@ -3,10 +3,18 @@
 //! A single Tokio runtime polls non-blocking UDP sockets, applies packet-count based DRR, and
 //! forwards packets into per-priority bounded channels destined for the EDF processor.
 
+use crate::buffer_pool;
 use crate::drr_scheduler::{Packet, Priority, PriorityTable, MAX_PACKET_SIZE};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::UdpSocket as StdUdpSocket;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "ios"
+))]
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -184,18 +192,17 @@ impl IngressDRRScheduler {
                         break;
                     }
 
-                    // Non-blocking read from UDP socket.
-                    let mut local_buf = [0u8; MAX_PACKET_SIZE];
-                    match socket.recv_from(&mut local_buf) {
+                    // Non-blocking read from UDP socket using a pooled buffer sized to the datagram.
+                    let expected = datagram_size_hint(&socket);
+                    let mut lease = buffer_pool::lease(expected);
+                    match socket.recv_from(lease.as_mut_slice()) {
                         Ok((size, _addr)) if size > 0 => {
                             local_deficit = local_deficit.saturating_sub(1);
 
                             // Materialise packet (including timestamp used for EDF deadlines).
-                            let packet = Packet::new(
-                                priority,
-                                &local_buf[..size],
-                                flow_state.latency_budget,
-                            );
+                            let buffer = lease.freeze(size);
+                            let packet =
+                                Packet::from_buffer(priority, buffer, flow_state.latency_budget);
 
                             let tx = &self.priority_queues[priority];
 
@@ -209,13 +216,18 @@ impl IngressDRRScheduler {
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             // No data for this flow yet.
+                            drop(lease);
                             break;
                         }
                         Err(_) => {
                             // Socket error; skip to next flow.
+                            drop(lease);
                             break;
                         }
-                        _ => break,
+                        _ => {
+                            // Unexpected zero-byte packet or error, simply move on.
+                            break;
+                        }
                     }
                 }
 
@@ -235,6 +247,40 @@ impl IngressDRRScheduler {
 
         Ok(())
     }
+}
+
+fn datagram_size_hint(socket: &StdUdpSocket) -> usize {
+    match socket_bytes_available(socket) {
+        Ok(available) if available > 0 => available,
+        _ => MAX_PACKET_SIZE,
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "ios"
+))]
+fn socket_bytes_available(socket: &StdUdpSocket) -> std::io::Result<usize> {
+    let fd = socket.as_raw_fd();
+    let mut bytes: libc::c_int = 0;
+    let ret = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut bytes) };
+    if ret == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(bytes.max(0) as usize)
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "ios"
+)))]
+fn socket_bytes_available(_socket: &StdUdpSocket) -> std::io::Result<usize> {
+    Ok(MAX_PACKET_SIZE)
 }
 
 #[cfg(test)]

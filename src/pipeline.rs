@@ -102,7 +102,7 @@ impl Default for IngressSchedulerConfig {
     fn default() -> Self {
         Self {
             quantums: PriorityTable::from_fn(|priority| match priority {
-                Priority::High => 32,
+                Priority::High => 64,
                 Priority::Medium => 8,
                 Priority::Low | Priority::BestEffort => 1,
             }),

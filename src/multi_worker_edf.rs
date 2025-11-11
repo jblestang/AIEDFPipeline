@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+// Worker 0: strictly HIGH, Worker 1: HIGH+MED, Worker 2: HIGH+MED+LOW+BE.
 const WORKER_ASSIGNMENTS: [&[Priority]; 3] = [
     &[Priority::High],
     &[Priority::High, Priority::Medium],
@@ -19,25 +20,32 @@ const WORKER_ASSIGNMENTS: [&[Priority]; 3] = [
     ],
 ];
 
-const HIGH_GUARD_DURATION: Duration = Duration::from_millis(2);
+// Maximum time slice spent waiting for a late-arriving HIGH packet before re-evaluating.
+const HIGH_GUARD_MAX_SLICE: Duration = Duration::from_micros(10);
 
+// Per-worker admission ceilings. We intentionally keep worker 0 very small to act as an
+// aggressive front-line drain for high-priority bursts. Worker 1 is the bulk medium handler,
+// while worker 2 has wider limits because it absorbs the remaining backlog (including BE).
 fn worker_total_limit(worker_id: usize) -> usize {
     match worker_id {
-        0 => 4,
-        1 => 58,
-        _ => 192 - 6,
+        0 => 16,
+        1 => 64,
+        _ => 256,
     }
 }
 
+// Fine-grained per-priority caps. By lowering HIGH quotas on workers 1 and 2 we ensure worker 0
+// still participates and that MED/LOW loads cannot push HIGH completely out of the local heap.
+// (The TOTAL limit is checked together with this table in push_with_capacity.)
 fn worker_priority_limit(worker_id: usize, priority: Priority) -> usize {
     match worker_id {
         0 => match priority {
-            Priority::High => 4,
+            Priority::High => 16,
             _ => 0,
         },
         1 => match priority {
             Priority::High => 4,
-            Priority::Medium => 56,
+            Priority::Medium => 60,
             _ => 0,
         },
         _ => match priority {
@@ -149,10 +157,11 @@ impl CompletionRouter {
 }
 
 fn processing_duration(packet: &Packet) -> Duration {
-    let base_ms = 0.1;
+    // Base duration tuned for 0.05 ms when payload <= 200B and up to ~0.15 ms at MTU.
+    let base_ms = 0.05;
     let extra_ms = if packet.len() > 200 {
         let clamped = packet.len().min(1500);
-        0.2 * ((clamped - 200) as f64 / 1300.0)
+        0.1 * ((clamped - 200) as f64 / 1300.0)
     } else {
         0.0
     };
@@ -167,11 +176,13 @@ fn push_with_capacity(
     total_limit: usize,
     item: ScheduledItem,
 ) -> bool {
+    // Reject immediately if this worker is not allowed to run the packet's priority.
     let priority = item.work_item.priority;
     let limit_for_priority = per_priority_limit[priority];
     if limit_for_priority == 0 {
         return false;
     }
+    // We also enforce the global per-worker backlog ceiling to avoid runaway heaps.
     if *total_count >= total_limit || counts[priority] >= limit_for_priority {
         return false;
     }
@@ -343,18 +354,19 @@ fn run_worker(
         }
     }
 
+    // Each worker maintains its own min-deadline heap (BinaryHeap with reversed ordering).
     let mut heap: BinaryHeap<ScheduledItem> = BinaryHeap::new();
+    // counts => number of packets enqueued for each priority inside the worker heap.
     let mut counts = PriorityTable::from_fn(|_| 0usize);
+    // total_count => total packets currently admitted for that worker.
     let mut total_count = 0usize;
     let total_limit = worker_total_limit(worker_id);
     let per_priority_limit =
         PriorityTable::from_fn(|priority| worker_priority_limit(worker_id, priority));
 
     while running.load(AtomicOrdering::Relaxed) {
-        // Pull packets from the assigned input queues. For each candidate packet we:
-        //   • compute its absolute deadline
-        //   • convert it into a work item (with the monotonic sequence id)
-        //   • push it into the heap, accounting against the per-priority quotas
+        // 1) Drain all eligible input queues while respecting per-priority + global quotas.
+        //    Each admitted packet receives an EDF deadline and is inserted into the heap.
         for &priority in &priorities {
             loop {
                 if counts[priority] >= per_priority_limit[priority] || total_count >= total_limit {
@@ -391,7 +403,7 @@ fn run_worker(
         // Update backlog so metrics/GUI can display per-worker queue depth.
         backlog.store(total_count, AtomicOrdering::Relaxed);
 
-        // Select the earliest-deadline work item. If none exist, yield and retry.
+        // 2) Select the earliest-deadline item. Empty heap => worker idles (yields).
         let mut scheduled = match heap.pop() {
             Some(item) => item,
             None => {
@@ -405,9 +417,9 @@ fn run_worker(
         total_count -= 1;
         shared_priority_counters[initial_priority].fetch_sub(1, AtomicOrdering::Relaxed);
 
-        // If this worker services High priority flows, admit any newly arrived High packets.
-        // This keeps the worst-case latency bounded by avoiding an extra processing quantum
-        // when a more urgent packet shows up while we're spinning on the current job.
+        // 3) Immediate preemption opportunity: before spinning, check for freshly-arrived HIGH
+        //    packets. This minimizes the extra latency a burst incurs (they can displace the
+        //    current job instantly instead of waiting for the busy loop to complete).
         if priorities.contains(&Priority::High) {
             loop {
                 if counts[Priority::High] >= per_priority_limit[Priority::High]
@@ -465,60 +477,91 @@ fn run_worker(
             }
         }
 
-        // If we're about to run a Medium/Low job, briefly wait for a late High packet.
-        if initial_priority != Priority::High && priorities.contains(&Priority::High) {
-            let guard_start = Instant::now();
-            while guard_start.elapsed() < HIGH_GUARD_DURATION {
-                if counts[Priority::High] >= per_priority_limit[Priority::High]
-                    || total_count >= total_limit
-                {
-                    break;
-                }
-                match input_queues[Priority::High].try_recv() {
-                    Ok(packet) => {
-                        let deadline = packet.timestamp + packet.latency_budget;
-                        let work_item = completion.prepare(Priority::High, packet, deadline);
+        // 4) Guard window based on "deadline aging": limit short waits to Medium/Low packets that are
+        //    still early in their latency budget. This keeps HIGH latency tails low without stalling
+        //    classes that are already close to their own deadline.
+        if priorities.contains(&Priority::High) {
+            let packet = &scheduled.work_item.packet;
+            let elapsed = Instant::now().saturating_duration_since(packet.timestamp);
+            if let Some(guard_threshold) =
+                guard_threshold_for(scheduled.work_item.priority, packet.latency_budget)
+            {
+                if elapsed < guard_threshold {
+                    let mut current_elapsed = elapsed;
+                    'guard: while current_elapsed < guard_threshold {
+                        let remaining_guard = guard_threshold
+                            .checked_sub(current_elapsed)
+                            .unwrap_or_default();
+                        if remaining_guard.is_zero() {
+                            break;
+                        }
+                        let guard_window = remaining_guard.min(HIGH_GUARD_MAX_SLICE);
+                        let guard_deadline = Instant::now() + guard_window;
+                        while Instant::now() < guard_deadline {
+                            if counts[Priority::High] >= per_priority_limit[Priority::High]
+                                || total_count >= total_limit
+                            {
+                                break;
+                            }
+                            match input_queues[Priority::High].try_recv() {
+                                Ok(packet) => {
+                                    let deadline = packet.timestamp + packet.latency_budget;
+                                    let work_item =
+                                        completion.prepare(Priority::High, packet, deadline);
 
-                        // Put the lower-priority job back and switch to High.
-                        let requeued_priority = initial_priority;
-                        let requeued = push_with_capacity(
-                            &mut heap,
-                            &mut counts,
-                            &mut total_count,
-                            &per_priority_limit,
-                            total_limit,
-                            scheduled,
-                        );
-                        debug_assert!(requeued, "failed to requeue guarded packet");
-                        shared_priority_counters[requeued_priority]
-                            .fetch_add(1, AtomicOrdering::Relaxed);
+                                    let requeued_priority = initial_priority;
+                                    let requeued = push_with_capacity(
+                                        &mut heap,
+                                        &mut counts,
+                                        &mut total_count,
+                                        &per_priority_limit,
+                                        total_limit,
+                                        scheduled,
+                                    );
+                                    debug_assert!(requeued, "failed to requeue guarded packet");
+                                    shared_priority_counters[requeued_priority]
+                                        .fetch_add(1, AtomicOrdering::Relaxed);
 
-                        scheduled = ScheduledItem {
-                            deadline,
-                            work_item,
-                        };
-                        // scheduled_priority = Priority::High; // This line is removed
-                        break;
+                                    scheduled = ScheduledItem {
+                                        deadline,
+                                        work_item,
+                                    };
+                                    break 'guard;
+                                }
+                                Err(TryRecvError::Empty) => std::hint::spin_loop(),
+                                Err(TryRecvError::Disconnected) => break 'guard,
+                            }
+                        }
+                        current_elapsed =
+                            Instant::now().saturating_duration_since(packet.timestamp);
+                        if current_elapsed >= guard_threshold {
+                            break;
+                        }
                     }
-                    Err(TryRecvError::Empty) => {
-                        std::hint::spin_loop();
-                    }
-                    Err(TryRecvError::Disconnected) => break,
                 }
             }
         }
 
-        // Busy-wait for the configured processing time to simulate work.
+        // 5) Simulate the CPU work (busy wait). In production this would be real compute.
         let processing_time = processing_duration(&scheduled.work_item.packet);
         let start = Instant::now();
         while start.elapsed() < processing_time {
             std::hint::spin_loop();
         }
 
-        // Finally, hand the packet to the completion router so it can be emitted
-        // in-order via the output queue.
+        // 6) Emit the packet through the completion router. Sequence tracking guarantees
+        //    per-priority FIFO order even though multiple workers run in parallel.
         completion.complete(scheduled.work_item);
     }
 
     backlog.store(0, AtomicOrdering::Relaxed);
+}
+
+fn guard_threshold_for(priority: Priority, latency_budget: Duration) -> Option<Duration> {
+    match priority {
+        Priority::High => None,
+        Priority::Medium => Some(latency_budget.mul_f64(0.05).min(Duration::from_micros(150))),
+        Priority::Low => Some(latency_budget.mul_f64(0.02).min(Duration::from_micros(150))),
+        Priority::BestEffort => None,
+    }
 }

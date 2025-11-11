@@ -4,6 +4,7 @@
 //! [`Packet`] representation that flows between stages, and the [`PriorityTable`] helper that
 //! keeps APIs stable when new priority classes are introduced.
 
+use crate::buffer_pool::{lease, BufferHandle};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::{Index, IndexMut};
@@ -95,7 +96,7 @@ pub struct Packet {
     #[cfg_attr(not(test), allow(dead_code))]
     pub flow_id: u64,
     pub id: u64,
-    data: [u8; MAX_PACKET_SIZE],
+    buffer: BufferHandle,
     len: usize,
     pub timestamp: Instant,
     pub latency_budget: Duration,
@@ -106,63 +107,43 @@ impl Packet {
     /// Create a packet while ensuring the flow/priorities are consistent.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(priority: Priority, payload: &[u8], latency_budget: Duration) -> Packet {
-        let mut data = [0u8; MAX_PACKET_SIZE];
         let len = payload.len().min(MAX_PACKET_SIZE);
-        data[..len].copy_from_slice(&payload[..len]);
+        let mut lease = lease(len);
+        lease.as_mut_slice()[..len].copy_from_slice(&payload[..len]);
+        let buffer = lease.freeze(len);
         Packet {
             flow_id: priority.flow_id(),
             id: PACKET_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             priority,
             timestamp: Instant::now(),
             latency_budget,
-            data,
             len,
+            buffer,
         }
     }
 
-    /// Create a packet from a pre-allocated buffer.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn with_buffer(
-        priority: Priority,
-        data: [u8; MAX_PACKET_SIZE],
-        len: usize,
-        latency_budget: Duration,
-    ) -> Packet {
-        let len = len.min(MAX_PACKET_SIZE);
-        Packet {
-            flow_id: priority.flow_id(),
-            id: PACKET_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-            priority,
-            timestamp: Instant::now(),
-            latency_budget,
-            data,
-            len,
-        }
-    }
-
-    /// Create a packet from a pre-allocated buffer.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Instantiate a packet directly from a pooled buffer.
     pub fn from_buffer(
         priority: Priority,
-        buf: [u8; MAX_PACKET_SIZE],
-        len: usize,
+        buffer: BufferHandle,
         latency_budget: Duration,
     ) -> Packet {
-        let len = len.min(MAX_PACKET_SIZE);
+        let len = buffer.len().min(MAX_PACKET_SIZE);
         Packet {
             flow_id: priority.flow_id(),
             id: PACKET_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             priority,
             timestamp: Instant::now(),
             latency_budget,
-            data: buf,
             len,
+            buffer,
         }
     }
 
     /// Borrow the payload as a slice.
     pub fn payload(&self) -> &[u8] {
-        &self.data[..self.len]
+        let slice = self.buffer.as_slice();
+        &slice[..self.len.min(slice.len())]
     }
 
     /// Current payload length.
@@ -283,6 +264,7 @@ mod tests {
         let p = Packet::new(Priority::Medium, &[1, 2, 3], Duration::from_millis(10));
         assert_eq!(p.priority, Priority::Medium);
         assert_eq!(p.flow_id, Priority::Medium.flow_id());
+        assert_eq!(p.payload(), &[1, 2, 3]);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 // The binary creates a Tokio runtime, instantiates the pipeline with default configuration, starts
 // the metrics TCP server, and keeps the pipeline alive until Ctrl+C is received.
 
+mod buffer_pool;
 mod drr_scheduler;
 mod edf_scheduler;
 mod egress_drr;
