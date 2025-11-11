@@ -2,7 +2,7 @@ use crate::drr_scheduler::{Packet, Priority, PriorityTable};
 use crate::edf_scheduler::EDFDropCounters;
 use crossbeam_channel::{self, Receiver, Sender, TryRecvError};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,8 +18,35 @@ const WORKER_ASSIGNMENTS: [&[Priority]; 3] = [
         Priority::BestEffort,
     ],
 ];
-const WORKER_LOCAL_CAPACITY: usize = 32;
-const WORKER_OVERFLOW_CAPACITY: usize = 256;
+const WORKER_LOCAL_CAPACITY: usize = 256;
+
+fn worker_total_limit(worker_id: usize) -> usize {
+    match worker_id {
+        0 => 7,
+        1 => 16,
+        _ => 16,
+    }
+}
+
+fn worker_priority_limit(worker_id: usize, priority: Priority) -> usize {
+    match worker_id {
+        0 => match priority {
+            Priority::High => 7,
+            _ => 0,
+        },
+        1 => match priority {
+            Priority::High => 3,
+            Priority::Medium => 13,
+            _ => 0,
+        },
+        _ => match priority {
+            Priority::High => 3,
+            Priority::Medium => 3,
+            Priority::Low => 10,
+            Priority::BestEffort => 0,
+        },
+    }
+}
 
 #[derive(Clone)]
 struct WorkItem {
@@ -133,25 +160,26 @@ fn processing_duration(packet: &Packet) -> Duration {
 
 fn push_with_capacity(
     heap: &mut BinaryHeap<ScheduledItem>,
-    overflow: &mut VecDeque<ScheduledItem>,
+    counts: &mut PriorityTable<usize>,
+    total_count: &mut usize,
+    per_priority_limit: &PriorityTable<usize>,
+    total_limit: usize,
     item: ScheduledItem,
-) {
-    if heap.len() < WORKER_LOCAL_CAPACITY {
-        heap.push(item);
-    } else if let Some(worst_deadline) = heap.peek().map(|worst| worst.deadline) {
-        if item.deadline < worst_deadline {
-            if let Some(worst_item) = heap.pop() {
-                if overflow.len() < WORKER_OVERFLOW_CAPACITY {
-                    overflow.push_back(worst_item);
-                }
-            }
-            heap.push(item);
-        } else if overflow.len() < WORKER_OVERFLOW_CAPACITY {
-            overflow.push_back(item);
-        }
-    } else {
-        heap.push(item);
+) -> bool {
+    let priority = item.work_item.priority;
+    let limit_for_priority = per_priority_limit[priority];
+    if limit_for_priority == 0 {
+        return false;
     }
+    if *total_count >= total_limit || counts[priority] >= limit_for_priority {
+        return false;
+    }
+
+    heap.push(item);
+
+    counts[priority] += 1;
+    *total_count += 1;
+    true
 }
 
 #[derive(Clone)]
@@ -289,37 +317,36 @@ fn run_worker(
     }
 
     let mut heap: BinaryHeap<ScheduledItem> = BinaryHeap::new();
-    let mut overflow: VecDeque<ScheduledItem> = VecDeque::new();
+    let mut counts = PriorityTable::from_fn(|_| 0usize);
+    let mut total_count = 0usize;
+    let total_limit = worker_total_limit(worker_id);
+    let per_priority_limit =
+        PriorityTable::from_fn(|priority| worker_priority_limit(worker_id, priority));
 
     while running.load(AtomicOrdering::Relaxed) {
-        // First, try to refill the primary heap with any items we previously overflowed.
-        // This ensures older work is reconsidered as soon as there is capacity.
-        while heap.len() < WORKER_LOCAL_CAPACITY {
-            if let Some(item) = overflow.pop_front() {
-                heap.push(item);
-            } else {
-                break;
-            }
-        }
-
         // Pull packets from the assigned input queues. For each candidate packet we:
         //   • compute its absolute deadline
         //   • convert it into a work item (with the monotonic sequence id)
-        //   • push it into the heap, possibly demoting the worst-deadline item to overflow
+        //   • push it into the heap, accounting against the per-priority quotas
         for &priority in &priorities {
             loop {
                 match input_queues[priority].try_recv() {
                     Ok(packet) => {
                         let deadline = packet.timestamp + packet.latency_budget;
                         let work_item = completion.prepare(priority, packet, deadline);
-                        push_with_capacity(
+                        if !push_with_capacity(
                             &mut heap,
-                            &mut overflow,
+                            &mut counts,
+                            &mut total_count,
+                            &per_priority_limit,
+                            total_limit,
                             ScheduledItem {
                                 deadline,
                                 work_item,
                             },
-                        );
+                        ) {
+                            break;
+                        }
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => break,
@@ -328,7 +355,7 @@ fn run_worker(
         }
 
         // Update backlog so metrics/GUI can display per-worker queue depth.
-        backlog.store(heap.len() + overflow.len(), AtomicOrdering::Relaxed);
+        backlog.store(total_count, AtomicOrdering::Relaxed);
 
         // Select the earliest-deadline work item. If none exist, yield and retry.
         let mut scheduled = match heap.pop() {
@@ -338,34 +365,49 @@ fn run_worker(
                 continue;
             }
         };
+        debug_assert!(counts[scheduled.work_item.priority] > 0);
+        counts[scheduled.work_item.priority] -= 1;
+        total_count -= 1;
 
-        // Before we process the selected packet, we allow for immediate preemption:
-        // we scan the queues again and if a newly-arrived packet has an earlier deadline,
-        // we push the current packet back (via push_with_capacity) and promote the newer work.
+        // Before we process the selected packet, allow newly-arrived packets with earlier
+        // deadlines to preempt. We keep polling as long as quotas permit us to admit work.
         let mut preempted = false;
         for &priority in &priorities {
-            while heap.len() < WORKER_LOCAL_CAPACITY {
+            loop {
                 match input_queues[priority].try_recv() {
                     Ok(packet) => {
                         let deadline = packet.timestamp + packet.latency_budget;
                         let work_item = completion.prepare(priority, packet, deadline);
                         if deadline < scheduled.deadline {
-                            push_with_capacity(&mut heap, &mut overflow, scheduled);
+                            // The new packet is more urgent; requeue our current selection and
+                            // promote the new work item.
+                            let pushed = push_with_capacity(
+                                &mut heap,
+                                &mut counts,
+                                &mut total_count,
+                                &per_priority_limit,
+                                total_limit,
+                                scheduled,
+                            );
+                            debug_assert!(pushed, "failed to requeue preempted packet");
                             scheduled = ScheduledItem {
                                 deadline,
                                 work_item,
                             };
                             preempted = true;
                             break;
-                        } else {
-                            push_with_capacity(
-                                &mut heap,
-                                &mut overflow,
-                                ScheduledItem {
-                                    deadline,
-                                    work_item,
-                                },
-                            );
+                        } else if !push_with_capacity(
+                            &mut heap,
+                            &mut counts,
+                            &mut total_count,
+                            &per_priority_limit,
+                            total_limit,
+                            ScheduledItem {
+                                deadline,
+                                work_item,
+                            },
+                        ) {
+                            break;
                         }
                     }
                     Err(TryRecvError::Empty) => break,
@@ -377,8 +419,8 @@ fn run_worker(
             }
         }
 
-        // Backlog after preemption check (includes overflow) for visibility.
-        backlog.store(heap.len() + overflow.len(), AtomicOrdering::Relaxed);
+        // Backlog after preemption phase for visibility.
+        backlog.store(total_count, AtomicOrdering::Relaxed);
 
         // Busy-wait for the configured processing time to simulate work.
         let processing_time = processing_duration(&scheduled.work_item.packet);
