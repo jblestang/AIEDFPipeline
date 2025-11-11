@@ -1,5 +1,5 @@
-use crate::drr_scheduler::Priority;
 use crate::metrics::MetricsSnapshot;
+use crate::priority::Priority;
 use crossbeam_channel::Receiver;
 use eframe::egui;
 use egui::scroll_area::ScrollBarVisibility;

@@ -3,9 +3,9 @@ use crossbeam_channel::unbounded;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aiedf_pipeline::drr_scheduler::{DRRScheduler, Packet, PriorityTable};
-use aiedf_pipeline::edf_scheduler::EDFScheduler;
+use aiedf_pipeline::drr_scheduler::{Packet, PriorityTable};
 use aiedf_pipeline::queue::Queue;
+use aiedf_pipeline::scheduler::edf::EDFScheduler;
 
 fn bench_drr_scheduler(c: &mut Criterion) {
     let mut group = c.benchmark_group("drr_scheduler");

@@ -3,17 +3,15 @@
 
 pub mod buffer_pool;
 pub mod drr_scheduler;
-pub mod edf_scheduler;
-pub mod egress_drr;
-pub mod gedf_scheduler;
-pub mod gedf_vd_scheduler;
 #[cfg(feature = "gui")]
 pub mod gui;
-pub mod ingress_drr;
 pub mod metrics;
-pub mod multi_worker_edf;
+pub mod packet;
 pub mod pipeline;
+pub mod priority;
 pub mod queue;
+pub mod scheduler;
+pub mod threading;
 
 // Re-export for easier testing
 pub use pipeline::{

@@ -3,7 +3,7 @@
 //! The main pipeline uses per-priority crossbeam channels directly, but some tests and metrics
 //! helpers still reference this minimal queue abstraction. It remains for backwards compatibility.
 
-use crate::drr_scheduler::Packet;
+use crate::packet::Packet;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::sync::Arc;
 
@@ -85,7 +85,8 @@ impl Default for Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drr_scheduler::Packet;
+    use crate::packet::Packet;
+    use crate::priority::Priority;
     use std::time::Duration;
 
     #[test]
@@ -98,11 +99,7 @@ mod tests {
     fn test_queue_send_recv() {
         let queue = Queue::new();
 
-        let packet = Packet::new(
-            crate::drr_scheduler::Priority::High,
-            &[1, 2, 3],
-            Duration::from_millis(1),
-        );
+        let packet = Packet::new(Priority::High, &[1, 2, 3], Duration::from_millis(1));
 
         queue.send(packet.clone()).unwrap();
         assert!(!queue.is_empty());

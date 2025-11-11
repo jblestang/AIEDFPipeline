@@ -5,15 +5,13 @@
 
 mod buffer_pool;
 mod drr_scheduler;
-mod edf_scheduler;
-mod egress_drr;
-mod gedf_scheduler;
-mod gedf_vd_scheduler;
-mod ingress_drr;
 mod metrics;
-mod multi_worker_edf;
+mod packet;
 mod pipeline;
+mod priority;
 mod queue;
+mod scheduler;
+mod threading;
 
 use pipeline::{Pipeline, PipelineConfig, SchedulerKind};
 use std::sync::atomic::AtomicBool;

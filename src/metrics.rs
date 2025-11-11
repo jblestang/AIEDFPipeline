@@ -4,8 +4,8 @@
 //! lock-free channel and aggregates statistics on the best-effort core before broadcasting them to
 //! GUI subscribers.
 
-use crate::drr_scheduler::{Priority, PriorityTable};
-use crate::multi_worker_edf::MultiWorkerStats;
+use crate::priority::{Priority, PriorityTable};
+use crate::scheduler::multi_worker_edf::MultiWorkerStats;
 use crossbeam_channel::{self, Sender};
 use parking_lot::Mutex;
 use std::cell::RefCell;
