@@ -2,7 +2,7 @@ use crate::drr_scheduler::{Packet, Priority, PriorityTable};
 use crate::edf_scheduler::EDFDropCounters;
 use crossbeam_channel::{self, Receiver, Sender, TryRecvError};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,7 +18,8 @@ const WORKER_ASSIGNMENTS: [&[Priority]; 3] = [
         Priority::BestEffort,
     ],
 ];
-const WORKER_LOCAL_CAPACITY: usize = 1;
+const WORKER_LOCAL_CAPACITY: usize = 32;
+const WORKER_OVERFLOW_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 struct WorkItem {
@@ -128,6 +129,29 @@ fn processing_duration(packet: &Packet) -> Duration {
         0.0
     };
     Duration::from_secs_f64((base_ms + extra_ms) / 1000.0)
+}
+
+fn push_with_capacity(
+    heap: &mut BinaryHeap<ScheduledItem>,
+    overflow: &mut VecDeque<ScheduledItem>,
+    item: ScheduledItem,
+) {
+    if heap.len() < WORKER_LOCAL_CAPACITY {
+        heap.push(item);
+    } else if let Some(worst_deadline) = heap.peek().map(|worst| worst.deadline) {
+        if item.deadline < worst_deadline {
+            if let Some(worst_item) = heap.pop() {
+                if overflow.len() < WORKER_OVERFLOW_CAPACITY {
+                    overflow.push_back(worst_item);
+                }
+            }
+            heap.push(item);
+        } else if overflow.len() < WORKER_OVERFLOW_CAPACITY {
+            overflow.push_back(item);
+        }
+    } else {
+        heap.push(item);
+    }
 }
 
 #[derive(Clone)]
@@ -265,20 +289,17 @@ fn run_worker(
     }
 
     let mut heap: BinaryHeap<ScheduledItem> = BinaryHeap::new();
-
-    let push_with_capacity = |heap: &mut BinaryHeap<ScheduledItem>, item: ScheduledItem| {
-        if heap.len() >= WORKER_LOCAL_CAPACITY {
-            if let Some(worst) = heap.peek() {
-                if item.deadline >= worst.deadline {
-                    return;
-                }
-            }
-            heap.pop();
-        }
-        heap.push(item);
-    };
+    let mut overflow: VecDeque<ScheduledItem> = VecDeque::new();
 
     while running.load(AtomicOrdering::Relaxed) {
+        while heap.len() < WORKER_LOCAL_CAPACITY {
+            if let Some(item) = overflow.pop_front() {
+                heap.push(item);
+            } else {
+                break;
+            }
+        }
+
         for &priority in &priorities {
             loop {
                 match input_queues[priority].try_recv() {
@@ -287,6 +308,7 @@ fn run_worker(
                         let work_item = completion.prepare(priority, packet, deadline);
                         push_with_capacity(
                             &mut heap,
+                            &mut overflow,
                             ScheduledItem {
                                 deadline,
                                 work_item,
@@ -299,7 +321,7 @@ fn run_worker(
             }
         }
 
-        backlog.store(heap.len(), AtomicOrdering::Relaxed);
+        backlog.store(heap.len() + overflow.len(), AtomicOrdering::Relaxed);
 
         let mut scheduled = match heap.pop() {
             Some(item) => item,
@@ -317,7 +339,7 @@ fn run_worker(
                         let deadline = packet.timestamp + packet.latency_budget;
                         let work_item = completion.prepare(priority, packet, deadline);
                         if deadline < scheduled.deadline {
-                            push_with_capacity(&mut heap, scheduled);
+                            push_with_capacity(&mut heap, &mut overflow, scheduled);
                             scheduled = ScheduledItem {
                                 deadline,
                                 work_item,
@@ -327,6 +349,7 @@ fn run_worker(
                         } else {
                             push_with_capacity(
                                 &mut heap,
+                                &mut overflow,
                                 ScheduledItem {
                                     deadline,
                                     work_item,
@@ -343,7 +366,7 @@ fn run_worker(
             }
         }
 
-        backlog.store(heap.len(), AtomicOrdering::Relaxed);
+        backlog.store(heap.len() + overflow.len(), AtomicOrdering::Relaxed);
 
         let processing_time = processing_duration(&scheduled.work_item.packet);
         let start = Instant::now();
