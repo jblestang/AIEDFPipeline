@@ -161,7 +161,6 @@ fn push_with_capacity(
 struct ScheduledItem {
     deadline: Instant,
     work_item: WorkItem,
-    estimated_ns: u64,
 }
 
 impl PartialEq for ScheduledItem {
@@ -184,17 +183,12 @@ impl Ord for ScheduledItem {
     }
 }
 
-/// Adaptive load balancer that continuously tunes worker quotas and guard timings.
-///
-/// The controller keeps per-priority, exponentially-smoothed processing times and writes new queue
-/// limits into atomics every 100 ms. Workers read these atomics lock-free on each iteration.
 struct AdaptiveController {
     worker_total_limits: Vec<AtomicUsize>,
     worker_priority_limits: Vec<PriorityTable<AtomicUsize>>,
     guard_slice_us: AtomicU64,
     guard_threshold_us: PriorityTable<AtomicU64>,
     processing_ema_ns: PriorityTable<AtomicU64>,
-    heap_work_ns: Vec<AtomicU64>,
 }
 
 impl AdaptiveController {
@@ -228,8 +222,8 @@ impl AdaptiveController {
             }),
         ];
         let guard_threshold_us = PriorityTable::from_fn(|priority| match priority {
-            Priority::Medium => AtomicU64::new(150),
-            Priority::Low => AtomicU64::new(150),
+            Priority::Medium => AtomicU64::new(80),
+            Priority::Low => AtomicU64::new(80),
             _ => AtomicU64::new(0),
         });
         let processing_ema_ns = PriorityTable::from_fn(|priority| {
@@ -247,10 +241,6 @@ impl AdaptiveController {
             guard_slice_us: AtomicU64::new(10),
             guard_threshold_us,
             processing_ema_ns,
-            heap_work_ns: WORKER_ASSIGNMENTS
-                .iter()
-                .map(|_| AtomicU64::new(0))
-                .collect(),
         }
     }
 
@@ -318,25 +308,6 @@ impl AdaptiveController {
         self.processing_ema_ns[priority]
             .load(AtomicOrdering::Relaxed)
             .max(1)
-    }
-
-    fn add_heap_work(&self, worker_id: usize, amount_ns: u64) {
-        self.heap_work_ns[worker_id].fetch_add(amount_ns, AtomicOrdering::Relaxed);
-    }
-
-    fn sub_heap_work(&self, worker_id: usize, amount_ns: u64) {
-        self.heap_work_ns[worker_id]
-            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |prev| {
-                let updated = prev.saturating_sub(amount_ns);
-                Some(updated)
-            })
-            .ok();
-    }
-
-    fn current_heap_work_ns(&self, worker_id: usize) -> u64 {
-        self.heap_work_ns[worker_id]
-            .load(AtomicOrdering::Relaxed)
-            .max(0)
     }
 
     /// Background loop that reshapes worker quotas based on recent processing times.
@@ -432,7 +403,7 @@ impl AdaptiveController {
 
                         let guard_us = ((avg_ns / 1_000).saturating_mul(2))
                             .min((budget_ns / 1_000).max(1))
-                            .min(150);
+                            .min(80);
                         self.set_guard_threshold_us(priority, guard_us);
                         guard_slice_candidates.push((priority, guard_us));
                     }
@@ -442,7 +413,7 @@ impl AdaptiveController {
                         new_totals[2] += low;
                         let guard_us = ((avg_ns / 1_000).saturating_mul(2))
                             .min((budget_ns / 1_000).max(1))
-                            .min(150);
+                            .min(80);
                         self.set_guard_threshold_us(priority, guard_us);
                         guard_slice_candidates.push((priority, guard_us));
                     }
@@ -658,30 +629,19 @@ fn run_worker(
                 match input_queues[priority].try_recv() {
                     Ok(packet) => {
                         let deadline = packet.timestamp + packet.latency_budget;
-                        let work_estimate_ns = processing_duration(&packet).as_nanos() as u64;
-                        let heap_work_ns = controller.current_heap_work_ns(worker_id);
-                        let projected_finish = Instant::now()
-                            + Duration::from_nanos(heap_work_ns.saturating_add(work_estimate_ns));
-                        if projected_finish > deadline {
-                            // Drop immediately when we know the deadline cannot be met.
-                            continue;
-                        }
                         let work_item = completion.prepare(priority, packet, deadline);
-                        let scheduled_item = ScheduledItem {
-                            deadline,
-                            work_item,
-                            estimated_ns: work_estimate_ns,
-                        };
                         let pushed = push_with_capacity(
                             &mut heap,
                             &mut counts,
                             &mut total_count,
                             &per_priority_limit,
                             total_limit,
-                            scheduled_item,
+                            ScheduledItem {
+                                deadline,
+                                work_item,
+                            },
                         );
                         if pushed {
-                            controller.add_heap_work(worker_id, work_estimate_ns);
                             shared_priority_counters[priority]
                                 .fetch_add(1, AtomicOrdering::Relaxed);
                         } else {
@@ -710,7 +670,6 @@ fn run_worker(
         counts[initial_priority] -= 1;
         total_count -= 1;
         shared_priority_counters[initial_priority].fetch_sub(1, AtomicOrdering::Relaxed);
-        controller.sub_heap_work(worker_id, scheduled.estimated_ns);
 
         // 3) Immediate preemption opportunity: before spinning, check for freshly-arrived HIGH
         //    packets. This minimizes the extra latency a burst incurs (they can displace the
@@ -727,13 +686,11 @@ fn run_worker(
                 match input_queues[Priority::High].try_recv() {
                     Ok(packet) => {
                         let deadline = packet.timestamp + packet.latency_budget;
-                        let estimated_ns = processing_duration(&packet).as_nanos() as u64;
                         let work_item = completion.prepare(Priority::High, packet, deadline);
 
                         if deadline < scheduled.deadline {
                             // Requeue the current job and run the more urgent packet instead.
                             let requeued_priority = initial_priority;
-                            let prev_est_ns = scheduled.estimated_ns;
                             let requeued = push_with_capacity(
                                 &mut heap,
                                 &mut counts,
@@ -743,31 +700,25 @@ fn run_worker(
                                 scheduled,
                             );
                             debug_assert!(requeued, "failed to requeue preempted packet");
-                            controller.add_heap_work(worker_id, prev_est_ns);
                             shared_priority_counters[requeued_priority]
                                 .fetch_add(1, AtomicOrdering::Relaxed);
 
                             scheduled = ScheduledItem {
                                 deadline,
                                 work_item,
-                                estimated_ns,
                             };
-                            // scheduled_priority = Priority::High; // This line is removed
                         } else {
-                            let new_item = ScheduledItem {
-                                deadline,
-                                work_item,
-                                estimated_ns,
-                            };
                             if push_with_capacity(
                                 &mut heap,
                                 &mut counts,
                                 &mut total_count,
                                 &per_priority_limit,
                                 total_limit,
-                                new_item,
+                                ScheduledItem {
+                                    deadline,
+                                    work_item,
+                                },
                             ) {
-                                controller.add_heap_work(worker_id, estimated_ns);
                                 shared_priority_counters[Priority::High]
                                     .fetch_add(1, AtomicOrdering::Relaxed);
                             } else {
@@ -810,13 +761,10 @@ fn run_worker(
                             match input_queues[Priority::High].try_recv() {
                                 Ok(packet) => {
                                     let deadline = packet.timestamp + packet.latency_budget;
-                                    let estimated_ns =
-                                        processing_duration(&packet).as_nanos() as u64;
                                     let work_item =
                                         completion.prepare(Priority::High, packet, deadline);
 
                                     let requeued_priority = initial_priority;
-                                    let prev_est_ns = scheduled.estimated_ns;
                                     let requeued = push_with_capacity(
                                         &mut heap,
                                         &mut counts,
@@ -826,14 +774,12 @@ fn run_worker(
                                         scheduled,
                                     );
                                     debug_assert!(requeued, "failed to requeue guarded packet");
-                                    controller.add_heap_work(worker_id, prev_est_ns);
                                     shared_priority_counters[requeued_priority]
                                         .fetch_add(1, AtomicOrdering::Relaxed);
 
                                     scheduled = ScheduledItem {
                                         deadline,
                                         work_item,
-                                        estimated_ns,
                                     };
                                     break 'guard;
                                 }

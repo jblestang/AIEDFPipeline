@@ -5,6 +5,7 @@ pub mod buffer_pool;
 pub mod drr_scheduler;
 pub mod edf_scheduler;
 pub mod egress_drr;
+#[cfg(feature = "gui")]
 pub mod gui;
 pub mod ingress_drr;
 pub mod metrics;

@@ -38,20 +38,11 @@ higher payload sizes or additional CPU load).
    - Low traffic is confined to worker 2 (cap 192).
    - Best Effort receives a fixed 128-packet cushion for metrics/logging workloads.
 
-3. **Guard tuning** – Medium and Low guard windows are recomputed from the same EMA. High traffic
-   always preempts immediately; Medium guards are skipped altogether when the local High backlog is
-   non-zero.
+3. **Guard tuning** – Medium and Low guard windows are recomputed from the same EMA and capped at ~80 µs.
+   High traffic always preempts immediately; Medium guards are skipped altogether when the local High backlog is non-zero.
 
 4. **Atomic update** – total/priority quotas and guard parameters are written to atomics so worker
    threads read them without locking.
-
-## Admission Checks
-
-Workers consult the current quota before admitting new packets. Beyond the quota check, each worker
-predicts the completion time of the candidate packet using the EMA plus the queued work; if the
-projected finish would violate the latency budget the packet is dropped immediately instead of
-sitting in the heap. Since the controller updates frequently, the system converges quickly after
-load swings.
 
 ## Extensibility
 

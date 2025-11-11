@@ -87,10 +87,10 @@ If the port is omitted the default `9999` is used, e.g. `--metrics-host=metrics.
 ### GUI Client
 Launch the egui dashboard after the pipeline is running:
 ```bash
-cargo run --release --bin gui
+cargo run --release --bin gui -- --server metrics.myhost:9999
 ```
 
-The GUI subscribes to the metrics stream and visualizes latency percentiles, deadline misses, queue occupancy, and drop counters. A legend highlights ingress versus EDF drop sources on the plots.
+Omit `--server` to default to `127.0.0.1:9999`. The GUI subscribes to the metrics stream and visualizes latency percentiles, deadline misses, queue occupancy, and drop counters. A legend highlights ingress versus EDF drop sources on the plots.
 
 > Replace `docs/gui-dashboard.png` with an actual screenshot and keep the reference below for convenience.
 
