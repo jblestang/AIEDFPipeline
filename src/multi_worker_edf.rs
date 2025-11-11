@@ -292,6 +292,8 @@ fn run_worker(
     let mut overflow: VecDeque<ScheduledItem> = VecDeque::new();
 
     while running.load(AtomicOrdering::Relaxed) {
+        // First, try to refill the primary heap with any items we previously overflowed.
+        // This ensures older work is reconsidered as soon as there is capacity.
         while heap.len() < WORKER_LOCAL_CAPACITY {
             if let Some(item) = overflow.pop_front() {
                 heap.push(item);
@@ -300,6 +302,10 @@ fn run_worker(
             }
         }
 
+        // Pull packets from the assigned input queues. For each candidate packet we:
+        //   • compute its absolute deadline
+        //   • convert it into a work item (with the monotonic sequence id)
+        //   • push it into the heap, possibly demoting the worst-deadline item to overflow
         for &priority in &priorities {
             loop {
                 match input_queues[priority].try_recv() {
@@ -321,8 +327,10 @@ fn run_worker(
             }
         }
 
+        // Update backlog so metrics/GUI can display per-worker queue depth.
         backlog.store(heap.len() + overflow.len(), AtomicOrdering::Relaxed);
 
+        // Select the earliest-deadline work item. If none exist, yield and retry.
         let mut scheduled = match heap.pop() {
             Some(item) => item,
             None => {
@@ -331,6 +339,9 @@ fn run_worker(
             }
         };
 
+        // Before we process the selected packet, we allow for immediate preemption:
+        // we scan the queues again and if a newly-arrived packet has an earlier deadline,
+        // we push the current packet back (via push_with_capacity) and promote the newer work.
         let mut preempted = false;
         for &priority in &priorities {
             while heap.len() < WORKER_LOCAL_CAPACITY {
@@ -366,14 +377,18 @@ fn run_worker(
             }
         }
 
+        // Backlog after preemption check (includes overflow) for visibility.
         backlog.store(heap.len() + overflow.len(), AtomicOrdering::Relaxed);
 
+        // Busy-wait for the configured processing time to simulate work.
         let processing_time = processing_duration(&scheduled.work_item.packet);
         let start = Instant::now();
         while start.elapsed() < processing_time {
             std::hint::spin_loop();
         }
 
+        // Finally, hand the packet to the completion router so it can be emitted
+        // in-order via the output queue.
         completion.complete(scheduled.work_item);
     }
 
