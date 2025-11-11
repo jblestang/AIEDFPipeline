@@ -18,7 +18,7 @@ const WORKER_ASSIGNMENTS: [&[Priority]; 3] = [
         Priority::BestEffort,
     ],
 ];
-const WORKER_LOCAL_CAPACITY: usize = 4;
+const WORKER_LOCAL_CAPACITY: usize = 1;
 
 #[derive(Clone)]
 struct WorkItem {
@@ -266,27 +266,32 @@ fn run_worker(
 
     let mut heap: BinaryHeap<ScheduledItem> = BinaryHeap::new();
 
+    let push_with_capacity = |heap: &mut BinaryHeap<ScheduledItem>, item: ScheduledItem| {
+        if heap.len() >= WORKER_LOCAL_CAPACITY {
+            if let Some(worst) = heap.peek() {
+                if item.deadline >= worst.deadline {
+                    return;
+                }
+            }
+            heap.pop();
+        }
+        heap.push(item);
+    };
+
     while running.load(AtomicOrdering::Relaxed) {
         for &priority in &priorities {
             loop {
                 match input_queues[priority].try_recv() {
                     Ok(packet) => {
                         let deadline = packet.timestamp + packet.latency_budget;
-                        if heap.len() >= WORKER_LOCAL_CAPACITY {
-                            if let Some(worst) = heap.peek() {
-                                if deadline >= worst.deadline {
-                                    // Put packet back and stop pulling from this priority for now.
-                                    // Since crossbeam channels don't support un-receive, we drop it and rely on upstream retry.
-                                    break;
-                                }
-                            }
-                            heap.pop();
-                        }
                         let work_item = completion.prepare(priority, packet, deadline);
-                        heap.push(ScheduledItem {
-                            deadline,
-                            work_item,
-                        });
+                        push_with_capacity(
+                            &mut heap,
+                            ScheduledItem {
+                                deadline,
+                                work_item,
+                            },
+                        );
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => break,
@@ -296,10 +301,49 @@ fn run_worker(
 
         backlog.store(heap.len(), AtomicOrdering::Relaxed);
 
-        let Some(scheduled) = heap.pop() else {
-            thread::yield_now();
-            continue;
+        let mut scheduled = match heap.pop() {
+            Some(item) => item,
+            None => {
+                thread::yield_now();
+                continue;
+            }
         };
+
+        let mut preempted = false;
+        for &priority in &priorities {
+            while heap.len() < WORKER_LOCAL_CAPACITY {
+                match input_queues[priority].try_recv() {
+                    Ok(packet) => {
+                        let deadline = packet.timestamp + packet.latency_budget;
+                        let work_item = completion.prepare(priority, packet, deadline);
+                        if deadline < scheduled.deadline {
+                            push_with_capacity(&mut heap, scheduled);
+                            scheduled = ScheduledItem {
+                                deadline,
+                                work_item,
+                            };
+                            preempted = true;
+                            break;
+                        } else {
+                            push_with_capacity(
+                                &mut heap,
+                                ScheduledItem {
+                                    deadline,
+                                    work_item,
+                                },
+                            );
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+            if preempted {
+                break;
+            }
+        }
+
+        backlog.store(heap.len(), AtomicOrdering::Relaxed);
 
         let processing_time = processing_duration(&scheduled.work_item.packet);
         let start = Instant::now();
