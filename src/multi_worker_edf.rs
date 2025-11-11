@@ -19,27 +19,29 @@ const WORKER_ASSIGNMENTS: [&[Priority]; 3] = [
     ],
 ];
 
+const HIGH_GUARD_DURATION: Duration = Duration::from_millis(2);
+
 fn worker_total_limit(worker_id: usize) -> usize {
     match worker_id {
-        0 => 8,
-        1 => 64,
-        _ => 192,
+        0 => 4,
+        1 => 58,
+        _ => 192 - 6,
     }
 }
 
 fn worker_priority_limit(worker_id: usize, priority: Priority) -> usize {
     match worker_id {
         0 => match priority {
-            Priority::High => 8,
+            Priority::High => 4,
             _ => 0,
         },
         1 => match priority {
-            Priority::High => 8,
+            Priority::High => 4,
             Priority::Medium => 56,
             _ => 0,
         },
         _ => match priority {
-            Priority::High => 8,
+            Priority::High => 4,
             Priority::Medium => 56,
             Priority::Low => 64,
             Priority::BestEffort => 128,
@@ -390,18 +392,121 @@ fn run_worker(
         backlog.store(total_count, AtomicOrdering::Relaxed);
 
         // Select the earliest-deadline work item. If none exist, yield and retry.
-        let scheduled = match heap.pop() {
+        let mut scheduled = match heap.pop() {
             Some(item) => item,
             None => {
                 thread::yield_now();
                 continue;
             }
         };
-        debug_assert!(counts[scheduled.work_item.priority] > 0);
-        counts[scheduled.work_item.priority] -= 1;
+        let initial_priority = scheduled.work_item.priority;
+        debug_assert!(counts[initial_priority] > 0);
+        counts[initial_priority] -= 1;
         total_count -= 1;
-        shared_priority_counters[scheduled.work_item.priority]
-            .fetch_sub(1, AtomicOrdering::Relaxed);
+        shared_priority_counters[initial_priority].fetch_sub(1, AtomicOrdering::Relaxed);
+
+        // If this worker services High priority flows, admit any newly arrived High packets.
+        // This keeps the worst-case latency bounded by avoiding an extra processing quantum
+        // when a more urgent packet shows up while we're spinning on the current job.
+        if priorities.contains(&Priority::High) {
+            loop {
+                if counts[Priority::High] >= per_priority_limit[Priority::High]
+                    || total_count >= total_limit
+                {
+                    break;
+                }
+                match input_queues[Priority::High].try_recv() {
+                    Ok(packet) => {
+                        let deadline = packet.timestamp + packet.latency_budget;
+                        let work_item = completion.prepare(Priority::High, packet, deadline);
+
+                        if deadline < scheduled.deadline {
+                            // Requeue the current job and run the more urgent packet instead.
+                            let requeued_priority = initial_priority;
+                            let requeued = push_with_capacity(
+                                &mut heap,
+                                &mut counts,
+                                &mut total_count,
+                                &per_priority_limit,
+                                total_limit,
+                                scheduled,
+                            );
+                            debug_assert!(requeued, "failed to requeue preempted packet");
+                            shared_priority_counters[requeued_priority]
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+
+                            scheduled = ScheduledItem {
+                                deadline,
+                                work_item,
+                            };
+                            // scheduled_priority = Priority::High; // This line is removed
+                        } else {
+                            if push_with_capacity(
+                                &mut heap,
+                                &mut counts,
+                                &mut total_count,
+                                &per_priority_limit,
+                                total_limit,
+                                ScheduledItem {
+                                    deadline,
+                                    work_item,
+                                },
+                            ) {
+                                shared_priority_counters[Priority::High]
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+
+        // If we're about to run a Medium/Low job, briefly wait for a late High packet.
+        if initial_priority != Priority::High && priorities.contains(&Priority::High) {
+            let guard_start = Instant::now();
+            while guard_start.elapsed() < HIGH_GUARD_DURATION {
+                if counts[Priority::High] >= per_priority_limit[Priority::High]
+                    || total_count >= total_limit
+                {
+                    break;
+                }
+                match input_queues[Priority::High].try_recv() {
+                    Ok(packet) => {
+                        let deadline = packet.timestamp + packet.latency_budget;
+                        let work_item = completion.prepare(Priority::High, packet, deadline);
+
+                        // Put the lower-priority job back and switch to High.
+                        let requeued_priority = initial_priority;
+                        let requeued = push_with_capacity(
+                            &mut heap,
+                            &mut counts,
+                            &mut total_count,
+                            &per_priority_limit,
+                            total_limit,
+                            scheduled,
+                        );
+                        debug_assert!(requeued, "failed to requeue guarded packet");
+                        shared_priority_counters[requeued_priority]
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+
+                        scheduled = ScheduledItem {
+                            deadline,
+                            work_item,
+                        };
+                        // scheduled_priority = Priority::High; // This line is removed
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        std::hint::spin_loop();
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+        }
 
         // Busy-wait for the configured processing time to simulate work.
         let processing_time = processing_duration(&scheduled.work_item.packet);
