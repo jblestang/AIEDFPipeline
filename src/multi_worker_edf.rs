@@ -18,32 +18,31 @@ const WORKER_ASSIGNMENTS: [&[Priority]; 3] = [
         Priority::BestEffort,
     ],
 ];
-const WORKER_LOCAL_CAPACITY: usize = 256;
 
 fn worker_total_limit(worker_id: usize) -> usize {
     match worker_id {
-        0 => 7,
-        1 => 16,
-        _ => 16,
+        0 => 8,
+        1 => 64,
+        _ => 192,
     }
 }
 
 fn worker_priority_limit(worker_id: usize, priority: Priority) -> usize {
     match worker_id {
         0 => match priority {
-            Priority::High => 7,
+            Priority::High => 8,
             _ => 0,
         },
         1 => match priority {
-            Priority::High => 3,
-            Priority::Medium => 13,
+            Priority::High => 8,
+            Priority::Medium => 56,
             _ => 0,
         },
         _ => match priority {
-            Priority::High => 3,
-            Priority::Medium => 3,
-            Priority::Low => 10,
-            Priority::BestEffort => 0,
+            Priority::High => 8,
+            Priority::Medium => 56,
+            Priority::Low => 64,
+            Priority::BestEffort => 128,
         },
     }
 }
@@ -212,13 +211,15 @@ pub struct MultiWorkerScheduler {
     input_queues: PriorityTable<Arc<Receiver<Packet>>>,
     completion: Arc<CompletionRouter>,
     worker_backlogs: Vec<Arc<AtomicUsize>>,
+    worker_priority_counters: Vec<PriorityTable<Arc<AtomicUsize>>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MultiWorkerStats {
     pub worker_queue_depths: Vec<usize>,
-    pub worker_queue_capacity: usize,
+    pub worker_queue_capacities: Vec<usize>,
     pub dispatcher_backlog: usize,
+    pub worker_priority_depths: Vec<Vec<usize>>,
 }
 
 impl MultiWorkerScheduler {
@@ -230,11 +231,16 @@ impl MultiWorkerScheduler {
             .iter()
             .map(|_| Arc::new(AtomicUsize::new(0)))
             .collect();
+        let worker_priority_counters = WORKER_ASSIGNMENTS
+            .iter()
+            .map(|_| PriorityTable::from_fn(|_| Arc::new(AtomicUsize::new(0))))
+            .collect();
 
         Self {
             input_queues,
             completion: Arc::new(CompletionRouter::new(output_queues)),
             worker_backlogs,
+            worker_priority_counters,
         }
     }
 
@@ -257,6 +263,9 @@ impl MultiWorkerScheduler {
             let running_clone = running.clone();
             let backlog = self.worker_backlogs[worker_id].clone();
             let priorities: Vec<Priority> = assignments.to_vec();
+            let priority_counters = PriorityTable::from_fn(|priority| {
+                self.worker_priority_counters[worker_id][priority].clone()
+            });
             let core_id = core_list[worker_id % core_list.len()];
             thread::Builder::new()
                 .name(format!("EDF-Worker-{}", worker_id))
@@ -270,6 +279,7 @@ impl MultiWorkerScheduler {
                         completion,
                         running_clone,
                         backlog,
+                        priority_counters,
                     );
                 })
                 .expect("failed to spawn EDF worker thread");
@@ -290,8 +300,22 @@ impl MultiWorkerScheduler {
                 .iter()
                 .map(|depth| depth.load(AtomicOrdering::Relaxed))
                 .collect(),
-            worker_queue_capacity: WORKER_LOCAL_CAPACITY,
+            worker_queue_capacities: WORKER_ASSIGNMENTS
+                .iter()
+                .enumerate()
+                .map(|(worker_id, _)| worker_total_limit(worker_id))
+                .collect(),
             dispatcher_backlog: 0,
+            worker_priority_depths: self
+                .worker_priority_counters
+                .iter()
+                .map(|table| {
+                    Priority::ALL
+                        .iter()
+                        .map(|priority| table[*priority].load(AtomicOrdering::Relaxed))
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
         }
     }
 }
@@ -303,6 +327,7 @@ fn run_worker(
     completion: Arc<CompletionRouter>,
     running: Arc<AtomicBool>,
     backlog: Arc<AtomicUsize>,
+    shared_priority_counters: PriorityTable<Arc<AtomicUsize>>,
 ) {
     let name = format!("EDF-Worker-{}", worker_id);
     if let Ok(name_cstr) = std::ffi::CString::new(name.clone()) {
@@ -330,11 +355,14 @@ fn run_worker(
         //   • push it into the heap, accounting against the per-priority quotas
         for &priority in &priorities {
             loop {
+                if counts[priority] >= per_priority_limit[priority] || total_count >= total_limit {
+                    break;
+                }
                 match input_queues[priority].try_recv() {
                     Ok(packet) => {
                         let deadline = packet.timestamp + packet.latency_budget;
                         let work_item = completion.prepare(priority, packet, deadline);
-                        if !push_with_capacity(
+                        let pushed = push_with_capacity(
                             &mut heap,
                             &mut counts,
                             &mut total_count,
@@ -344,7 +372,11 @@ fn run_worker(
                                 deadline,
                                 work_item,
                             },
-                        ) {
+                        );
+                        if pushed {
+                            shared_priority_counters[priority]
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        } else {
                             break;
                         }
                     }
@@ -358,7 +390,7 @@ fn run_worker(
         backlog.store(total_count, AtomicOrdering::Relaxed);
 
         // Select the earliest-deadline work item. If none exist, yield and retry.
-        let mut scheduled = match heap.pop() {
+        let scheduled = match heap.pop() {
             Some(item) => item,
             None => {
                 thread::yield_now();
@@ -368,59 +400,8 @@ fn run_worker(
         debug_assert!(counts[scheduled.work_item.priority] > 0);
         counts[scheduled.work_item.priority] -= 1;
         total_count -= 1;
-
-        // Before we process the selected packet, allow newly-arrived packets with earlier
-        // deadlines to preempt. We keep polling as long as quotas permit us to admit work.
-        let mut preempted = false;
-        for &priority in &priorities {
-            loop {
-                match input_queues[priority].try_recv() {
-                    Ok(packet) => {
-                        let deadline = packet.timestamp + packet.latency_budget;
-                        let work_item = completion.prepare(priority, packet, deadline);
-                        if deadline < scheduled.deadline {
-                            // The new packet is more urgent; requeue our current selection and
-                            // promote the new work item.
-                            let pushed = push_with_capacity(
-                                &mut heap,
-                                &mut counts,
-                                &mut total_count,
-                                &per_priority_limit,
-                                total_limit,
-                                scheduled,
-                            );
-                            debug_assert!(pushed, "failed to requeue preempted packet");
-                            scheduled = ScheduledItem {
-                                deadline,
-                                work_item,
-                            };
-                            preempted = true;
-                            break;
-                        } else if !push_with_capacity(
-                            &mut heap,
-                            &mut counts,
-                            &mut total_count,
-                            &per_priority_limit,
-                            total_limit,
-                            ScheduledItem {
-                                deadline,
-                                work_item,
-                            },
-                        ) {
-                            break;
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break,
-                }
-            }
-            if preempted {
-                break;
-            }
-        }
-
-        // Backlog after preemption phase for visibility.
-        backlog.store(total_count, AtomicOrdering::Relaxed);
+        shared_priority_counters[scheduled.work_item.priority]
+            .fetch_sub(1, AtomicOrdering::Relaxed);
 
         // Busy-wait for the configured processing time to simulate work.
         let processing_time = processing_duration(&scheduled.work_item.packet);

@@ -310,10 +310,12 @@ pub struct MetricsSnapshot {
     pub queue2_capacity: usize,
     #[serde(default = "default_worker_depths")]
     pub worker_queue_depths: Vec<usize>,
-    #[serde(default)]
-    pub worker_queue_capacity: usize,
+    #[serde(default = "default_worker_depths")]
+    pub worker_queue_capacities: Vec<usize>,
     #[serde(default)]
     pub dispatcher_backlog: usize,
+    #[serde(default = "default_worker_priority_depths")]
+    pub worker_priority_depths: Vec<Vec<usize>>,
     // Packet drop metrics (per flow, aggregated from all drop points)
     #[serde(default = "default_zero_u64")]
     pub ingress_drops: u64, // Drops at IngressDRR → Input Queue
@@ -336,10 +338,12 @@ pub struct MetricsSnapshot {
 pub struct WorkerLoadSnapshot {
     #[serde(default = "default_worker_depths")]
     pub worker_queue_depths: Vec<usize>,
-    #[serde(default)]
-    pub worker_queue_capacity: usize,
+    #[serde(default = "default_worker_depths")]
+    pub worker_queue_capacities: Vec<usize>,
     #[serde(default)]
     pub dispatcher_backlog: usize,
+    #[serde(default = "default_worker_priority_depths")]
+    pub worker_priority_depths: Vec<Vec<usize>>,
 }
 
 fn default_instant() -> Instant {
@@ -359,6 +363,10 @@ fn default_zero_u64() -> u64 {
 }
 
 fn default_worker_depths() -> Vec<usize> {
+    Vec::new()
+}
+
+fn default_worker_priority_depths() -> Vec<Vec<usize>> {
     Vec::new()
 }
 
@@ -507,8 +515,9 @@ impl MetricsCollector {
         let mut guard = self.worker_stats.lock();
         *guard = stats.map(|s| WorkerLoadSnapshot {
             worker_queue_depths: s.worker_queue_depths,
-            worker_queue_capacity: s.worker_queue_capacity,
+            worker_queue_capacities: s.worker_queue_capacities,
             dispatcher_backlog: s.dispatcher_backlog,
+            worker_priority_depths: s.worker_priority_depths,
         });
     }
 
@@ -575,14 +584,18 @@ impl MetricsCollector {
                         .as_ref()
                         .map(|s| s.worker_queue_depths.clone())
                         .unwrap_or_default(),
-                    worker_queue_capacity: worker_stats_snapshot
+                    worker_queue_capacities: worker_stats_snapshot
                         .as_ref()
-                        .map(|s| s.worker_queue_capacity)
-                        .unwrap_or(0),
+                        .map(|s| s.worker_queue_capacities.clone())
+                        .unwrap_or_default(),
                     dispatcher_backlog: worker_stats_snapshot
                         .as_ref()
                         .map(|s| s.dispatcher_backlog)
                         .unwrap_or(0),
+                    worker_priority_depths: worker_stats_snapshot
+                        .as_ref()
+                        .map(|s| s.worker_priority_depths.clone())
+                        .unwrap_or_default(),
                     ingress_drops: ingress_drops_for_flow,
                     edf_heap_drops, // Shared across all flows
                     edf_output_drops: edf_output_drops_for_flow,
@@ -637,14 +650,18 @@ impl MetricsCollector {
                         .as_ref()
                         .map(|s| s.worker_queue_depths.clone())
                         .unwrap_or_default(),
-                    worker_queue_capacity: worker_stats_snapshot
+                    worker_queue_capacities: worker_stats_snapshot
                         .as_ref()
-                        .map(|s| s.worker_queue_capacity)
-                        .unwrap_or(0),
+                        .map(|s| s.worker_queue_capacities.clone())
+                        .unwrap_or_default(),
                     dispatcher_backlog: worker_stats_snapshot
                         .as_ref()
                         .map(|s| s.dispatcher_backlog)
                         .unwrap_or(0),
+                    worker_priority_depths: worker_stats_snapshot
+                        .as_ref()
+                        .map(|s| s.worker_priority_depths.clone())
+                        .unwrap_or_default(),
                     ingress_drops: 0,
                     edf_heap_drops: 0,
                     edf_output_drops: 0,

@@ -1,14 +1,75 @@
+use crate::drr_scheduler::Priority;
 use crate::metrics::MetricsSnapshot;
 use crossbeam_channel::Receiver;
 use eframe::egui;
 use egui::scroll_area::ScrollBarVisibility;
-use egui::widgets::ProgressBar;
+use egui::{pos2, Align2, Color32, CornerRadius, FontId, Rect, Stroke, StrokeKind, Vec2};
 use egui_plot::{Corner, Legend, Line, LineStyle, Plot, PlotPoints};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+fn priority_color(priority: Priority) -> Color32 {
+    match priority {
+        Priority::High => Color32::from_rgb(220, 50, 47), // red
+        Priority::Medium => Color32::from_rgb(203, 75, 22), // orange
+        Priority::Low => Color32::from_rgb(38, 139, 210), // blue
+        Priority::BestEffort => Color32::from_rgb(147, 161, 161), // gray
+    }
+}
+
+fn draw_worker_priority_bar(
+    ui: &mut egui::Ui,
+    _worker_idx: usize,
+    total_depth: usize,
+    priority_depths: &[usize],
+    capacity: usize,
+) {
+    let capacity = capacity.max(1);
+    let width = ui.available_width().min(400.0);
+    let height = 14.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, Color32::from_rgb(60, 60, 60));
+
+    let mut cursor = rect.left();
+    for (i, priority) in Priority::ALL.iter().enumerate() {
+        let depth = priority_depths.get(i).copied().unwrap_or(0);
+        if depth == 0 {
+            continue;
+        }
+        let fraction = (depth as f32 / capacity as f32).clamp(0.0, 1.0);
+        if fraction <= 0.0 {
+            continue;
+        }
+        let segment_width = rect.width() * fraction;
+        if segment_width < 0.5 {
+            continue;
+        }
+        let segment = Rect::from_min_size(
+            pos2(cursor, rect.top()),
+            Vec2::new(segment_width, rect.height()),
+        );
+        painter.rect_filled(segment, 2.0, priority_color(*priority));
+        cursor += segment_width;
+    }
+
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(2),
+        Stroke::new(1.0, Color32::from_gray(200)),
+        StrokeKind::Outside,
+    );
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        format!("{} / {}", total_depth, capacity),
+        FontId::proportional(11.0),
+        Color32::WHITE,
+    );
+}
 
 // Structure to track statistics over time
 #[derive(Clone)]
@@ -204,13 +265,22 @@ fn update_ui(
                             sample_snapshot.dispatcher_backlog
                         ));
                         for (idx, depth) in sample_snapshot.worker_queue_depths.iter().enumerate() {
-                            let capacity = sample_snapshot.worker_queue_capacity.max(1);
-                            let fraction = (*depth as f32 / capacity as f32).clamp(0.0, 1.0);
-                            let label = format!(
-                                "Worker {}: {}/{}",
-                                idx, depth, sample_snapshot.worker_queue_capacity
-                            );
-                            ui.add(ProgressBar::new(fraction).text(label));
+                            let capacity = sample_snapshot
+                                .worker_queue_capacities
+                                .get(idx)
+                                .copied()
+                                .unwrap_or(0);
+                            let priority_depths = sample_snapshot
+                                .worker_priority_depths
+                                .get(idx)
+                                .cloned()
+                                .unwrap_or_else(|| vec![0; Priority::ALL.len()]);
+                            ui.label(format!(
+                                "Worker {}: {} packets (capacity {})",
+                                idx, depth, capacity
+                            ));
+                            draw_worker_priority_bar(ui, idx, *depth, &priority_depths, capacity);
+                            ui.add_space(6.0);
                         }
                     }
                 }
@@ -745,13 +815,22 @@ fn update_ui_client(
                             sample_snapshot.dispatcher_backlog
                         ));
                         for (idx, depth) in sample_snapshot.worker_queue_depths.iter().enumerate() {
-                            let capacity = sample_snapshot.worker_queue_capacity.max(1);
-                            let fraction = (*depth as f32 / capacity as f32).clamp(0.0, 1.0);
-                            let label = format!(
-                                "Worker {}: {}/{}",
-                                idx, depth, sample_snapshot.worker_queue_capacity
-                            );
-                            ui.add(ProgressBar::new(fraction).text(label));
+                            let capacity = sample_snapshot
+                                .worker_queue_capacities
+                                .get(idx)
+                                .copied()
+                                .unwrap_or(0);
+                            let priority_depths = sample_snapshot
+                                .worker_priority_depths
+                                .get(idx)
+                                .cloned()
+                                .unwrap_or_else(|| vec![0; Priority::ALL.len()]);
+                            ui.label(format!(
+                                "Worker {}: {} packets (capacity {})",
+                                idx, depth, capacity
+                            ));
+                            draw_worker_priority_bar(ui, idx, *depth, &priority_depths, capacity);
+                            ui.add_space(6.0);
                         }
                     }
                 }
