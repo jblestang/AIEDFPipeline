@@ -20,6 +20,18 @@ fn priority_color(priority: Priority) -> Color32 {
     }
 }
 
+/// Convert flow_id (u64) to Priority for display purposes.
+/// This is a helper function to map legacy flow IDs to Priority enum values.
+fn flow_id_to_priority(flow_id: u64) -> Priority {
+    match flow_id {
+        1 => Priority::High,
+        2 => Priority::Medium,
+        3 => Priority::Low,
+        4 => Priority::BestEffort,
+        _ => Priority::BestEffort, // Fallback for unknown IDs
+    }
+}
+
 fn draw_worker_priority_bar(
     ui: &mut egui::Ui,
     _worker_idx: usize,
@@ -204,7 +216,7 @@ fn update_ui(
                 }
 
                 ui.horizontal(|ui| {
-                    ui.label("Flow ID");
+                    ui.label("Priority");
                     ui.label("Packets");
                     ui.label("Avg");
                     ui.label("Min");
@@ -223,8 +235,10 @@ fn update_ui(
 
                 for &flow_id in &flows {
                     let metrics = &latest_metrics[flow_id];
+                    // Convert flow_id to Priority for display
+                    let priority = flow_id_to_priority(*flow_id);
                     ui.horizontal(|ui| {
-                        ui.label(format!("{}", flow_id));
+                        ui.label(format!("{}", priority));
                         ui.label(format!("{}", metrics.packet_count));
                         // Display with microsecond precision when < 1ms, otherwise milliseconds
                         let avg_ms = metrics.avg_latency.as_secs_f64() * 1000.0;
@@ -638,12 +652,12 @@ pub fn run_gui_client(server_addr: &str, shutdown_flag: Arc<AtomicBool>) {
                                     match serde_json::from_str::<HashMap<u64, MetricsSnapshot>>(line.trim()) {
                                         Ok(metrics) => {
                                             let now = std::time::Instant::now();
-                                            // Set last_update to now for deserialized snapshots
+                                            // Process deserialized snapshots
                                             let mut updated_metrics = HashMap::new();
                                             let mut stats_guard = statistics_history_clone.lock().unwrap();
 
-                                            for (k, mut v) in metrics {
-                                                v.last_update = now;
+                                            for (k, v) in metrics {
+                                                // Note: MetricsSnapshot doesn't have last_update field
                                                 updated_metrics.insert(k, v.clone());
 
                                                 // Update statistics history
@@ -754,7 +768,7 @@ fn update_ui_client(
                 ui.separator();
 
                 ui.horizontal(|ui| {
-                    ui.label("Flow ID");
+                    ui.label("Priority");
                     ui.label("Packets");
                     ui.label("Avg");
                     ui.label("Min");
@@ -773,8 +787,10 @@ fn update_ui_client(
 
                 for &flow_id in &flows {
                     let metrics = &latest_metrics[flow_id];
+                    // Convert flow_id to Priority for display
+                    let priority = flow_id_to_priority(*flow_id);
                     ui.horizontal(|ui| {
-                        ui.label(format!("{}", flow_id));
+                        ui.label(format!("{}", priority));
                         ui.label(format!("{}", metrics.packet_count));
                         // Display with microsecond precision when < 1ms, otherwise milliseconds
                         let avg_ms = metrics.avg_latency.as_secs_f64() * 1000.0;

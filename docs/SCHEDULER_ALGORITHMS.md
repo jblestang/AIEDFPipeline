@@ -159,8 +159,8 @@ This document summarizes the scheduling strategies implemented in the project. E
 ## Global EDF with Virtual Deadlines (GEDF-VD)
 
 ### Role
-- Extends GEDF by scaling latency budgets to produce virtual deadlines for mid/low priorities, reducing starvation.
-- Lower priority tasks get an earlier virtual deadline (latency budget × scaling factor).
+- Extends GEDF by scaling latency budgets to produce virtual deadlines using an INVERTED variant that prioritizes high-priority tasks.
+- Higher priority tasks get earlier virtual deadlines (latency budget × scaling factor), strongly prioritizing them in the scheduling queue.
 
 ### Threading
 - Similar to `GEDFScheduler`: dispatcher plus worker threads.
@@ -179,8 +179,8 @@ This document summarizes the scheduling strategies implemented in the project. E
 - Same as GEDF.
 
 ### Unique Notes
-- Virtual deadlines ensure mediums/lows get more immediate slots (prevent extended starvation under heavy high priority).
-- Scaling factors currently: `High=1.0`, `Medium=0.75`, `Low=0.6`, `BestEffort=0.5`.
+- This is an INVERTED variant of GEDF-VD: high-priority tasks get the earliest virtual deadlines (smallest scaling factors), ensuring they are processed before lower-priority ones even when deadlines are similar.
+- Scaling factors currently: `High=0.05` (95% reduction, earliest), `Medium=0.6`, `Low=0.75`, `BestEffort=1.0` (latest).
 
 ---
 

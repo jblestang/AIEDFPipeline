@@ -2,17 +2,17 @@
 //!
 //! Implements a shared run-queue scheduler where tasks compete based on virtual deadlines derived
 //! from the original latency budget multiplied by a per-priority scaling factor. High priority
-//! tasks keep their original deadline, whereas lower priorities get a more pessimistic virtual
-//! deadline to mitigate deadline misses for critical traffic.
+//! tasks get the smallest scaling factor (earliest virtual deadlines), strongly prioritizing them
+//! in the scheduling queue.
 //!
 //! Algorithm:
 //! 1. Dispatcher: reads packets, calculates virtual deadlines (original deadline × scaling factor), pushes to shared queue
 //! 2. Workers: pop earliest-virtual-deadline tasks from shared queue, process them, forward to output queues
-//! 3. Virtual deadlines: High=1.0 (no scaling), Medium=0.75, Low=0.6, BestEffort=0.5
+//! 3. Virtual deadlines: High=0.05 (earliest), Medium=0.6, Low=0.75, BestEffort=1.0 (latest)
 //!
-//! Virtual deadlines give lower-priority tasks a "head start" in the scheduling queue, effectively
-//! making them appear more urgent than they actually are. This helps prevent high-priority tasks
-//! from starving lower-priority ones while still prioritizing urgent deadlines.
+//! Virtual deadlines give HIGH priority tasks the earliest virtual deadlines, making them appear
+//! more urgent in the scheduling queue. This strongly prioritizes high-priority tasks, ensuring
+//! they are processed before lower-priority ones even when deadlines are similar.
 
 // Import packet representation used throughout the pipeline
 use crate::packet::Packet;
@@ -47,8 +47,8 @@ use std::time::Instant;
 #[derive(Debug)]
 struct QueuedTask {
     /// Virtual deadline: timestamp + (latency_budget × scaling_factor)
-    /// Lower priorities have smaller scaling factors, making their virtual deadlines earlier
-    /// (giving them a "head start" in the scheduling queue)
+    /// HIGH priority has the smallest scaling factor (0.5), making its virtual deadlines earliest
+    /// (giving HIGH priority tasks a "head start" in the scheduling queue)
     virtual_deadline: Instant,
     /// Priority class of the packet (for routing to correct output queue)
     priority: Priority,
@@ -159,24 +159,24 @@ impl SharedQueue {
 ///
 /// Virtual deadlines are calculated as: `virtual_deadline = timestamp + (latency_budget × scaling_factor)`
 ///
-/// Scaling factors:
-/// - High: 1.0 (no scaling, uses original deadline)
-/// - Medium: 0.75 (25% reduction, virtual deadline is 75% of original)
-/// - Low: 0.6 (40% reduction, virtual deadline is 60% of original)
-/// - BestEffort: 0.5 (50% reduction, virtual deadline is 50% of original)
+/// Scaling factors (INVERTED to prioritize HIGH priority):
+/// - High: 0.05 (95% reduction, virtual deadline is 5% of original - EARLIEST)
+/// - Medium: 0.6 (40% reduction, virtual deadline is 60% of original)
+/// - Low: 0.75 (25% reduction, virtual deadline is 75% of original)
+/// - BestEffort: 1.0 (no scaling, uses original deadline - LATEST)
 ///
-/// Lower scaling factors make virtual deadlines earlier, giving lower-priority tasks a "head start"
-/// in the scheduling queue. This helps prevent high-priority tasks from starving lower-priority ones
-/// while still prioritizing truly urgent deadlines.
+/// Lower scaling factors make virtual deadlines earlier, giving HIGH priority tasks the earliest
+/// virtual deadlines. This strongly prioritizes high-priority tasks in the scheduling queue,
+/// ensuring they are processed before lower-priority ones even when deadlines are similar.
 ///
 /// # Returns
 /// A PriorityTable mapping each priority to its scaling factor
 fn scaling_table() -> PriorityTable<f64> {
     PriorityTable::from_fn(|priority| match priority {
-        Priority::High => 1.0, // No scaling: High priority uses original deadline
-        Priority::Medium => 0.75, // 25% reduction: Medium gets earlier virtual deadline
-        Priority::Low => 0.6, // 40% reduction: Low gets even earlier virtual deadline
-        Priority::BestEffort => 0.5, // 50% reduction: BestEffort gets earliest virtual deadline
+        Priority::High => 0.05, // 95% reduction: High gets earliest virtual deadline (strongest priority)
+        Priority::Medium => 0.6, // 40% reduction: Medium gets earlier virtual deadline
+        Priority::Low => 0.75, // 25% reduction: Low gets earlier virtual deadline
+        Priority::BestEffort => 1.0, // No scaling: BestEffort uses original deadline (lowest priority)
     })
 }
 
@@ -270,8 +270,9 @@ impl GEDFVDScheduler {
 /// 4. Pushes the task to the shared queue (wakes a waiting worker)
 /// 5. Yields if no packets were dispatched (prevents busy-waiting)
 ///
-/// Virtual deadlines give lower-priority tasks a "head start" by making their deadlines appear earlier,
-/// which helps prevent starvation while still prioritizing truly urgent deadlines.
+/// Virtual deadlines give HIGH priority tasks the earliest virtual deadlines (smallest scaling factor),
+/// strongly prioritizing them in the scheduling queue. This ensures high-priority tasks are processed
+/// before lower-priority ones even when deadlines are similar.
 ///
 /// # Arguments
 /// * `input_queues` - Per-priority input channels from ingress DRR
@@ -281,7 +282,7 @@ impl GEDFVDScheduler {
 fn dispatcher_loop(
     input_queues: PriorityTable<Arc<Receiver<Packet>>>, // Input channels per priority
     shared_queue: Arc<SharedQueue>, // Shared run queue (min-heap on virtual deadline)
-    scaling: PriorityTable<f64>, // Per-priority scaling factors (High=1.0, Medium=0.75, Low=0.6, BE=0.5)
+    scaling: PriorityTable<f64>, // Per-priority scaling factors (High=0.05, Medium=0.6, Low=0.75, BE=1.0) - INVERTED to prioritize HIGH
     running: Arc<AtomicBool>, // Shutdown flag (checked each iteration)
 ) {
     // Main dispatcher loop: continues until shutdown signal
@@ -301,7 +302,8 @@ fn dispatcher_loop(
                         .latency_budget
                         .mul_f64(scaling[priority].clamp(0.1, 1.0));
                     // Calculate virtual deadline: ingress timestamp + scaled latency budget
-                    // Lower priorities have smaller scaling factors, so their virtual deadlines are earlier
+                    // HIGHER priorities have smaller scaling factors (High=0.05, BE=1.0), so their virtual deadlines are earlier
+                    // This INVERTED variant prioritizes high-priority tasks by giving them the earliest virtual deadlines
                     let virtual_deadline = packet.timestamp + scaled;
                     // Push task to shared queue (wakes a waiting worker if queue was empty)
                     shared_queue.push(QueuedTask {

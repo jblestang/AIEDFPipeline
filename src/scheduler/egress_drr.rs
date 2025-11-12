@@ -159,10 +159,12 @@ impl EgressDRRScheduler {
                             let previous_id = last_ids[priority].load(Ordering::Relaxed); // Get last ID
                             if previous_id != u64::MAX && packet.id <= previous_id {
                                 // Out-of-order detected: log warning (shouldn't happen)
+                                /*
                                 eprintln!(
                                     "[egress] detected out-of-order packet for {:?}: current id {}, previous id {}",
                                     priority, packet.id, previous_id
                                 );
+                                */
                             }
                             // Update last seen ID (atomically, relaxed ordering is sufficient)
                             last_ids[priority].store(packet.id, Ordering::Relaxed);
