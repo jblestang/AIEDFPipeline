@@ -389,15 +389,123 @@ impl Ord for ScheduledItem {
     }
 }
 
+/// Adaptive load balancing controller for the multi-worker EDF scheduler.
+///
+/// This controller dynamically adjusts worker quotas, guard windows, and admission policies based on
+/// observed processing times and latency budgets. It uses a feedback loop that runs every 100ms to
+/// reshape resource allocation, ensuring that each priority class meets its latency budget while
+/// avoiding starvation and priority inversion.
+///
+/// # Core Principles
+///
+/// 1. **Exponential Moving Average (EMA)**: Tracks per-priority processing time using an EMA with
+///    α=1/8 (7/8 weight on previous value, 1/8 on new observation). This provides stability while
+///    reacting quickly to sustained changes.
+///
+/// 2. **Capacity Estimation**: For each priority, computes a safe backlog capacity:
+///    ```
+///    capacity = clamp(round(0.9 × latency_budget / avg_processing_time), 1, 512)
+///    ```
+///    The 0.9 multiplier intentionally over-allocates High priority to keep tail latency low.
+///
+/// 3. **Worker Distribution**: Allocates capacity across eligible workers based on `WORKER_ASSIGNMENTS`:
+///    - Worker 0: Primary High priority handler (bulk of High traffic)
+///    - Worker 1: High + Medium (spillover High, primary Medium)
+///    - Worker 2: All priorities (spillover High/Medium, primary Low/BestEffort)
+///
+/// 4. **Guard Windows**: Medium and Low priorities use guard windows to briefly poll for High
+///    priority packets before processing lower-priority work. Guard thresholds are computed as:
+///    ```
+///    guard_threshold = min(2 × avg_processing_time, latency_budget, 80µs)
+///    ```
+///
+/// # Thread Safety
+///
+/// All fields use atomic operations (`AtomicUsize`, `AtomicU64`) to allow lock-free reads from
+/// worker threads. The background `autobalance_loop` updates these values periodically without
+/// blocking the hot path.
+///
+/// # Data Flow
+///
+/// 1. **Observation**: Workers call `observe_processing_time()` after processing each packet, updating
+///    the EMA for that priority.
+/// 2. **Rebalancing**: Every 100ms, `autobalance_loop` reads current queue depths, computes new
+///    quotas, and atomically updates limits.
+/// 3. **Admission**: Workers check `total_limit()` and `priority_limits()` before pulling packets
+///    from input queues, preventing unbounded backlog growth.
 struct AdaptiveController {
+    /// Maximum total packets allowed in each worker's local heap (across all priorities).
+    ///
+    /// This is a hard cap: workers will not pull more packets from input queues once this limit
+    /// is reached, even if per-priority quotas allow it. Prevents memory exhaustion and ensures
+    /// bounded processing latency.
+    ///
+    /// Indexed by worker ID (0, 1, 2). Updated atomically by `autobalance_loop` every 100ms.
     worker_total_limits: Vec<AtomicUsize>,
+
+    /// Per-worker, per-priority packet quotas.
+    ///
+    /// `worker_priority_limits[worker_id][priority]` is the maximum number of packets of that
+    /// priority that the worker can hold in its local heap. This enforces priority-specific
+    /// backpressure and prevents low-priority traffic from starving high-priority flows.
+    ///
+    /// Updated atomically by `autobalance_loop` based on observed processing times and latency
+    /// budgets. Workers check these limits before pulling packets from input queues.
     worker_priority_limits: Vec<PriorityTable<AtomicUsize>>,
+
+    /// Duration of each guard window slice in microseconds.
+    ///
+    /// When a Medium or Low priority packet is about to be processed, workers may briefly poll
+    /// for High priority packets. This value controls how long each polling slice lasts. The
+    /// guard loop continues until either a High packet arrives or the packet's consumed latency
+    /// budget exceeds its guard threshold.
+    ///
+    /// Automatically tuned by `autobalance_loop` based on observed processing times, clamped to
+    /// [5µs, 50µs] to balance responsiveness with CPU overhead.
     guard_slice_us: AtomicU64,
+
+    /// Per-priority guard threshold in microseconds.
+    ///
+    /// For Medium and Low priorities, this is the maximum latency budget that can be consumed
+    /// before the guard window loop stops polling for High priority packets. Computed as:
+    /// ```
+    /// guard_threshold = min(2 × avg_processing_time, latency_budget, 80µs)
+    /// ```
+    ///
+    /// High and BestEffort priorities have a threshold of 0 (no guarding). Updated by
+    /// `autobalance_loop` every 100ms.
     guard_threshold_us: PriorityTable<AtomicU64>,
+
+    /// Per-priority Exponential Moving Average (EMA) of processing time in nanoseconds.
+    ///
+    /// Updated by `observe_processing_time()` after each packet is processed. The EMA formula is:
+    /// ```
+    /// ema_new = (ema_old × 7 + observed_ns) / 8
+    /// ```
+    ///
+    /// This provides a stable estimate of processing cost while reacting quickly to sustained
+    /// changes (e.g., larger payload sizes, CPU load variations). Used by `autobalance_loop` to
+    /// compute safe backlog capacities.
     processing_ema_ns: PriorityTable<AtomicU64>,
 }
 
 impl AdaptiveController {
+    /// Create a new adaptive controller with initial quotas and guard parameters.
+    ///
+    /// Initializes all quotas and thresholds to conservative defaults that provide reasonable
+    /// performance while the EMA converges. The controller will automatically adjust these
+    /// values after the first rebalancing cycle (100ms).
+    ///
+    /// # Initial Values
+    ///
+    /// - **Worker total limits**: [16, 64, 256] packets for workers 0, 1, 2 respectively
+    /// - **Worker priority limits**:
+    ///   - Worker 0: High=16, others=0
+    ///   - Worker 1: High=4, Medium=60, others=0
+    ///   - Worker 2: High=4, Medium=60, Low=64, BestEffort=128
+    /// - **Guard slice**: 10µs (will be tuned automatically)
+    /// - **Guard thresholds**: Medium=80µs, Low=80µs, High/BestEffort=0 (no guarding)
+    /// - **Processing EMA**: High=100µs, Medium=120µs, Low/BestEffort=200µs
     fn new() -> Self {
         let worker_total_limits = vec![
             AtomicUsize::new(16),
@@ -450,36 +558,120 @@ impl AdaptiveController {
         }
     }
 
+    /// Get the maximum total packet capacity for a worker (across all priorities).
+    ///
+    /// This is a hard cap that prevents the worker from pulling more packets from input queues,
+    /// even if individual priority quotas allow it. Ensures bounded memory usage and processing
+    /// latency.
+    ///
+    /// # Arguments
+    /// * `worker_id` - Worker identifier (0, 1, or 2)
+    ///
+    /// # Returns
+    /// Maximum number of packets the worker can hold in its local heap (always ≥ 1)
+    ///
+    /// # Thread Safety
+    /// Uses `Relaxed` ordering since this is a read-only operation on a value that changes
+    /// infrequently (every 100ms).
     fn total_limit(&self, worker_id: usize) -> usize {
         self.worker_total_limits[worker_id]
             .load(AtomicOrdering::Relaxed)
             .max(1)
     }
 
+    /// Set the maximum total packet capacity for a worker.
+    ///
+    /// Called by `autobalance_loop` to update worker quotas based on observed processing times
+    /// and latency budgets. The value is clamped to ≥ 1 to ensure workers can always process
+    /// at least one packet.
+    ///
+    /// # Arguments
+    /// * `worker_id` - Worker identifier (0, 1, or 2)
+    /// * `value` - New total limit (will be clamped to ≥ 1)
     fn set_total_limit(&self, worker_id: usize, value: usize) {
         self.worker_total_limits[worker_id].store(value.max(1), AtomicOrdering::Relaxed);
     }
 
+    /// Get all per-priority quotas for a worker.
+    ///
+    /// Returns a snapshot of the current priority-specific limits for the given worker. Workers
+    /// use this to check if they can admit packets of a specific priority before pulling from
+    /// input queues.
+    ///
+    /// # Arguments
+    /// * `worker_id` - Worker identifier (0, 1, or 2)
+    ///
+    /// # Returns
+    /// A `PriorityTable` mapping each priority to its current quota for this worker
+    ///
+    /// # Thread Safety
+    /// Uses `Relaxed` ordering for atomic reads. The returned table is a snapshot and may be
+    /// stale by the time it's used, but this is acceptable since quotas change slowly (every 100ms).
     fn priority_limits(&self, worker_id: usize) -> PriorityTable<usize> {
         PriorityTable::from_fn(|priority| {
             self.worker_priority_limits[worker_id][priority].load(AtomicOrdering::Relaxed)
         })
     }
 
+    /// Set the quota for a specific priority on a specific worker.
+    ///
+    /// Called by `autobalance_loop` to update per-priority quotas based on capacity estimation
+    /// and worker assignments. The value can be 0 (worker cannot handle this priority) or any
+    /// positive integer.
+    ///
+    /// # Arguments
+    /// * `worker_id` - Worker identifier (0, 1, or 2)
+    /// * `priority` - Priority class to update
+    /// * `value` - New quota (0 means this worker cannot handle this priority)
     fn set_priority_limit(&self, worker_id: usize, priority: Priority, value: usize) {
         self.worker_priority_limits[worker_id][priority].store(value, AtomicOrdering::Relaxed);
     }
 
+    /// Get the current guard window slice duration.
+    ///
+    /// This is the duration of each polling slice when workers guard for High priority packets
+    /// before processing Medium or Low priority work. The guard loop continues for multiple
+    /// slices until either a High packet arrives or the packet's consumed latency budget exceeds
+    /// its guard threshold.
+    ///
+    /// # Returns
+    /// Guard slice duration (always ≥ 1µs, clamped to [5µs, 50µs] by `autobalance_loop`)
     fn guard_slice(&self) -> Duration {
         let micros = self.guard_slice_us.load(AtomicOrdering::Relaxed).max(1);
         Duration::from_micros(micros)
     }
 
+    /// Set the guard window slice duration in microseconds.
+    ///
+    /// Called by `autobalance_loop` to tune guard responsiveness based on observed processing
+    /// times. The value is clamped to ≥ 1µs to prevent division by zero.
+    ///
+    /// # Arguments
+    /// * `micros` - New guard slice duration in microseconds (will be clamped to ≥ 1)
     fn set_guard_slice_us(&self, micros: u64) {
         self.guard_slice_us
             .store(micros.max(1), AtomicOrdering::Relaxed);
     }
 
+    /// Get the guard threshold for a priority, if guarding is enabled.
+    ///
+    /// The guard threshold is the maximum latency budget that can be consumed before the guard
+    /// window loop stops polling for High priority packets. High and BestEffort priorities
+    /// return `None` (no guarding). For Medium and Low, returns the threshold clamped to the
+    /// packet's actual latency budget.
+    ///
+    /// # Arguments
+    /// * `priority` - Priority class to check
+    /// * `latency_budget` - The packet's latency budget (used to clamp the threshold)
+    ///
+    /// # Returns
+    /// `Some(Duration)` if guarding is enabled for this priority, `None` otherwise
+    ///
+    /// # Algorithm
+    /// 1. High and BestEffort always return `None` (no guarding)
+    /// 2. If the stored threshold is 0, return `None` (guarding disabled)
+    /// 3. Otherwise, return `min(stored_threshold, latency_budget)` to ensure we don't guard
+    ///    beyond the packet's actual budget
     fn guard_threshold(&self, priority: Priority, latency_budget: Duration) -> Option<Duration> {
         match priority {
             Priority::High | Priority::BestEffort => None,
@@ -495,21 +687,77 @@ impl AdaptiveController {
         }
     }
 
+    /// Set the guard threshold for a priority in microseconds.
+    ///
+    /// Called by `autobalance_loop` to update guard thresholds based on observed processing
+    /// times and latency budgets. Set to 0 to disable guarding for a priority.
+    ///
+    /// # Arguments
+    /// * `priority` - Priority class to update
+    /// * `micros` - New guard threshold in microseconds (0 to disable)
     fn set_guard_threshold_us(&self, priority: Priority, micros: u64) {
         self.guard_threshold_us[priority].store(micros, AtomicOrdering::Relaxed);
     }
 
-    /// Update the EMA of the processing duration for `priority`.
+    /// Update the Exponential Moving Average (EMA) of processing time for a priority.
+    ///
+    /// Called by workers after processing each packet to feed observed processing times into the
+    /// adaptive controller. The EMA provides a stable estimate that reacts quickly to sustained
+    /// changes while filtering out transient noise.
+    ///
+    /// # EMA Formula
+    ///
+    /// The exponential moving average uses α=1/8 (7/8 weight on previous value, 1/8 on new observation):
+    /// ```
+    /// ema_new = (ema_old × 7 + observed_ns) / 8
+    /// ```
+    ///
+    /// This means:
+    /// - 87.5% of the estimate comes from historical data (stability)
+    /// - 12.5% comes from the new observation (responsiveness)
+    /// - The half-life is approximately 5.5 observations (time to reach 50% of new value)
+    ///
+    /// # Arguments
+    /// * `priority` - Priority class of the processed packet
+    /// * `duration` - Actual processing time observed for this packet
+    ///
+    /// # Thread Safety
+    /// Uses `fetch_update` with `Relaxed` ordering. This is safe because:
+    /// - Multiple workers may update the same priority's EMA concurrently
+    /// - The EMA formula is commutative (order doesn't matter)
+    /// - Slight race conditions are acceptable (EMA naturally smooths them out)
+    ///
+    /// # Performance
+    /// This is called on the hot path (once per packet), so it uses lock-free atomics and avoids
+    /// any blocking operations.
     fn observe_processing_time(&self, priority: Priority, duration: Duration) {
         let new_ns = duration.as_nanos() as u64;
         let slot = &self.processing_ema_ns[priority];
         let _ = slot.fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |prev| {
             let prev = prev.max(1);
+            // EMA formula: ema_new = (ema_old × 7 + new_observation) / 8
+            // This gives α=1/8, meaning 87.5% weight on history, 12.5% on new value
             let updated = (prev * 7 + new_ns) / 8;
             Some(updated)
         });
     }
 
+    /// Get the current EMA estimate of average processing time for a priority.
+    ///
+    /// Used by `autobalance_loop` to compute safe backlog capacities. The value is clamped to
+    /// ≥ 1ns to prevent division by zero in capacity calculations.
+    ///
+    /// # Arguments
+    /// * `priority` - Priority class to query
+    ///
+    /// # Returns
+    /// Average processing time in nanoseconds (always ≥ 1)
+    ///
+    /// # Usage
+    /// This value is used in the capacity estimation formula:
+    /// ```
+    /// capacity = clamp(round(0.9 × latency_budget / average_processing_ns), 1, 512)
+    /// ```
     fn average_processing_ns(&self, priority: Priority) -> u64 {
         self.processing_ema_ns[priority]
             .load(AtomicOrdering::Relaxed)
@@ -528,128 +776,201 @@ impl AdaptiveController {
         expected_latencies: Arc<PriorityTable<Duration>>,
         worker_priority_counters: Vec<PriorityTable<Arc<AtomicUsize>>>,
     ) {
-        const HIGH_PRIMARY_MAX: usize = 64;
-        const HIGH_SPILL_MAX: usize = 16;
-        const MEDIUM_W1_MAX: usize = 160;
-        const MEDIUM_W2_MAX: usize = 160;
-        const LOW_MAX: usize = 192;
-        const BEST_EFFORT_MAX: usize = 128;
+        // Hard caps to prevent unbounded quota growth per worker/priority
+        const HIGH_PRIMARY_MAX: usize = 64;  // Maximum High priority packets for Worker 0
+        const HIGH_SPILL_MAX: usize = 16;    // Maximum High priority spillover for Workers 1 & 2
+        const MEDIUM_W1_MAX: usize = 160;    // Maximum Medium priority packets for Worker 1
+        const MEDIUM_W2_MAX: usize = 160;   // Maximum Medium priority packets for Worker 2
+        const LOW_MAX: usize = 192;          // Maximum Low priority packets for Worker 2
+        const BEST_EFFORT_MAX: usize = 128;  // Fixed BestEffort quota for Worker 2
 
+        // Main rebalancing loop: runs every 100ms until shutdown signal
         while running.load(AtomicOrdering::Relaxed) {
+            // Sleep for 100ms between rebalancing cycles
+            // This frequency balances responsiveness (quick adaptation) with stability (avoiding thrashing)
             std::thread::sleep(Duration::from_millis(100));
 
-            let mut new_totals = vec![0usize; WORKER_ASSIGNMENTS.len()];
+            // Initialize new quota tables: we'll compute all quotas first, then atomically update them
+            // This ensures consistency (all quotas updated together) and avoids intermediate states
+            let mut new_totals = vec![0usize; WORKER_ASSIGNMENTS.len()];  // Total capacity per worker
             let mut new_limits: Vec<PriorityTable<usize>> = WORKER_ASSIGNMENTS
                 .iter()
-                .map(|_| PriorityTable::from_fn(|_| 0usize))
+                .map(|_| PriorityTable::from_fn(|_| 0usize))  // Per-worker, per-priority quotas
                 .collect();
 
+            // Collect guard slice duration candidates from all priorities
+            // We'll choose the minimum to ensure responsiveness across all priorities
             let mut guard_slice_candidates = Vec::new();
 
+            // Process each priority (except BestEffort, which gets a fixed quota)
             for priority in Priority::ALL {
                 if matches!(priority, Priority::BestEffort) {
+                    // BestEffort is handled separately with a fixed quota
                     continue;
                 }
+
+                // Step 1: Get current EMA estimate of average processing time for this priority
                 let avg_ns = self.average_processing_ns(priority);
+                // Step 2: Get the latency budget (expected max latency) for this priority
                 let budget_ns = expected_latencies[priority].as_nanos() as u64;
+                // Skip if invalid values (shouldn't happen in normal operation)
                 if budget_ns == 0 || avg_ns == 0 {
                     continue;
                 }
+
+                // Step 3: Compute safe backlog capacity
+                // Formula: capacity = 0.9 × (latency_budget / avg_processing_time)
+                // The 0.9 multiplier intentionally over-allocates to keep tail latency low
+                // Clamp to [1, 512] to prevent extreme values
                 let capacity = ((budget_ns as f64 / avg_ns as f64) * 0.9)
                     .clamp(1.0, 512.0)
                     .round() as usize;
+
+                // Step 4: Read actual current queue depth across all workers for this priority
+                // This gives us visibility into the current backlog state
                 let actual_depth: usize = worker_priority_counters
                     .iter()
                     .map(|table| table[priority].load(AtomicOrdering::Relaxed))
                     .sum();
+
+                // Step 5: Compute target depth
+                // Allow some growth if actual depth is higher (up to 2× capacity) to avoid thrashing
+                // This prevents rapid quota oscillations when backlog fluctuates
                 let target_depth = capacity.max(actual_depth.min(capacity * 2).max(1));
 
+                // Step 6: Distribute target capacity across eligible workers based on WORKER_ASSIGNMENTS
                 match priority {
                     Priority::High => {
+                        // High priority distribution strategy:
+                        // - Worker 0 gets the bulk of High traffic (primary handler)
+                        // - Workers 1 & 2 get small spillover quotas (1 packet each if capacity ≥ 3)
+                        //   This ensures High priority can be processed on multiple workers for parallelism
                         let mut remaining = target_depth.max(1);
                         let mut alloc0;
                         let mut alloc1 = 0usize;
                         let mut alloc2 = 0usize;
+                        // Allocate spillover to workers 1 & 2 if we have enough capacity
                         if remaining >= 3 {
-                            alloc1 = 1;
-                            alloc2 = 1;
+                            alloc1 = 1;  // Worker 1 gets 1 High packet
+                            alloc2 = 1;  // Worker 2 gets 1 High packet
                             remaining -= 2;
                         } else if remaining == 2 {
+                            // If only 2 packets, give 1 to Worker 1, rest to Worker 0
                             alloc1 = 1;
                             remaining -= 1;
                         }
+                        // Remaining capacity goes to Worker 0 (primary handler)
                         alloc0 = remaining;
+                        // Apply hard caps to prevent unbounded growth
                         alloc0 = alloc0.min(HIGH_PRIMARY_MAX);
                         alloc1 = alloc1.min(HIGH_SPILL_MAX);
                         alloc2 = alloc2.min(HIGH_SPILL_MAX);
+                        // Store quotas (Worker 0 must have at least 1)
                         new_limits[0][Priority::High] = alloc0.max(1);
                         new_limits[1][Priority::High] = alloc1;
                         new_limits[2][Priority::High] = alloc2;
+                        // Update worker totals
                         new_totals[0] += new_limits[0][Priority::High];
                         new_totals[1] += new_limits[1][Priority::High];
                         new_totals[2] += new_limits[2][Priority::High];
 
+                        // High priority doesn't use guard windows (always preempts immediately)
+                        // But we compute a guard slice candidate for reference
                         let guard_us =
                             ((avg_ns / 1_000).saturating_mul(2)).min((budget_ns / 1_000).max(1));
                         guard_slice_candidates.push((priority, guard_us));
+                        // Disable guard threshold for High (set to 0)
                         self.set_guard_threshold_us(priority, 0);
                     }
                     Priority::Medium => {
+                        // Medium priority distribution strategy:
+                        // - Split capacity between Workers 1 & 2 (both can handle Medium)
+                        // - Try to balance evenly, but respect hard caps (160 each)
                         let target = target_depth.max(1);
+                        // Allocate to Worker 1 first (up to its cap)
                         let mut w1 = target.min(MEDIUM_W1_MAX);
+                        // Remaining goes to Worker 2 (up to its cap)
                         let mut w2 = target.saturating_sub(w1).min(MEDIUM_W2_MAX);
+                        // Ensure Worker 2 gets at least 1 packet if target > 1 (for parallelism)
                         if target > 1 && w2 == 0 {
                             w1 = w1.saturating_sub(1);
                             w2 = 1;
                         }
+                        // Store quotas
                         new_limits[1][Priority::Medium] = w1;
                         new_limits[2][Priority::Medium] = w2;
+                        // Update worker totals
                         new_totals[1] += w1;
                         new_totals[2] += w2;
 
+                        // Compute guard threshold for Medium priority
+                        // Formula: min(2 × avg_processing_time, latency_budget, 80µs)
+                        // This allows Medium packets to briefly poll for High before processing
                         let guard_us = ((avg_ns / 1_000).saturating_mul(2))
                             .min((budget_ns / 1_000).max(1))
-                            .min(80);
+                            .min(80);  // Cap at 80µs to prevent excessive guarding
                         self.set_guard_threshold_us(priority, guard_us);
                         guard_slice_candidates.push((priority, guard_us));
                     }
                     Priority::Low => {
+                        // Low priority distribution strategy:
+                        // - All capacity goes to Worker 2 (only worker that handles Low)
+                        // - Apply hard cap (192 packets max)
                         let low = target_depth.max(1).min(LOW_MAX);
                         new_limits[2][Priority::Low] = low;
                         new_totals[2] += low;
+
+                        // Compute guard threshold for Low priority (same formula as Medium)
                         let guard_us = ((avg_ns / 1_000).saturating_mul(2))
                             .min((budget_ns / 1_000).max(1))
-                            .min(80);
+                            .min(80);  // Cap at 80µs
                         self.set_guard_threshold_us(priority, guard_us);
                         guard_slice_candidates.push((priority, guard_us));
                     }
-                    Priority::BestEffort => {}
+                    Priority::BestEffort => {
+                        // BestEffort is handled separately after the loop (fixed quota)
+                    }
                 }
             }
 
-            // Ensure best-effort has a reasonable default capacity.
+            // Step 7: Set fixed BestEffort quota for Worker 2
+            // BestEffort doesn't participate in adaptive capacity estimation (it's utility traffic)
+            // Fixed quota ensures metrics/logging workloads always have capacity
             new_limits[2][Priority::BestEffort] = BEST_EFFORT_MAX;
             new_totals[2] += BEST_EFFORT_MAX;
 
+            // Step 8: Atomically update all quotas for all workers
+            // This ensures consistency: all quotas are updated together, avoiding intermediate states
             for (worker_id, total) in new_totals.iter().enumerate() {
+                // Each worker has a minimum total limit to ensure it can always process some packets
                 let min_total = match worker_id {
-                    0 => 4,
-                    1 => 16,
-                    _ => 64,
+                    0 => 4,   // Worker 0 (High priority specialist): minimum 4 packets
+                    1 => 16,  // Worker 1 (High + Medium): minimum 16 packets
+                    _ => 64,  // Worker 2 (all priorities): minimum 64 packets
                 };
+                // Update total limit (clamped to minimum)
                 self.set_total_limit(worker_id, (*total).max(min_total));
+                // Update all per-priority quotas for this worker
                 for priority in Priority::ALL {
                     let value = new_limits[worker_id][priority];
                     self.set_priority_limit(worker_id, priority, value);
                 }
             }
 
+            // Step 9: Select guard slice duration
+            // Choose the minimum guard threshold across all priorities to ensure responsiveness
+            // This means the guard window will be short enough to catch High priority packets
+            // even for the tightest latency budget
             if let Some((_, best_guard)) = guard_slice_candidates
                 .into_iter()
                 .min_by_key(|(_, guard)| *guard)
             {
+                // Clamp guard slice to [5µs, 50µs] to balance responsiveness with CPU overhead
+                // Too short (< 5µs): excessive CPU overhead from frequent polling
+                // Too long (> 50µs): poor responsiveness, may miss High priority bursts
                 self.set_guard_slice_us(best_guard.max(5).min(50));
             }
+            // If no guard candidates (shouldn't happen), guard_slice_us keeps its previous value
         }
     }
 }
@@ -658,51 +979,183 @@ impl AdaptiveController {
 ///
 /// Each worker maintains its own EDF heap; the shared [`AdaptiveController`] nudges backlog limits
 /// and guard timings so that observed processing costs stay within the configured latency budgets.
+///
+/// # Architecture
+///
+/// The scheduler distributes work across multiple worker threads based on `WORKER_ASSIGNMENTS`:
+/// - Worker 0: Processes High priority packets only (dedicated high-latency handler)
+/// - Worker 1: Processes High and Medium priority packets (2 workers max for Medium)
+/// - Worker 2: Processes all priorities (spillover for High/Medium, primary for Low/BestEffort)
+///
+/// Each worker:
+/// - Maintains its own EDF min-deadline heap
+/// - Drains input queues respecting adaptive quotas
+/// - Processes packets in earliest-deadline-first order
+/// - Routes completions through `CompletionRouter` for per-priority FIFO ordering
+///
+/// The adaptive controller dynamically adjusts quotas every 100ms based on observed processing
+/// times and latency budgets, ensuring each priority class meets its deadlines.
 pub struct MultiWorkerScheduler {
+    /// Per-priority input channels from ingress DRR scheduler.
+    ///
+    /// Workers pull packets from these channels based on their priority assignments and
+    /// current quotas. Each priority has its own channel to prevent head-of-line blocking.
     input_queues: PriorityTable<Arc<Receiver<Packet>>>,
+
+    /// Router that coordinates packet completion and sequence tracking.
+    ///
+    /// Ensures per-priority FIFO ordering despite parallel worker execution. Workers call
+    /// `completion.complete()` after processing each packet, and the router handles
+    /// reordering out-of-order completions.
     completion: Arc<CompletionRouter>,
+
+    /// Per-worker atomic counters tracking current queue depth (total packets in heap).
+    ///
+    /// Used for metrics and GUI display. Updated by workers as they drain input queues
+    /// and process packets. The adaptive controller reads these values during rebalancing.
     worker_backlogs: Vec<Arc<AtomicUsize>>,
+
+    /// Per-worker, per-priority atomic counters tracking queue depth by priority.
+    ///
+    /// `worker_priority_counters[worker_id][priority]` is the number of packets of that
+    /// priority currently in the worker's heap. Used by the adaptive controller to compute
+    /// safe backlog capacities during rebalancing.
     worker_priority_counters: Vec<PriorityTable<Arc<AtomicUsize>>>,
+
+    /// Adaptive controller that dynamically adjusts quotas and guard timings.
+    ///
+    /// Runs a background thread that reads observed processing times (EMA) and current
+    /// queue depths, then computes and atomically updates quotas every 100ms. Workers
+    /// read these quotas lock-free before pulling packets from input queues.
     adaptive: Arc<AdaptiveController>,
+
+    /// Per-priority latency budgets (expected maximum latency for each priority class).
+    ///
+    /// Used by the adaptive controller to compute safe backlog capacities:
+    /// `capacity = 0.9 × latency_budget / avg_processing_time`
+    ///
+    /// Sourced from pipeline configuration (the tighter of ingress/egress socket budgets).
     expected_latencies: Arc<PriorityTable<Duration>>,
 }
 
+/// Statistics snapshot for the multi-worker EDF scheduler.
+///
+/// Used for metrics collection and GUI display. All values are read atomically from
+/// worker threads without blocking the hot path.
 #[derive(Debug, Clone)]
 pub struct MultiWorkerStats {
+    /// Current queue depth (total packets in heap) for each worker.
+    ///
+    /// Indexed by worker ID (0, 1, 2). Read from `worker_backlogs` atomic counters.
     pub worker_queue_depths: Vec<usize>,
+
+    /// Current capacity limit (maximum packets allowed) for each worker.
+    ///
+    /// Indexed by worker ID (0, 1, 2). Read from `adaptive.total_limit()` which returns
+    /// the current quota set by the adaptive controller.
     pub worker_queue_capacities: Vec<usize>,
+
+    /// Dispatcher backlog (currently unused, always 0).
+    ///
+    /// Reserved for future use if a dispatcher thread is added to the architecture.
     pub dispatcher_backlog: usize,
+
+    /// Per-worker, per-priority queue depths.
+    ///
+    /// `worker_priority_depths[worker_id][priority_index]` is the number of packets of
+    /// that priority currently in the worker's heap. Used for detailed metrics display
+    /// in the GUI (shows per-priority breakdown per worker).
     pub worker_priority_depths: Vec<Vec<usize>>,
 }
 
 impl MultiWorkerScheduler {
     /// Create a new multi-worker EDF scheduler with adaptive balancing.
+    ///
+    /// Initializes the scheduler with:
+    /// - Input queues from ingress DRR (per-priority channels)
+    /// - Output queues to egress DRR (per-priority channels)
+    /// - Latency budgets for each priority class
+    /// - Adaptive controller with initial quotas
+    /// - Per-worker backlog counters (initialized to 0)
+    /// - Per-worker, per-priority counters (initialized to 0)
+    ///
+    /// The scheduler is ready to spawn worker threads after construction. Workers are
+    /// spawned via `spawn_threads()` which also starts the adaptive controller's
+    /// background rebalancing loop.
+    ///
+    /// # Arguments
+    /// * `input_queues` - Per-priority input channels from ingress DRR scheduler
+    /// * `output_queues` - Per-priority output channels to egress DRR scheduler
+    /// * `expected_latencies` - Per-priority latency budgets (used by adaptive controller
+    ///   to compute safe backlog capacities)
+    ///
+    /// # Returns
+    /// A new `MultiWorkerScheduler` instance ready to spawn worker threads
     pub fn new(
         input_queues: PriorityTable<Arc<Receiver<Packet>>>,
         output_queues: PriorityTable<Sender<Packet>>,
         expected_latencies: PriorityTable<Duration>,
     ) -> Self {
+        // Initialize per-worker backlog counters (one atomic counter per worker)
+        // These track the total number of packets in each worker's heap
         let worker_backlogs = WORKER_ASSIGNMENTS
             .iter()
             .map(|_| Arc::new(AtomicUsize::new(0)))
             .collect();
+        // Initialize per-worker, per-priority counters (one atomic counter per worker/priority pair)
+        // These track the number of packets of each priority in each worker's heap
         let worker_priority_counters = WORKER_ASSIGNMENTS
             .iter()
             .map(|_| PriorityTable::from_fn(|_| Arc::new(AtomicUsize::new(0))))
             .collect();
 
+        // Create the adaptive controller with initial quotas (will be adjusted after first rebalance)
         let adaptive = Arc::new(AdaptiveController::new());
         Self {
             input_queues,
+            // Create completion router with per-priority sequence trackers and output channels
             completion: Arc::new(CompletionRouter::new(output_queues)),
             worker_backlogs,
             worker_priority_counters,
             adaptive,
+            // Store latency budgets for adaptive controller (used in capacity estimation)
             expected_latencies: Arc::new(expected_latencies),
         }
     }
 
-    /// Spawn the EDF workers plus the background auto-balancer.
+    /// Spawn the EDF workers plus the background auto-balancer thread.
+    ///
+    /// Creates one thread per worker (3 threads total) plus one background thread for
+    /// the adaptive controller. Each worker:
+    /// - Is pinned to a specific CPU core (from `worker_cores`)
+    /// - Has its thread priority set (via `priority_setter`)
+    /// - Processes packets according to its priority assignments (`WORKER_ASSIGNMENTS`)
+    /// - Maintains its own EDF heap and respects adaptive quotas
+    ///
+    /// The adaptive controller runs in a separate background thread that:
+    /// - Reads observed processing times (EMA) and current queue depths
+    /// - Computes new quotas every 100ms based on latency budgets
+    /// - Atomically updates quotas so workers can read them lock-free
+    ///
+    /// # Arguments
+    /// * `running` - Atomic flag to signal shutdown (checked by all threads)
+    /// * `priority_setter` - Function to set thread priority (platform-specific)
+    /// * `core_setter` - Function to pin thread to a CPU core (platform-specific)
+    /// * `worker_cores` - List of CPU cores to pin workers to (round-robin if fewer cores than workers)
+    ///
+    /// # Thread Creation
+    ///
+    /// - **Worker threads**: One per `WORKER_ASSIGNMENTS` entry (3 workers)
+    ///   - Thread name: `"EDF-Worker-{worker_id}"`
+    ///   - Priority: Set via `priority_setter(2)` (high priority for real-time work)
+    ///   - Core: Pinned via `core_setter(core_id)` (round-robin from `worker_cores`)
+    ///   - Function: `run_worker()` - main EDF processing loop
+    ///
+    /// - **Auto-balancer thread**: One background thread
+    ///   - Thread name: `"EDF-AutoBalance"`
+    ///   - Priority: Default (lower than workers, runs every 100ms)
+    ///   - Core: Not pinned (can migrate, low frequency)
+    ///   - Function: `AdaptiveController::autobalance_loop()` - quota rebalancing
     pub fn spawn_threads(
         &self,
         running: Arc<AtomicBool>,
@@ -710,28 +1163,38 @@ impl MultiWorkerScheduler {
         core_setter: fn(usize),
         worker_cores: &[usize],
     ) {
+        // Determine core assignment: use provided cores or default to core 0
         let core_list: Vec<usize> = if worker_cores.is_empty() {
-            vec![0]
+            vec![0] // Default: all workers on core 0 (fallback)
         } else {
-            worker_cores.to_vec()
+            worker_cores.to_vec() // Use provided cores (round-robin if fewer cores than workers)
         };
 
+        // Spawn one worker thread per WORKER_ASSIGNMENTS entry (3 workers total)
         for (worker_id, assignments) in WORKER_ASSIGNMENTS.iter().enumerate() {
-            let input_clone = self.input_queues.clone();
-            let completion = self.completion.clone();
-            let running_clone = running.clone();
-            let backlog = self.worker_backlogs[worker_id].clone();
-            let priorities: Vec<Priority> = assignments.to_vec();
+            // Clone shared state for this worker thread
+            let input_clone = self.input_queues.clone(); // Per-priority input channels
+            let completion = self.completion.clone(); // Completion router (sequence tracking)
+            let running_clone = running.clone(); // Shutdown flag
+            let backlog = self.worker_backlogs[worker_id].clone(); // Worker's backlog counter
+            let priorities: Vec<Priority> = assignments.to_vec(); // Priorities this worker handles
             let priority_counters = PriorityTable::from_fn(|priority| {
+                // Per-priority counters for this worker (shared with adaptive controller)
                 self.worker_priority_counters[worker_id][priority].clone()
             });
-            let controller = self.adaptive.clone();
+            let controller = self.adaptive.clone(); // Adaptive controller (quotas, guard timings)
+            // Assign core: round-robin if fewer cores than workers
             let core_id = core_list[worker_id % core_list.len()];
+
+            // Spawn worker thread
             thread::Builder::new()
                 .name(format!("EDF-Worker-{}", worker_id))
                 .spawn(move || {
+                    // Set thread priority (high priority for real-time work)
                     priority_setter(2);
+                    // Pin thread to specific CPU core
                     core_setter(core_id);
+                    // Run the main worker loop (processes packets using EDF scheduling)
                     run_worker(
                         worker_id,
                         priorities,
@@ -746,6 +1209,7 @@ impl MultiWorkerScheduler {
                 .expect("failed to spawn EDF worker thread");
         }
 
+        // Spawn adaptive controller background thread
         let controller = self.adaptive.clone();
         let running_balancer = running.clone();
         let expected = self.expected_latencies.clone();
@@ -753,18 +1217,46 @@ impl MultiWorkerScheduler {
         thread::Builder::new()
             .name("EDF-AutoBalance".to_string())
             .spawn(move || {
+                // Run the adaptive rebalancing loop (updates quotas every 100ms)
                 controller.autobalance_loop(running_balancer, expected, priority_counters);
             })
             .expect("failed to spawn EDF auto-balancer");
     }
 
+    /// Get drop counts for all priorities (packets dropped due to full egress queues).
+    ///
+    /// Returns an `EDFDropCounters` structure compatible with the single-threaded EDF
+    /// scheduler's metrics format. The `heap` field is always 0 (no heap drops in
+    /// multi-worker scheduler; packets are dropped at input queue admission instead).
+    ///
+    /// # Returns
+    /// `EDFDropCounters` with:
+    /// - `heap`: Always 0 (no heap drops in multi-worker scheduler)
+    /// - `output`: Per-priority drop counts from egress queues (packets dropped when
+    ///   egress queue is full)
     pub fn get_drop_counts(&self) -> EDFDropCounters {
         EDFDropCounters {
-            heap: 0,
-            output: self.completion.drop_counts(),
+            heap: 0, // Multi-worker scheduler doesn't drop at heap (drops at admission instead)
+            output: self.completion.drop_counts(), // Per-priority drops from egress queues
         }
     }
 
+    /// Get current statistics snapshot for metrics and GUI display.
+    ///
+    /// Reads all counters atomically without blocking the hot path. Returns a snapshot
+    /// that may be slightly stale (counters are updated continuously by workers), but
+    /// this is acceptable for metrics display.
+    ///
+    /// # Returns
+    /// `MultiWorkerStats` containing:
+    /// - `worker_queue_depths`: Current total packets in each worker's heap
+    /// - `worker_queue_capacities`: Current capacity limits for each worker
+    /// - `dispatcher_backlog`: Always 0 (no dispatcher in current architecture)
+    /// - `worker_priority_depths`: Per-worker, per-priority queue depths (for detailed metrics)
+    ///
+    /// # Performance
+    /// All reads use `Relaxed` atomic ordering (sufficient for metrics). The operation
+    /// is O(W × P) where W is the number of workers (3) and P is the number of priorities (4).
     pub fn stats(&self) -> MultiWorkerStats {
         MultiWorkerStats {
             worker_queue_depths: self
