@@ -36,6 +36,19 @@ impl Priority {
     }
 
     /// Numeric identifier for compatibility with legacy metrics and IO code.
+    ///
+    /// Maps priority classes to numeric IDs used in legacy code and external interfaces
+    /// (e.g., GUI, metrics serialization). This allows backward compatibility with systems
+    /// that expect numeric flow IDs instead of priority enum values.
+    ///
+    /// # Mapping
+    /// - `High` → 1
+    /// - `Medium` → 2
+    /// - `Low` → 3
+    /// - `BestEffort` → 4
+    ///
+    /// # Returns
+    /// Numeric flow ID for this priority (1-4)
     pub const fn flow_id(self) -> u64 {
         match self {
             Priority::High => 1,
@@ -70,6 +83,25 @@ pub struct PriorityTable<T> {
 
 impl<T> PriorityTable<T> {
     /// Build a table by executing a closure for each priority.
+    ///
+    /// Creates a `PriorityTable` by calling the closure once for each priority in the order
+    /// defined by `Priority::ALL` (High, Medium, Low, BestEffort). This ensures consistent
+    /// ordering regardless of how the table is constructed.
+    ///
+    /// # Arguments
+    /// * `f` - Closure that maps each priority to a value of type `T`
+    ///
+    /// # Returns
+    /// A new `PriorityTable` with values computed by the closure
+    ///
+    /// # Example
+    /// ```
+    /// let quantums = PriorityTable::from_fn(|priority| match priority {
+    ///     Priority::High => 64,
+    ///     Priority::Medium => 8,
+    ///     _ => 1,
+    /// });
+    /// ```
     pub fn from_fn(mut f: impl FnMut(Priority) -> T) -> Self {
         let mut values = Vec::with_capacity(Priority::ALL.len());
         for priority in Priority::ALL {
@@ -79,16 +111,47 @@ impl<T> PriorityTable<T> {
     }
 
     /// Borrow the value for a given priority.
+    ///
+    /// Returns a reference to the value stored for the specified priority. The value is
+    /// indexed using `priority.index()`, which provides O(1) access.
+    ///
+    /// # Arguments
+    /// * `priority` - Priority class to look up
+    ///
+    /// # Returns
+    /// Reference to the value for this priority
     pub fn get(&self, priority: Priority) -> &T {
         &self.values[priority.index()]
     }
 
     /// Mutably borrow the value for a given priority.
+    ///
+    /// Returns a mutable reference to the value stored for the specified priority. The value
+    /// is indexed using `priority.index()`, which provides O(1) access.
+    ///
+    /// # Arguments
+    /// * `priority` - Priority class to look up
+    ///
+    /// # Returns
+    /// Mutable reference to the value for this priority
     pub fn get_mut(&mut self, priority: Priority) -> &mut T {
         &mut self.values[priority.index()]
     }
 
     /// Build a table from a vector ordered according to [`Priority::ALL`].
+    ///
+    /// Creates a `PriorityTable` from a pre-existing vector. The vector must have exactly
+    /// `Priority::ALL.len()` elements (currently 4), and they must be in the same order as
+    /// `Priority::ALL` (High, Medium, Low, BestEffort).
+    ///
+    /// # Arguments
+    /// * `values` - Vector of values, one per priority in `Priority::ALL` order
+    ///
+    /// # Returns
+    /// A new `PriorityTable` containing the provided values
+    ///
+    /// # Panics
+    /// Panics if `values.len() != Priority::ALL.len()` (assertion failure)
     pub fn from_vec(values: Vec<T>) -> Self {
         assert!(
             values.len() == Priority::ALL.len(),

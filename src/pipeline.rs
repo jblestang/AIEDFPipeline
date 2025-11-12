@@ -22,11 +22,41 @@ use crate::scheduler::multi_worker_edf::MultiWorkerScheduler;
 use crate::threading::{set_cpu_affinity, set_thread_core, set_thread_priority};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Scheduler strategy selection for the EDF processing stage.
+///
+/// The pipeline supports four different EDF scheduling strategies, each optimized
+/// for different workloads and performance characteristics:
+///
+/// - **Single**: Single-threaded EDF scheduler (legacy, simplest implementation)
+///   - One thread processes all priorities sequentially
+///   - Lowest overhead, suitable for low-throughput workloads
+///   - No parallelism, may become a bottleneck under high load
+///
+/// - **MultiWorker**: Multi-worker EDF with adaptive load balancing (recommended)
+///   - Multiple worker threads (3 by default) process packets in parallel
+///   - Adaptive controller dynamically adjusts quotas based on observed processing times
+///   - Per-priority FIFO ordering maintained via sequence tracking
+///   - Best for high-throughput workloads requiring low latency
+///
+/// - **Global**: Global EDF with shared run queue
+///   - Multiple worker threads share a single priority queue
+///   - Workers compete for earliest-deadline packets
+///   - Simpler than MultiWorker but may have more contention
+///
+/// - **GlobalVD**: Global EDF with virtual deadlines
+///   - Similar to Global but uses virtual deadlines to prioritize high-priority tasks
+///   - Virtual deadlines are computed as `original_deadline × scaling_factor`
+///   - High priority gets smallest scaling factor (0.05), ensuring earliest virtual deadlines
+///   - Best for workloads requiring strong high-priority task prioritization
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulerKind {
+    /// Single-threaded EDF scheduler (legacy, simplest)
     Single,
+    /// Multi-worker EDF with adaptive load balancing (recommended for high throughput)
     MultiWorker,
+    /// Global EDF with shared run queue
     Global,
+    /// Global EDF with virtual deadlines (prioritizes high-priority tasks)
     GlobalVD,
 }
 
@@ -157,6 +187,20 @@ impl Default for PipelineConfig {
 }
 
 /// Complete pipeline wiring that owns schedulers, sockets, and metrics collectors.
+///
+/// The `Pipeline` struct orchestrates the entire scheduling stack:
+/// - **Ingress DRR**: Reads packets from UDP sockets and routes them to EDF schedulers
+/// - **EDF Schedulers**: Process packets using one of four scheduling strategies (Single, MultiWorker, Global, GlobalVD)
+/// - **Egress DRR**: Emits processed packets to UDP sockets and records metrics
+/// - **Metrics Collector**: Aggregates latency statistics and broadcasts them via TCP
+///
+/// The pipeline supports multiple scheduler types selected via `SchedulerKind`:
+/// - `Single`: Single-threaded EDF (legacy, simplest)
+/// - `MultiWorker`: Multi-worker EDF with adaptive load balancing (recommended for high throughput)
+/// - `Global`: Global EDF with shared run queue
+/// - `GlobalVD`: Global EDF with virtual deadlines (prioritizes high-priority tasks)
+///
+/// Threads are spawned via `run()` and can be shut down gracefully via `shutdown()`.
 pub struct Pipeline {
     ingress_drr: Arc<IngressDRRScheduler>,
     edf_single: Option<Arc<EDFScheduler>>,
@@ -390,8 +434,27 @@ impl Pipeline {
 
     /// Launch the ingress, EDF, and egress threads plus the statistics publisher.
     ///
-    /// The method binds sockets, wires metrics, and then waits until `shutdown` flips the shared
-    /// running flag.
+    /// This method orchestrates the entire pipeline startup:
+    /// 1. Binds UDP input sockets and registers them with IngressDRRScheduler
+    /// 2. Binds UDP output sockets and registers them with EgressDRRScheduler
+    /// 3. Spawns IngressDRR thread (reads from UDP, routes to priority queues)
+    /// 4. Spawns EDF scheduler threads (processes packets based on `SchedulerKind`)
+    /// 5. Spawns EgressDRR thread (reads from priority queues, writes to UDP, records metrics)
+    /// 6. Spawns statistics thread (periodically sends metrics updates to GUI)
+    /// 7. Waits until `shutdown()` is called (blocks until shutdown signal)
+    ///
+    /// # Thread Layout
+    ///
+    /// - **Ingress-DRR**: Pinned to `cores.ingress`, priority 2 (high)
+    /// - **EDF-Processor/Workers**: Pinned to `cores.edf_dispatcher`/`cores.edf_workers`, priority 2 (high)
+    /// - **Egress-DRR**: Pinned to `cores.egress`, priority 1 (medium)
+    /// - **Statistics-Thread**: Pinned to `cores.egress`, priority 1 (medium, best-effort)
+    ///
+    /// # Returns
+    /// `Ok(())` when shutdown is requested, or an error if thread spawning fails
+    ///
+    /// # Errors
+    /// Returns an error if socket binding fails or thread spawning fails
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.running.store(true, Ordering::Relaxed);
 
@@ -629,13 +692,40 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Signal all pipeline threads to stop.
+    /// Signal all pipeline threads to stop gracefully.
+    ///
+    /// Sets the shared `running` flag to `false`, which causes all threads to exit their
+    /// main loops. This is a cooperative shutdown: threads check the flag periodically
+    /// and exit when it becomes false.
+    ///
+    /// # Graceful Shutdown
+    /// All threads (IngressDRR, EDF, EgressDRR, Statistics) check `running` in their
+    /// main loops and will exit when this method is called. The shutdown is asynchronous:
+    /// threads may take a short time to notice the flag change and exit.
+    ///
+    /// # Thread Safety
+    /// Uses `AtomicBool` with `Relaxed` ordering for lock-free reads/writes. All threads
+    /// can safely check the flag without blocking.
     pub async fn shutdown(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
 }
 
 /// Create bounded crossbeam channels for each priority class using the supplied capacities.
+///
+/// Builds a pair of `PriorityTable` structures containing `Sender` and `Receiver` channels
+/// for each priority. The channels are bounded to the capacities specified in the config,
+/// preventing unbounded memory growth while allowing backpressure.
+///
+/// # Arguments
+/// * `capacities` - Per-priority channel capacities (from `QueueConfig`)
+///
+/// # Returns
+/// A tuple `(PriorityTable<Sender<Packet>>, PriorityTable<Receiver<Packet>>)` containing
+/// the senders and receivers for each priority class
+///
+/// # Usage
+/// Used during pipeline construction to wire ingress → EDF and EDF → egress connections.
 fn build_priority_channels(
     capacities: &PriorityTable<usize>,
 ) -> (

@@ -54,6 +54,16 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    /// Create a new metrics tracker for a priority class.
+    ///
+    /// Initializes all counters to zero and pre-allocates the latency history buffer
+    /// to avoid reallocations during high packet rates.
+    ///
+    /// # Arguments
+    /// * `priority` - Priority class this metrics tracker will monitor
+    ///
+    /// # Returns
+    /// A new `Metrics` instance with empty statistics
     pub fn new(priority: Priority) -> Self {
         Self {
             priority,
@@ -69,6 +79,21 @@ impl Metrics {
         }
     }
 
+    /// Record a latency measurement and update statistics.
+    ///
+    /// Adds the latency to the time-windowed history, removes measurements outside
+    /// the time window, invalidates cached percentiles, and updates deadline miss
+    /// counters. This is called on the hot path (egress DRR), so it's optimized
+    /// for performance.
+    ///
+    /// # Arguments
+    /// * `latency` - Observed latency for this packet
+    /// * `deadline_missed` - Whether the packet exceeded its latency budget
+    ///
+    /// # Time Windowing
+    /// Only measurements within the last `time_window` (default 10 seconds) are
+    /// retained. This ensures all priority classes are compared over the same time
+    /// period regardless of packet rate differences.
     pub fn record_latency(&mut self, latency: Duration, deadline_missed: bool) {
         self.packet_count += 1;
 
@@ -103,7 +128,20 @@ impl Metrics {
         }
     }
 
-    // Compute all percentiles at once and cache them (more efficient than computing individually)
+    /// Compute all percentiles (P50, P95, P99, P99.9) at once and cache them.
+    ///
+    /// This method is more efficient than computing percentiles individually because
+    /// it sorts the latency array once and extracts all percentiles from the sorted
+    /// array. The results are cached in `RefCell` fields to avoid recomputation when
+    /// multiple percentiles are requested.
+    ///
+    /// # Caching Strategy
+    /// Percentiles are only recomputed when `packet_count` changes (new data arrived).
+    /// The cache is invalidated by `record_latency()` when new measurements are added.
+    ///
+    /// # Performance
+    /// O(n log n) where n is the number of measurements in the time window. The sort
+    /// is done once per cache invalidation, not per percentile query.
     fn compute_and_cache_percentiles(&self) {
         let cached_count = *self.cached_packet_count.borrow();
 
@@ -138,6 +176,14 @@ impl Metrics {
         }
     }
 
+    /// Compute the arithmetic mean of all latency measurements in the time window.
+    ///
+    /// Returns `Duration::ZERO` if no measurements are available. The average is
+    /// computed from the time-windowed history, so it reflects recent performance
+    /// rather than all-time statistics.
+    ///
+    /// # Returns
+    /// Average latency as a `Duration`, or `Duration::ZERO` if no measurements
     pub fn average_latency(&self) -> Duration {
         if self.latencies.is_empty() {
             return Duration::ZERO;
@@ -147,6 +193,19 @@ impl Metrics {
         Duration::from_secs_f64(mean / 1_000_000.0)
     }
 
+    /// Compute the standard deviation of latency measurements.
+    ///
+    /// Returns `None` if fewer than 2 measurements are available (standard deviation
+    /// requires at least 2 data points). The standard deviation is computed from the
+    /// time-windowed history.
+    ///
+    /// # Returns
+    /// Standard deviation as a `Duration`, or `None` if insufficient data
+    ///
+    /// # Formula
+    /// ```
+    /// std_dev = sqrt(sum((latency_i - mean)^2) / n)
+    /// ```
     pub fn standard_deviation(&self) -> Option<Duration> {
         if self.latencies.len() < 2 {
             return None;
@@ -163,6 +222,13 @@ impl Metrics {
         Some(Duration::from_secs_f64(std_dev / 1_000_000.0))
     }
 
+    /// Get the minimum latency observed in the time window.
+    ///
+    /// Returns `None` if no measurements are available. This is the best-case latency
+    /// for this priority class.
+    ///
+    /// # Returns
+    /// Minimum latency as a `Duration`, or `None` if no measurements
     pub fn min_latency(&self) -> Option<Duration> {
         if self.latencies.is_empty() {
             return None;
@@ -175,6 +241,13 @@ impl Metrics {
         Some(Duration::from_secs_f64(min / 1_000_000.0))
     }
 
+    /// Get the maximum latency observed in the time window (P100).
+    ///
+    /// Returns `None` if no measurements are available. This is the worst-case latency
+    /// for this priority class and represents the 100th percentile.
+    ///
+    /// # Returns
+    /// Maximum latency as a `Duration`, or `None` if no measurements
     pub fn max_latency(&self) -> Option<Duration> {
         if self.latencies.is_empty() {
             return None;
@@ -187,21 +260,52 @@ impl Metrics {
         Some(Duration::from_secs_f64(max / 1_000_000.0))
     }
 
+    /// Get the 50th percentile (median) latency.
+    ///
+    /// Returns `None` if no measurements are available. The result is cached and
+    /// only recomputed when new data arrives.
+    ///
+    /// # Returns
+    /// P50 latency as a `Duration`, or `None` if no measurements
     pub fn p50(&self) -> Option<Duration> {
         self.compute_and_cache_percentiles();
         *self.cached_p50.borrow()
     }
 
+    /// Get the 95th percentile latency.
+    ///
+    /// Returns `None` if no measurements are available. The result is cached and
+    /// only recomputed when new data arrives. P95 is commonly used to measure
+    /// tail latency performance.
+    ///
+    /// # Returns
+    /// P95 latency as a `Duration`, or `None` if no measurements
     pub fn p95(&self) -> Option<Duration> {
         self.compute_and_cache_percentiles();
         *self.cached_p95.borrow()
     }
 
+    /// Get the 99th percentile latency.
+    ///
+    /// Returns `None` if no measurements are available. The result is cached and
+    /// only recomputed when new data arrives. P99 is commonly used to measure
+    /// extreme tail latency performance.
+    ///
+    /// # Returns
+    /// P99 latency as a `Duration`, or `None` if no measurements
     pub fn p99(&self) -> Option<Duration> {
         self.compute_and_cache_percentiles();
         *self.cached_p99.borrow()
     }
 
+    /// Get the 99.9th percentile latency.
+    ///
+    /// Returns `None` if no measurements are available. The result is cached and
+    /// only recomputed when new data arrives. P99.9 captures the most extreme
+    /// tail latency events (1 in 1000 packets).
+    ///
+    /// # Returns
+    /// P99.9 latency as a `Duration`, or `None` if no measurements
     pub fn p999(&self) -> Option<Duration> {
         self.compute_and_cache_percentiles();
         *self.cached_p999.borrow()
@@ -225,15 +329,34 @@ impl Clone for Metrics {
     }
 }
 
-/// Metrics event for lock-free recording (sent from hot path)
+/// Metrics event for lock-free recording (sent from hot path).
+///
+/// This lightweight structure is sent through a lock-free channel from the egress DRR
+/// scheduler (hot path) to the metrics processor thread (background). Using a channel
+/// ensures the hot path never blocks on mutexes, maintaining low latency.
+///
+/// The event contains all information needed to update metrics: priority class, observed
+/// latency, and whether the packet missed its deadline.
 #[derive(Debug, Clone)]
 struct MetricsEvent {
+    /// Priority class of the packet (determines which Metrics instance to update)
     priority: Priority,
+    /// Observed latency (time from ingress to egress)
     latency: Duration,
+    /// Whether the packet exceeded its latency budget (deadline miss)
     deadline_missed: bool,
 }
 
-/// Snapshot emitted to external listeners (GUI, tests, logging).
+/// Snapshot of metrics emitted to external listeners (GUI, tests, logging).
+///
+/// This structure contains a complete snapshot of all metrics for a single priority class,
+/// including latency statistics (percentiles, average, min, max), deadline misses, queue
+/// occupancy, and drop counters. Snapshots are serialized to JSON and broadcast via TCP
+/// to GUI clients.
+///
+/// The snapshot is computed periodically (every 100ms) by the statistics thread running
+/// on the best-effort core, ensuring metrics collection doesn't interfere with packet
+/// processing.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MetricsSnapshot {
     pub priority: Priority,
@@ -287,6 +410,14 @@ pub struct MetricsSnapshot {
     pub total_drops: u64, // Total drops for this flow
 }
 
+/// Snapshot of worker queue depths and capacities (multi-worker EDF only).
+///
+/// Contains per-worker statistics showing current queue depths, capacities, and
+/// per-priority breakdowns. Used by the GUI to display worker load and identify
+/// bottlenecks in the multi-worker scheduler.
+///
+/// This snapshot is updated periodically (every 100ms) by the statistics thread
+/// and included in `MetricsSnapshot` for GUI display.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct WorkerLoadSnapshot {
     #[serde(default = "default_worker_depths")]
@@ -371,16 +502,49 @@ mod duration_millis_option {
 }
 
 /// Metrics collector coordinates hot-path event ingestion and background aggregation.
+///
+/// The collector uses a two-stage architecture to minimize contention on the hot path:
+/// 1. **Hot Path**: Egress DRR calls `record_packet()` which sends events to a lock-free
+///    channel (non-blocking, never waits on mutexes)
+/// 2. **Background Thread**: A dedicated thread processes events in batches, updating
+///    the metrics map while holding a mutex (lock held only briefly per batch)
+///
+/// This design ensures that packet processing latency is not affected by metrics collection,
+/// while still providing accurate statistics for monitoring and debugging.
+///
+/// # Thread Safety
+/// - `events_tx`: Lock-free channel (hot path writes, background thread reads)
+/// - `metrics`: Protected by `Mutex` (only background thread writes, statistics thread reads)
+/// - `worker_stats`: Protected by `Mutex` (statistics thread writes, metrics thread reads)
 pub struct MetricsCollector {
+    /// Per-priority metrics map (protected by Mutex, updated by background thread)
     metrics: Arc<Mutex<std::collections::HashMap<Priority, Metrics>>>,
+    /// Channel for broadcasting metrics snapshots to TCP clients (GUI)
     metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>,
-    // Lock-free channel for metrics events (hot path sends here, background thread processes)
+    /// Lock-free channel for metrics events (hot path sends here, background thread processes)
     events_tx: crossbeam_channel::Sender<MetricsEvent>,
+    /// Worker load statistics (multi-worker EDF only, updated by statistics thread)
     worker_stats: Arc<Mutex<Option<WorkerLoadSnapshot>>>,
 }
 
 impl MetricsCollector {
-    /// Create a new collector backed by the provided metrics sender and optional queue probes.
+    /// Create a new collector backed by the provided metrics sender.
+    ///
+    /// Initializes the collector with:
+    /// - A lock-free channel for hot-path events (bounded to 10000 events)
+    /// - A background thread that processes events in batches (100 events per batch)
+    /// - A metrics map that aggregates statistics per priority
+    /// - Worker stats storage (for multi-worker EDF scheduler)
+    ///
+    /// The background thread processes events asynchronously, updating the metrics map
+    /// while holding a mutex only briefly (once per batch). This ensures the hot path
+    /// never blocks on metrics collection.
+    ///
+    /// # Arguments
+    /// * `metrics_tx` - Channel sender for broadcasting metrics snapshots to TCP clients
+    ///
+    /// # Returns
+    /// A new `MetricsCollector` instance with background processing thread running
     pub fn new(metrics_tx: Sender<std::collections::HashMap<u64, MetricsSnapshot>>) -> Self {
         // Create lock-free channel for metrics events (bounded to prevent unbounded growth)
         let (events_tx, events_rx): (
@@ -441,8 +605,22 @@ impl MetricsCollector {
 
     /// Record a single packet latency event from the hot path.
     ///
-    /// The caller is typically the egress scheduler. Events are pushed into a lock-free channel and
-    /// processed on the statistics thread, so calling this method never blocks on mutexes.
+    /// This method is called by the egress DRR scheduler after processing each packet.
+    /// It sends the event through a lock-free channel to the background metrics processor
+    /// thread, ensuring the hot path never blocks on mutexes or metrics computation.
+    ///
+    /// # Arguments
+    /// * `priority` - Priority class of the processed packet
+    /// * `latency` - Observed latency (time from ingress timestamp to egress completion)
+    /// * `deadline_missed` - Whether the packet exceeded its latency budget
+    ///
+    /// # Performance
+    /// Non-blocking operation. If the channel is full, the event is dropped (silent
+    /// failure). This prevents backpressure from metrics collection affecting packet
+    /// processing latency.
+    ///
+    /// # Thread Safety
+    /// Safe to call from any thread. Uses lock-free channel with `Relaxed` ordering.
     pub fn record_packet(&self, priority: Priority, latency: Duration, deadline_missed: bool) {
         let _ = self.events_tx.send(MetricsEvent {
             priority,
@@ -452,6 +630,14 @@ impl MetricsCollector {
     }
 
     /// Update worker queue statistics (multi-worker EDF only).
+    ///
+    /// Called by the statistics thread to update worker load information. The stats
+    /// are included in metrics snapshots sent to GUI clients, allowing visualization
+    /// of per-worker queue depths and capacities.
+    ///
+    /// # Arguments
+    /// * `stats` - Worker statistics snapshot from multi-worker EDF scheduler, or `None`
+    ///   if using a different scheduler (stats are ignored for non-multi-worker schedulers)
     pub fn update_worker_stats(&self, stats: Option<MultiWorkerStats>) {
         let mut guard = self.worker_stats.lock();
         *guard = stats.map(|s| WorkerLoadSnapshot {
@@ -464,9 +650,21 @@ impl MetricsCollector {
 
     /// Aggregate current metrics and send a snapshot to listeners.
     ///
-    /// Called from the statistics thread running on the best-effort core. The method clones the
-    /// underlying structures while holding the mutex briefly, computes percentiles outside the lock,
-    /// and merges drop counters and queue occupancy information into the snapshot map.
+    /// Called periodically (every 100ms) by the statistics thread running on the best-effort
+    /// core. This method:
+    /// 1. Clones the metrics map while holding the mutex briefly (minimizes lock contention)
+    /// 2. Computes percentiles and statistics outside the lock (no blocking of other threads)
+    /// 3. Merges drop counters and queue occupancy information
+    /// 4. Sends the snapshot through the metrics channel to TCP clients (GUI)
+    ///
+    /// # Arguments
+    /// * `expected_latencies` - Per-priority latency budgets (used in snapshot for reference)
+    /// * `ingress_drops` - Per-priority drop counts from ingress DRR scheduler
+    /// * `edf_drops` - Drop counts from EDF scheduler (heap drops + per-priority output drops)
+    ///
+    /// # Performance
+    /// The mutex is held only for the clone operation (fast). All expensive computations
+    /// (percentiles, statistics) happen outside the lock, ensuring minimal contention.
     pub fn send_current_metrics(
         &self,
         expected_latencies: &PriorityTable<Duration>,

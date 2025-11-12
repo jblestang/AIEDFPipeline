@@ -2,6 +2,20 @@
 use std::error::Error;
 
 /// Configure CPU affinity for the process when available.
+///
+/// On Linux, restricts the process to run on cores 0, 1, and 2. This ensures the
+/// pipeline threads don't migrate to other cores, improving cache locality and
+/// reducing scheduling overhead.
+///
+/// On other platforms (macOS, Windows), this is a no-op (CPU affinity not available
+/// or requires different APIs).
+///
+/// # Returns
+/// `Ok(())` on success, or an error if affinity setting fails (Linux only)
+///
+/// # Platform Support
+/// - **Linux**: Uses `sched_setaffinity` to restrict process to cores 0-2
+/// - **Other platforms**: No-op (returns `Ok(())`)
 pub fn set_cpu_affinity() -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "linux")]
     {
@@ -26,6 +40,35 @@ pub fn set_cpu_affinity() -> Result<(), Box<dyn Error>> {
 }
 
 /// Attempt to set a cooperative thread priority on supported platforms.
+///
+/// Sets the thread's scheduling priority to improve real-time performance. Higher
+/// priority values result in more CPU time allocation and better responsiveness.
+///
+/// # Platform-Specific Behavior
+///
+/// ## Linux
+/// Uses `pthread_setschedparam` with real-time scheduling policies:
+/// - `priority >= 3`: `SCHED_FIFO` with priority 90 (highest real-time)
+/// - `priority == 2`: `SCHED_FIFO` with priority 70 (high real-time)
+/// - `priority == 1`: `SCHED_RR` with priority 30 (medium real-time)
+/// - `priority == 0`: `SCHED_OTHER` with priority 0 (default, lowest)
+///
+/// ## macOS
+/// Uses Quality of Service (QoS) classes:
+/// - `priority >= 2`: `QOS_CLASS_USER_INITIATED` (high priority for critical work)
+/// - `priority == 1`: `QOS_CLASS_UTILITY` (medium priority for utility work)
+/// - `priority == 0`: `QOS_CLASS_BACKGROUND` (low priority for background work)
+///
+/// ## Other Platforms
+/// No-op (thread priority setting not implemented)
+///
+/// # Arguments
+/// * `priority` - Priority level (0=lowest, higher values = higher priority)
+///
+/// # Note
+/// On Linux, real-time scheduling policies (`SCHED_FIFO`, `SCHED_RR`) require
+/// appropriate capabilities or root privileges. The function will silently fail
+/// if permissions are insufficient.
 pub fn set_thread_priority(priority: i32) {
     #[cfg(target_os = "linux")]
     {
@@ -97,6 +140,21 @@ pub fn set_thread_priority(priority: i32) {
 }
 
 /// Attempt to pin the current thread to a specific core when supported.
+///
+/// Restricts the current thread to run only on the specified CPU core. This improves
+/// cache locality and reduces context switching overhead, which is critical for
+/// low-latency packet processing.
+///
+/// # Platform Support
+/// - **Linux**: Uses `pthread_setaffinity_np` to pin thread to `core_id`
+/// - **Other platforms**: No-op (thread pinning not available or requires different APIs)
+///
+/// # Arguments
+/// * `core_id` - CPU core ID to pin the thread to (0-indexed)
+///
+/// # Note
+/// On Linux, thread pinning may require appropriate capabilities. The function will
+/// silently fail if the operation is not permitted.
 pub fn set_thread_core(core_id: usize) {
     #[cfg(target_os = "linux")]
     unsafe {

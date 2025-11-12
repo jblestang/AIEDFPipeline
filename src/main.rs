@@ -16,11 +16,24 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// Command-line options parsed from program arguments.
 struct CliOptions {
+    /// Scheduler strategy to use (Single, MultiWorker, Global, or GlobalVD)
     scheduler: SchedulerKind,
+    /// IP address and port for the metrics TCP server (default: "127.0.0.1:9999")
     metrics_bind: String,
 }
 
+/// Normalize a metrics bind address to include a port if missing.
+///
+/// If the address contains a colon (indicating a port is already specified), returns
+/// it as-is. Otherwise, appends the default port `:9999`.
+///
+/// # Arguments
+/// * `value` - IP address or IP:port string
+///
+/// # Returns
+/// Normalized address string with port (e.g., "127.0.0.1" → "127.0.0.1:9999")
 fn normalize_metrics_bind(value: &str) -> String {
     if value.contains(':') {
         value.to_string()
@@ -29,6 +42,20 @@ fn normalize_metrics_bind(value: &str) -> String {
     }
 }
 
+/// Parse command-line arguments into `CliOptions`.
+///
+/// Supports two argument formats:
+/// - `--scheduler=<value>` or `--scheduler <value>`: Select scheduler type
+/// - `--metrics-bind=<value>` or `--metrics-bind <value>`: Set metrics server bind address
+///
+/// # Supported Scheduler Values
+/// - `single`, `legacy`: Single-threaded EDF scheduler
+/// - `multi`, `multi-worker`, `multi_worker`: Multi-worker EDF with adaptive balancing
+/// - `gedf`, `g-edf`, `global`: Global EDF scheduler
+/// - `gedf-vd`, `g-edf-vd`, `global-vd`: Global EDF with virtual deadlines
+///
+/// # Returns
+/// `CliOptions` with parsed values (defaults to Single scheduler and "127.0.0.1:9999")
 fn parse_cli_options() -> CliOptions {
     let mut scheduler = SchedulerKind::default();
     let mut metrics_bind = String::from("127.0.0.1:9999");
@@ -72,6 +99,32 @@ fn parse_cli_options() -> CliOptions {
     }
 }
 
+/// Main entry point for the pipeline binary.
+///
+/// This function:
+/// 1. Parses command-line arguments to determine scheduler type and metrics bind address
+/// 2. Creates a Tokio runtime for async operations
+/// 3. Initializes the pipeline with the selected scheduler
+/// 4. Spawns a background thread for the metrics TCP server
+/// 5. Spawns a background thread for the pipeline runtime
+/// 6. Waits for Ctrl+C signal
+/// 7. Shuts down the pipeline gracefully
+///
+/// # Command-Line Arguments
+/// - `--scheduler=<type>`: Select scheduler (single, multi, gedf, gedf-vd)
+/// - `--metrics-bind=<addr>`: Set metrics server bind address (default: 127.0.0.1:9999)
+///
+/// # Example Usage
+/// ```bash
+/// # Run with multi-worker scheduler
+/// cargo run -- --scheduler=multi
+///
+/// # Run with custom metrics server address
+/// cargo run -- --metrics-bind=0.0.0.0:9999
+/// ```
+///
+/// # Returns
+/// `Ok(())` on successful shutdown, or an error if initialization fails
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = parse_cli_options();
 
