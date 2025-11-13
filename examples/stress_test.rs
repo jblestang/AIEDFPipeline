@@ -675,23 +675,32 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
     // Flow 1 (High): ports 8080, 8081
     // Flow 2 (Medium): ports 8082, 8083
     // Flow 3 (Low): ports 8084, 8085
-    let packets_per_socket_flow1 = packets_flow1 as usize / 2;
-    let packets_per_socket_flow2 = packets_flow2 as usize / 2;
-    let packets_per_socket_flow3 = packets_flow3 as usize / 2;
+    // 
+    // When using multiple sockets, we divide packets evenly but double the interval
+    // to maintain the same total rate (each socket sends at half rate, combined = full rate)
+    // Use ceiling division to ensure we don't lose packets due to integer division
+    let packets_per_socket_flow1 = (packets_flow1 as usize + 1) / 2; // Round up
+    let packets_per_socket_flow2 = (packets_flow2 as usize + 1) / 2; // Round up
+    let packets_per_socket_flow3 = (packets_flow3 as usize + 1) / 2; // Round up
+    
+    // Double the interval for each socket to maintain total rate (2 sockets * half rate = full rate)
+    let interval_per_socket_flow1 = interval_flow1 * 2;
+    let interval_per_socket_flow2 = interval_flow2 * 2;
+    let interval_per_socket_flow3 = interval_flow3 * 2;
     
     // Flow 1: High priority (2 sockets)
     test.send_packets(
         1,
         8080,
         packets_per_socket_flow1,
-        interval_flow1,
+        interval_per_socket_flow1,
         Some(flow1_bar.clone()),
     );
     test.send_packets(
         1,
         8081,
         packets_per_socket_flow1,
-        interval_flow1,
+        interval_per_socket_flow1,
         Some(flow1_bar.clone()),
     );
     thread::sleep(Duration::from_millis(10));
@@ -701,14 +710,14 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
         2,
         8082,
         packets_per_socket_flow2,
-        interval_flow2,
+        interval_per_socket_flow2,
         Some(flow2_bar.clone()),
     );
     test.send_packets(
         2,
         8083,
         packets_per_socket_flow2,
-        interval_flow2,
+        interval_per_socket_flow2,
         Some(flow2_bar.clone()),
     );
     thread::sleep(Duration::from_millis(10));
@@ -718,14 +727,14 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
         3,
         8084,
         packets_per_socket_flow3,
-        interval_flow3,
+        interval_per_socket_flow3,
         Some(flow3_bar.clone()),
     );
     test.send_packets(
         3,
         8085,
         packets_per_socket_flow3,
-        interval_flow3,
+        interval_per_socket_flow3,
         Some(flow3_bar.clone()),
     );
 
