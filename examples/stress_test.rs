@@ -599,7 +599,15 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
     let interval_flow2 = Duration::from_micros((1_000_000.0 / rate_flow2 as f64) as u64);
     let interval_flow3 = Duration::from_micros((1_000_000.0 / rate_flow3 as f64) as u64);
 
-    let receiver_handles: Vec<_> = vec![(1, 9080), (2, 9081), (3, 9082)]
+    // Receive packets from multiple output sockets per priority
+    // Flow 1 (High): ports 9080, 9081
+    // Flow 2 (Medium): ports 9082, 9083
+    // Flow 3 (Low): ports 9084, 9085
+    let receiver_handles: Vec<_> = vec![
+        (1, 9080), (1, 9081), // Flow 1: High priority (2 sockets)
+        (2, 9082), (2, 9083), // Flow 2: Medium priority (2 sockets)
+        (3, 9084), (3, 9085), // Flow 3: Low priority (2 sockets)
+    ]
         .into_iter()
         .map(|(flow_id, port)| {
             let test_clone = StressTest {
@@ -607,7 +615,7 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
                 packets_received: test.packets_received.clone(),
             };
             thread::spawn(move || {
-                test_clone.receive_packets(port, flow_id, test_duration + Duration::from_secs(2))
+                (flow_id, test_clone.receive_packets(port, flow_id, test_duration + Duration::from_secs(2)))
             })
         })
         .collect();
@@ -663,26 +671,60 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
             .progress_chars("=>-"),
     );
 
+    // Send packets to multiple sockets per priority for load balancing
+    // Flow 1 (High): ports 8080, 8081
+    // Flow 2 (Medium): ports 8082, 8083
+    // Flow 3 (Low): ports 8084, 8085
+    let packets_per_socket_flow1 = packets_flow1 as usize / 2;
+    let packets_per_socket_flow2 = packets_flow2 as usize / 2;
+    let packets_per_socket_flow3 = packets_flow3 as usize / 2;
+    
+    // Flow 1: High priority (2 sockets)
     test.send_packets(
         1,
         8080,
-        packets_flow1 as usize,
+        packets_per_socket_flow1,
+        interval_flow1,
+        Some(flow1_bar.clone()),
+    );
+    test.send_packets(
+        1,
+        8081,
+        packets_per_socket_flow1,
         interval_flow1,
         Some(flow1_bar.clone()),
     );
     thread::sleep(Duration::from_millis(10));
+    
+    // Flow 2: Medium priority (2 sockets)
     test.send_packets(
         2,
-        8081,
-        packets_flow2 as usize,
+        8082,
+        packets_per_socket_flow2,
+        interval_flow2,
+        Some(flow2_bar.clone()),
+    );
+    test.send_packets(
+        2,
+        8083,
+        packets_per_socket_flow2,
         interval_flow2,
         Some(flow2_bar.clone()),
     );
     thread::sleep(Duration::from_millis(10));
+    
+    // Flow 3: Low priority (2 sockets)
     test.send_packets(
         3,
-        8082,
-        packets_flow3 as usize,
+        8084,
+        packets_per_socket_flow3,
+        interval_flow3,
+        Some(flow3_bar.clone()),
+    );
+    test.send_packets(
+        3,
+        8085,
+        packets_per_socket_flow3,
         interval_flow3,
         Some(flow3_bar.clone()),
     );
@@ -702,15 +744,17 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
 
     println!("Test completed. Waiting for receivers to finish...\n");
 
-    let results: Vec<(u64, Vec<(Instant, String)>)> = receiver_handles
-        .into_iter()
-        .enumerate()
-        .map(|(i, handle)| {
-            let flow_id = (i + 1) as u64;
-            let packets = handle.join().unwrap();
-            (flow_id, packets)
-        })
-        .collect();
+    // Collect results from all receivers and merge by flow_id
+    let mut results_by_flow: std::collections::HashMap<u64, Vec<(Instant, String)>> = std::collections::HashMap::new();
+    for handle in receiver_handles {
+        let (flow_id, packets) = handle.join().unwrap();
+        results_by_flow.entry(flow_id).or_insert_with(Vec::new).extend(packets);
+    }
+    // Sort packets by timestamp within each flow
+    for packets in results_by_flow.values_mut() {
+        packets.sort_by_key(|(time, _)| *time);
+    }
+    let results: Vec<(u64, Vec<(Instant, String)>)> = results_by_flow.into_iter().collect();
 
     let stats = analyze_results(&results, test_start, test_duration);
 

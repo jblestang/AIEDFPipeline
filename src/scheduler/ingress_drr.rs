@@ -63,8 +63,9 @@ struct FlowState {
 /// the mutex, reducing contention and improving performance.
 #[derive(Clone)]
 struct FlowSnapshot {
-    /// The UDP socket for this priority flow
-    socket: Arc<StdUdpSocket>,
+    /// All UDP sockets for this priority flow (multiple sockets per priority supported)
+    /// When processing, we poll all sockets together to maximize throughput.
+    sockets: Vec<Arc<StdUdpSocket>>,
     /// The DRR state (quantum, deficit, latency_budget) for this priority
     state: Arc<FlowState>,
 }
@@ -76,9 +77,10 @@ struct FlowSnapshot {
 /// lock before entering the hot processing loop.
 #[derive(Debug)]
 struct IngressDRRState {
-    /// Socket configuration keyed by priority for O(1) lookup.
-    /// Maps each priority to its associated UDP socket.
-    socket_configs: HashMap<Priority, SocketConfig>,
+    /// Socket configurations keyed by priority for O(1) lookup.
+    /// Maps each priority to a vector of UDP sockets (multiple sockets per priority supported).
+    /// When processing, all sockets of the same priority are polled together.
+    socket_configs: HashMap<Priority, Vec<SocketConfig>>,
     /// Per-priority DRR state (quantum + deficit atomics).
     /// Each priority has its own FlowState with quantum and atomic deficit counter.
     flow_states: HashMap<Priority, Arc<FlowState>>,
@@ -154,6 +156,9 @@ impl IngressDRRScheduler {
 
     /// Register a new input socket associated with a priority class and DRR quantum.
     ///
+    /// Multiple sockets can be registered for the same priority. When processing,
+    /// all sockets of the same priority are polled together to maximize throughput.
+    ///
     /// # Arguments
     /// * `socket` - The UDP socket to read packets from
     /// * `priority` - The priority class for packets from this socket
@@ -173,19 +178,21 @@ impl IngressDRRScheduler {
 
         // OPTIMISATION: Build per-flow state once and store atomics for deficit updates
         // The deficit counter is atomic, so updates in the hot loop don't require locking.
-        let flow_state = Arc::new(FlowState {
-            quantum, // Store quantum (number of packets per round)
-            deficit: AtomicUsize::new(0), // Initialize deficit to 0 (no credit yet)
-            latency_budget, // Store latency budget for packet creation
-        });
-
-        // OPTIMIZATION: Single lock acquisition for all state updates
-        // We acquire the lock once and update all related state atomically.
+        // Only create flow state if this is the first socket for this priority.
         let mut state = self.state.lock();
-        // Register the socket configuration for this priority
-        state.socket_configs.insert(priority, config);
-        // Register the flow state for this priority
-        state.flow_states.insert(priority, flow_state);
+        
+        // Get or create flow state for this priority (shared across all sockets of same priority)
+        let _flow_state = state.flow_states.entry(priority).or_insert_with(|| {
+            Arc::new(FlowState {
+                quantum, // Store quantum (number of packets per round)
+                deficit: AtomicUsize::new(0), // Initialize deficit to 0 (no credit yet)
+                latency_budget, // Store latency budget for packet creation
+            })
+        });
+        
+        // Register the socket configuration for this priority (append to vector)
+        state.socket_configs.entry(priority).or_insert_with(Vec::new).push(config);
+        
         // Add to active flows list if not already present (for round-robin iteration)
         if !state.active_flows.contains(&priority) {
             state.active_flows.push(priority);
@@ -231,21 +238,27 @@ impl IngressDRRScheduler {
                 };
                 // Get the current round-robin index
                 let current_index = state.current_flow_index;
-                // Build a snapshot map: priority -> (socket, flow_state)
+                // Build a snapshot map: priority -> (sockets, flow_state)
                 // This allows O(1) lookup in the hot loop without holding the mutex.
+                // All sockets for the same priority are collected together for batch polling.
                 let snapshot_map: HashMap<Priority, FlowSnapshot> = state
                     .active_flows
                     .iter()
                     .filter_map(|priority| {
-                        // Get socket config for this priority
-                        let socket = state.socket_configs.get(priority)?;
+                        // Get socket configs for this priority (may be multiple sockets)
+                        let socket_configs = state.socket_configs.get(priority)?;
                         // Get flow state for this priority
                         let flow_state = state.flow_states.get(priority)?;
-                        // Create snapshot entry
+                        // Collect all sockets for this priority into a vector
+                        let sockets: Vec<Arc<StdUdpSocket>> = socket_configs
+                            .iter()
+                            .map(|config| config.socket.clone())
+                            .collect();
+                        // Create snapshot entry with all sockets for this priority
                         Some((
                             *priority, // Priority as key
                             FlowSnapshot {
-                                socket: socket.socket.clone(), // Clone socket Arc
+                                sockets, // All sockets for this priority
                                 state: flow_state.clone(), // Clone flow state Arc
                             },
                         ))
@@ -274,12 +287,12 @@ impl IngressDRRScheduler {
 
                 let priority = active_flows[flow_index];
 
-                // Get socket and flow state from snapshot (no lock needed)
+                // Get sockets and flow state from snapshot (no lock needed)
                 let flow_snapshot = match snapshot_map.get(&priority) {
                     Some(snapshot) => snapshot.clone(),
                     None => continue,
                 };
-                let socket = flow_snapshot.socket;
+                let sockets = &flow_snapshot.sockets;
                 let flow_state = flow_snapshot.state;
 
                 // Atomically add quantum to deficit and retrieve local copy
@@ -293,11 +306,14 @@ impl IngressDRRScheduler {
                 }
 
                 // ========================================================================
-                // STEP 4: Read packets until deficit is exhausted or socket is empty
+                // STEP 4: Read packets from all sockets of this priority until deficit is exhausted
                 // ========================================================================
-                // Inner loop: read packets from this flow's socket until:
+                // Poll all sockets of the same priority together to maximize throughput.
+                // This ensures we drain all available packets from all sockets before moving
+                // to the next priority, improving fairness and reducing latency.
+                // Inner loop: read packets from all sockets of this priority until:
                 // - Deficit is exhausted (no more credit)
-                // - Socket is empty (WouldBlock error)
+                // - All sockets are empty (WouldBlock errors)
                 // - Shutdown is requested
                 // - EDF queue is full (drop packet and move to next flow)
                 loop {
@@ -311,55 +327,83 @@ impl IngressDRRScheduler {
                         break; // No more credit, move to next flow
                     }
 
-                    // Non-blocking read from UDP socket using a pooled buffer sized to the datagram.
-                    // We use FIONREAD (if available) to get the expected datagram size, allowing
-                    // us to allocate the right-sized buffer from the pool (zero-copy optimization).
-                    let expected = datagram_size_hint(&socket); // Get expected size (or MAX_PACKET_SIZE)
-                    let mut lease = buffer_pool::lease(expected); // Lease buffer from pool
-                    // Attempt to receive a UDP datagram (non-blocking)
-                    match socket.recv_from(lease.as_mut_slice()) {
-                        Ok((size, _addr)) if size > 0 => {
-                            // Successfully received a packet: decrement deficit
-                            local_deficit = local_deficit.saturating_sub(1);
+                    // Track if we read any packets from any socket in this iteration
+                    let mut read_any = false;
 
-                            // Materialise packet (including timestamp used for EDF deadlines).
-                            // The buffer is frozen at the actual size (may be smaller than expected).
-                            let buffer = lease.freeze(size); // Freeze buffer at actual size
-                            // Create packet with priority, buffer, and latency budget
-                            let packet =
-                                Packet::from_buffer(priority, buffer, flow_state.latency_budget);
+                    // Poll all sockets of this priority together
+                    for socket in sockets {
+                        // Check if we've exhausted our deficit (may have been consumed by previous sockets)
+                        if local_deficit == 0 {
+                            break; // No more credit, exit socket loop
+                        }
 
-                            // Get the output channel for this priority
-                            let tx = &self.priority_queues[priority];
+                        // Check shutdown flag
+                        if !running.load(Ordering::Relaxed) {
+                            break; // Shutdown requested, exit socket loop
+                        }
 
-                            // Try to send to EDF queue (non-blocking)
-                            if tx.try_send(packet).is_ok() {
-                                // Successfully forwarded: increment packet counter
-                                packets_read += 1;
-                            } else {
-                                // Channel full → drop packet and move to the next flow.
-                                // Increment drop counter atomically (relaxed ordering is sufficient)
-                                self.drop_counters[priority].fetch_add(1, Ordering::Relaxed);
-                                break; // Exit inner loop, move to next flow
+                        // Skip to next socket if this one has no data (optimization)
+                        let size_hint = datagram_size_hint(socket);
+                        if size_hint == 0 {
+                            continue; // No data available, try next socket
+                        }
+
+                        // Non-blocking read from UDP socket using a pooled buffer sized to the datagram.
+                        // We use FIONREAD (if available) to get the expected datagram size, allowing
+                        // us to allocate the right-sized buffer from the pool (zero-copy optimization).
+                        let expected = size_hint;
+                        let mut lease = buffer_pool::lease(expected); // Lease buffer from pool
+                        // Attempt to receive a UDP datagram (non-blocking)
+                        match socket.recv_from(lease.as_mut_slice()) {
+                            Ok((size, _addr)) if size > 0 => {
+                                // Successfully received a packet: decrement deficit
+                                local_deficit = local_deficit.saturating_sub(1);
+                                read_any = true;
+
+                                // Materialise packet (including timestamp used for EDF deadlines).
+                                // The buffer is frozen at the actual size (may be smaller than expected).
+                                let buffer = lease.freeze(size); // Freeze buffer at actual size
+                                // Create packet with priority, buffer, and latency budget
+                                let packet =
+                                    Packet::from_buffer(priority, buffer, flow_state.latency_budget);
+
+                                // Get the output channel for this priority
+                                let tx = &self.priority_queues[priority];
+
+                                // Try to send to EDF queue (non-blocking)
+                                if tx.try_send(packet).is_ok() {
+                                    // Successfully forwarded: increment packet counter
+                                    packets_read += 1;
+                                } else {
+                                    // Channel full → drop packet and move to the next flow.
+                                    // Increment drop counter atomically (relaxed ordering is sufficient)
+                                    self.drop_counters[priority].fetch_add(1, Ordering::Relaxed);
+                                    break; // Exit socket loop, will exit inner loop
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                // No data for this socket yet (socket is empty).
+                                // This is expected: the socket is non-blocking and has no data.
+                                drop(lease); // Return buffer to pool
+                                continue; // Try next socket
+                            }
+                            Err(_) => {
+                                // Socket error; skip to next socket.
+                                // This could be a network error, socket closed, etc.
+                                drop(lease); // Return buffer to pool
+                                continue; // Try next socket
+                            }
+                            _ => {
+                                // Unexpected zero-byte packet or error, skip to next socket.
+                                // This shouldn't happen normally, but we handle it gracefully.
+                                continue; // Try next socket
                             }
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // No data for this flow yet (socket is empty).
-                            // This is expected: the socket is non-blocking and has no data.
-                            drop(lease); // Return buffer to pool
-                            break; // Exit inner loop, move to next flow
-                        }
-                        Err(_) => {
-                            // Socket error; skip to next flow.
-                            // This could be a network error, socket closed, etc.
-                            drop(lease); // Return buffer to pool
-                            break; // Exit inner loop, move to next flow
-                        }
-                        _ => {
-                            // Unexpected zero-byte packet or error, simply move on.
-                            // This shouldn't happen normally, but we handle it gracefully.
-                            break; // Exit inner loop, move to next flow
-                        }
+                    }
+
+                    // If we didn't read any packets from any socket, all sockets are empty
+                    if !read_any {
+                        break; // All sockets empty, exit inner loop, move to next flow
                     }
                 }
 

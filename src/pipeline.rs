@@ -223,7 +223,12 @@ impl Pipeline {
     pub async fn new(config: PipelineConfig) -> Result<Self, Box<dyn std::error::Error>> {
         set_cpu_affinity()?;
 
+        // Create multiple sockets per priority for load balancing and redundancy
+        // High priority: ports 8080-8081 (2 sockets)
+        // Medium priority: ports 8082-8083 (2 sockets)
+        // Low priority: ports 8084-8085 (2 sockets)
         let input_sockets = vec![
+            // High priority sockets
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 8080,
@@ -233,18 +238,43 @@ impl Pipeline {
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 8081,
+                latency_budget: Duration::from_millis(1),
+                priority: Priority::High,
+            },
+            // Medium priority sockets
+            SocketConfig {
+                address: "127.0.0.1".to_string(),
+                port: 8082,
                 latency_budget: Duration::from_millis(10),
                 priority: Priority::Medium,
             },
             SocketConfig {
                 address: "127.0.0.1".to_string(),
-                port: 8082,
+                port: 8083,
+                latency_budget: Duration::from_millis(10),
+                priority: Priority::Medium,
+            },
+            // Low priority sockets
+            SocketConfig {
+                address: "127.0.0.1".to_string(),
+                port: 8084,
+                latency_budget: Duration::from_millis(100),
+                priority: Priority::Low,
+            },
+            SocketConfig {
+                address: "127.0.0.1".to_string(),
+                port: 8085,
                 latency_budget: Duration::from_millis(100),
                 priority: Priority::Low,
             },
         ];
 
+        // Create multiple output sockets per priority for load balancing
+        // High priority: ports 9080-9081 (2 sockets)
+        // Medium priority: ports 9082-9083 (2 sockets)
+        // Low priority: ports 9084-9085 (2 sockets)
         let output_sockets = vec![
+            // High priority sockets
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 9080,
@@ -254,12 +284,32 @@ impl Pipeline {
             SocketConfig {
                 address: "127.0.0.1".to_string(),
                 port: 9081,
+                latency_budget: Duration::from_millis(1),
+                priority: Priority::High,
+            },
+            // Medium priority sockets
+            SocketConfig {
+                address: "127.0.0.1".to_string(),
+                port: 9082,
                 latency_budget: Duration::from_millis(10),
                 priority: Priority::Medium,
             },
             SocketConfig {
                 address: "127.0.0.1".to_string(),
-                port: 9082,
+                port: 9083,
+                latency_budget: Duration::from_millis(10),
+                priority: Priority::Medium,
+            },
+            // Low priority sockets
+            SocketConfig {
+                address: "127.0.0.1".to_string(),
+                port: 9084,
+                latency_budget: Duration::from_millis(100),
+                priority: Priority::Low,
+            },
+            SocketConfig {
+                address: "127.0.0.1".to_string(),
+                port: 9085,
                 latency_budget: Duration::from_millis(100),
                 priority: Priority::Low,
             },
