@@ -128,6 +128,36 @@ impl Metrics {
         }
     }
 
+    /// Remove old measurements outside the time window.
+    ///
+    /// This method should be called periodically (e.g., when sending metrics to GUI)
+    /// to ensure stale measurements are removed even when no new packets arrive.
+    /// This prevents latency from appearing to increase when traffic stops.
+    ///
+    /// # Time Windowing
+    /// Only measurements within the last `time_window` (default 10 seconds) are
+    /// retained. Measurements older than this are removed to prevent stale data
+    /// from affecting statistics.
+    pub fn cleanup_old_measurements(&mut self) {
+        let now = Instant::now();
+        let cutoff_time = now.checked_sub(self.time_window).unwrap_or(now);
+        
+        // Remove old measurements outside the time window
+        while let Some(front) = self.latencies.front() {
+            if front.timestamp < cutoff_time {
+                self.latencies.pop_front();
+            } else {
+                break; // Remaining measurements are all within the window
+            }
+        }
+        
+        // Invalidate cache when cleanup happens (data changed)
+        *self.cached_p50.borrow_mut() = None;
+        *self.cached_p95.borrow_mut() = None;
+        *self.cached_p99.borrow_mut() = None;
+        *self.cached_p999.borrow_mut() = None;
+    }
+
     /// Compute all percentiles (P50, P95, P99, P99.9) at once and cache them.
     ///
     /// This method is more efficient than computing percentiles individually because
@@ -677,10 +707,15 @@ impl MetricsCollector {
         let queue2_occupancy = 0;
         let queue2_capacity = 0;
 
-        // Quick clone to minimize lock hold time (reduces priority inversion risk)
-        // Statistics computation happens outside the lock
+        // Clean up old measurements and clone metrics (minimize lock hold time)
+        // This ensures stale measurements are removed even when no new packets arrive,
+        // preventing latency from appearing to increase when traffic stops.
         let metrics_clone: std::collections::HashMap<Priority, Metrics> = {
-            let metrics = self.metrics.lock();
+            let mut metrics = self.metrics.lock();
+            // Clean up old measurements for each priority before cloning
+            for metrics_entry in metrics.values_mut() {
+                metrics_entry.cleanup_old_measurements();
+            }
             metrics.clone() // Clone while holding lock (fast operation)
         }; // Lock released here
         let worker_stats_snapshot = { self.worker_stats.lock().clone() };
