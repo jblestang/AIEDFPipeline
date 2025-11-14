@@ -53,6 +53,7 @@ fn normalize_metrics_bind(value: &str) -> String {
 /// - `multi`, `multi-worker`, `multi_worker`: Multi-worker EDF with adaptive balancing
 /// - `gedf`, `g-edf`, `global`: Global EDF scheduler
 /// - `gedf-vd`, `g-edf-vd`, `global-vd`: Global EDF with virtual deadlines
+/// - `cedf`, `clairvoyant`: Clairvoyant EDF scheduler
 ///
 /// # Returns
 /// `CliOptions` with parsed values (defaults to Single scheduler and "127.0.0.1:9999")
@@ -68,6 +69,7 @@ fn parse_cli_options() -> CliOptions {
                         "multi" | "multi-worker" | "multi_worker" => SchedulerKind::MultiWorker,
                         "gedf" | "g-edf" | "global" => SchedulerKind::Global,
                         "gedf-vd" | "g-edf-vd" | "global-vd" => SchedulerKind::GlobalVD,
+                        "cedf" | "clairvoyant" => SchedulerKind::Clairvoyant,
                         "single" | "legacy" => SchedulerKind::Single,
                         _ => scheduler,
                     };
@@ -83,6 +85,7 @@ fn parse_cli_options() -> CliOptions {
                     "multi" | "multi-worker" | "multi_worker" => SchedulerKind::MultiWorker,
                     "gedf" | "g-edf" | "global" => SchedulerKind::Global,
                     "gedf-vd" | "g-edf-vd" | "global-vd" => SchedulerKind::GlobalVD,
+                    "cedf" | "clairvoyant" => SchedulerKind::Clairvoyant,
                     "single" | "legacy" => SchedulerKind::Single,
                     _ => scheduler,
                 };

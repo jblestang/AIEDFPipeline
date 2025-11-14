@@ -173,9 +173,9 @@ impl SharedQueue {
 /// A PriorityTable mapping each priority to its scaling factor
 fn scaling_table() -> PriorityTable<f64> {
     PriorityTable::from_fn(|priority| match priority {
-        Priority::High => 0.05, // 95% reduction: High gets earliest virtual deadline (strongest priority)
-        Priority::Medium => 0.6, // 40% reduction: Medium gets earlier virtual deadline
-        Priority::Low => 0.75, // 25% reduction: Low gets earlier virtual deadline
+        Priority::High => 0.01, // 95% reduction: High gets earliest virtual deadline (strongest priority)
+        Priority::Medium => 0.8, // 40% reduction: Medium gets earlier virtual deadline
+        Priority::Low => 0.9, // 25% reduction: Low gets earlier virtual deadline
         Priority::BestEffort => 1.0, // No scaling: BestEffort uses original deadline (lowest priority)
     })
 }

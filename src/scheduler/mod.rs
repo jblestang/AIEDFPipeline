@@ -1,3 +1,4 @@
+pub mod cedf;
 pub mod edf;
 pub mod egress_drr;
 pub mod gedf;
