@@ -19,6 +19,7 @@ use crate::scheduler::egress_drr::EgressDRRScheduler;
 use crate::scheduler::gedf::GEDFScheduler;
 use crate::scheduler::gedf_vd::GEDFVDScheduler;
 use crate::scheduler::ingress_drr::IngressDRRScheduler;
+use crate::scheduler::mc_edf_elastic::MCEDFElasticScheduler;
 use crate::scheduler::multi_worker_edf::MultiWorkerScheduler;
 use crate::threading::{set_cpu_affinity, set_thread_core, set_thread_priority};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,6 +69,8 @@ pub enum SchedulerKind {
     GlobalVD,
     /// Clairvoyant EDF scheduler (multi-core optimized, uses slack time for optimal assignment)
     Clairvoyant,
+    /// Multi-Channel EDF with elasticity (one EDF per priority, intelligent Round Robin for HIGH)
+    MCEDFElastic,
 }
 
 impl Default for SchedulerKind {
@@ -218,6 +221,7 @@ pub struct Pipeline {
     edf_global: Option<Arc<GEDFScheduler>>,
     edf_global_vd: Option<Arc<GEDFVDScheduler>>,
     edf_cedf: Option<Arc<CEDFScheduler>>,
+    edf_mcedf: Option<Arc<MCEDFElasticScheduler>>,
     egress_drr: Arc<EgressDRRScheduler>,
     metrics_collector: Arc<MetricsCollector>,
     metrics_receiver: Receiver<std::collections::HashMap<u64, MetricsSnapshot>>,
@@ -341,12 +345,13 @@ impl Pipeline {
 
         let ingress_drr = Arc::new(IngressDRRScheduler::new(ingress_input_txs.clone()));
         let scheduler_kind = config.scheduler;
-        let (edf_single, edf_multi, edf_global, edf_global_vd, edf_cedf): (
+        let (edf_single, edf_multi, edf_global, edf_global_vd, edf_cedf, edf_mcedf): (
             Option<Arc<EDFScheduler>>,
             Option<Arc<MultiWorkerScheduler>>,
             Option<Arc<GEDFScheduler>>,
             Option<Arc<GEDFVDScheduler>>,
             Option<Arc<CEDFScheduler>>,
+            Option<Arc<MCEDFElasticScheduler>>,
         ) = match scheduler_kind {
             SchedulerKind::Single => {
                 let edf = Arc::new(EDFScheduler::new(
@@ -356,7 +361,7 @@ impl Pipeline {
                     edf_output_txs.clone(),
                     config.edf.max_heap_size,
                 ));
-                (Some(edf), None, None, None, None)
+                (Some(edf), None, None, None, None, None)
             }
             SchedulerKind::MultiWorker => {
                 let multi = Arc::new(MultiWorkerScheduler::new(
@@ -366,7 +371,7 @@ impl Pipeline {
                     edf_output_txs.clone(),
                     latency_table.clone(),
                 ));
-                (None, Some(multi), None, None, None)
+                (None, Some(multi), None, None, None, None)
             }
             SchedulerKind::Global => {
                 let global = Arc::new(GEDFScheduler::new(
@@ -375,7 +380,7 @@ impl Pipeline {
                     }),
                     edf_output_txs.clone(),
         ));
-                (None, None, Some(global), None, None)
+                (None, None, Some(global), None, None, None)
             }
             SchedulerKind::GlobalVD => {
                 let global_vd = Arc::new(GEDFVDScheduler::new(
@@ -384,7 +389,7 @@ impl Pipeline {
                     }),
                     edf_output_txs.clone(),
         ));
-                (None, None, None, Some(global_vd), None)
+                (None, None, None, Some(global_vd), None, None)
             }
             SchedulerKind::Clairvoyant => {
                 let cedf = Arc::new(CEDFScheduler::new(
@@ -393,7 +398,16 @@ impl Pipeline {
                     }),
                     edf_output_txs.clone(),
         ));
-                (None, None, None, None, Some(cedf))
+                (None, None, None, None, Some(cedf), None)
+            }
+            SchedulerKind::MCEDFElastic => {
+                let mcedf = Arc::new(MCEDFElasticScheduler::new(
+                    PriorityTable::from_fn(|priority| {
+                        Arc::new(ingress_input_rxs[priority].clone())
+                    }),
+                    edf_output_txs.clone(),
+                ));
+                (None, None, None, None, None, Some(mcedf))
             }
         };
         let egress_drr = Arc::new(EgressDRRScheduler::new(edf_output_rxs.clone()));
@@ -408,6 +422,7 @@ impl Pipeline {
             edf_global: edf_global.clone(),
             edf_global_vd: edf_global_vd.clone(),
             edf_cedf: edf_cedf.clone(),
+            edf_mcedf: edf_mcedf.clone(),
             egress_drr,
             metrics_collector,
             metrics_receiver: metrics_rx,
@@ -673,6 +688,26 @@ impl Pipeline {
                     &worker_cores,
                 );
             }
+            SchedulerKind::MCEDFElastic => {
+                let scheduler = self
+                    .edf_mcedf
+                    .as_ref()
+                    .expect("MC-EDF scheduler must be present")
+                    .clone();
+                let running_mcedf = self.running.clone();
+                let worker_cores = if self.config.cores.edf_workers.is_empty() {
+                    vec![self.config.cores.edf_dispatcher]
+                } else {
+                    self.config.cores.edf_workers.clone()
+                };
+                scheduler.spawn_threads(
+                    running_mcedf,
+                    set_thread_priority,
+                    set_thread_core,
+                    self.config.cores.edf_dispatcher,
+                    &worker_cores,
+                );
+            }
         }
 
         // Start EgressDRRScheduler (reads from priority queues, writes to UDP sockets)
@@ -723,6 +758,7 @@ impl Pipeline {
         let edf_global_for_drops = self.edf_global.clone();
         let edf_global_vd_for_drops = self.edf_global_vd.clone();
         let edf_cedf_for_drops = self.edf_cedf.clone();
+        let edf_mcedf_for_drops = self.edf_mcedf.clone();
         let scheduler_kind = self.scheduler_kind;
         let stats_core = self.config.cores.egress;
         std::thread::Builder::new()
@@ -762,6 +798,10 @@ impl Pipeline {
                             SchedulerKind::Clairvoyant => edf_cedf_for_drops
                                 .as_ref()
                                 .expect("CEDF should exist")
+                                .get_drop_counts(),
+                            SchedulerKind::MCEDFElastic => edf_mcedf_for_drops
+                                .as_ref()
+                                .expect("MC-EDF should exist")
                                 .get_drop_counts(),
                         };
                         if let Some(multi) = edf_multi_for_drops.as_ref() {

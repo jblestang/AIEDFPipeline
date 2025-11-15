@@ -54,6 +54,7 @@ fn normalize_metrics_bind(value: &str) -> String {
 /// - `gedf`, `g-edf`, `global`: Global EDF scheduler
 /// - `gedf-vd`, `g-edf-vd`, `global-vd`: Global EDF with virtual deadlines
 /// - `cedf`, `clairvoyant`: Clairvoyant EDF scheduler
+/// - `mcedf`, `mc-edf`, `mc-edf-elastic`: Multi-Channel EDF with elasticity scheduler
 ///
 /// # Returns
 /// `CliOptions` with parsed values (defaults to Single scheduler and "127.0.0.1:9999")
@@ -70,6 +71,7 @@ fn parse_cli_options() -> CliOptions {
                         "gedf" | "g-edf" | "global" => SchedulerKind::Global,
                         "gedf-vd" | "g-edf-vd" | "global-vd" => SchedulerKind::GlobalVD,
                         "cedf" | "clairvoyant" => SchedulerKind::Clairvoyant,
+                        "mcedf" | "mc-edf" | "mc-edf-elastic" => SchedulerKind::MCEDFElastic,
                         "single" | "legacy" => SchedulerKind::Single,
                         _ => scheduler,
                     };

@@ -4,4 +4,5 @@ pub mod egress_drr;
 pub mod gedf;
 pub mod gedf_vd;
 pub mod ingress_drr;
+pub mod mc_edf_elastic;
 pub mod multi_worker_edf;
