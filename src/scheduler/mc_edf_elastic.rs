@@ -620,12 +620,24 @@ fn edf_worker_loop(
             // HIGH packets should never be delayed by elasticity
             if has_elasticity && task.priority != Priority::High {
                 let wait_start = Instant::now();
-                let check_interval = Duration::from_micros(3); // Check every 3µs for HIGH (more frequent)
+                // Hybrid approach: short busy polling for low latency, then sleep to save CPU
+                let busy_poll_duration = Duration::from_micros(50); // Busy poll first 50µs
+                let check_interval = Duration::from_micros(10); // Check every 10µs during busy poll
+                let sleep_interval = Duration::from_micros(50); // Sleep 50µs between checks after busy poll
                 let mut last_check = Instant::now();
+                let mut in_busy_poll = true;
                 
                 while wait_start.elapsed() < elasticity {
-                    // Check for incoming HIGH packets frequently during elasticity window
-                    if last_check.elapsed() >= check_interval {
+                    let elapsed = wait_start.elapsed();
+                    
+                    // Transition from busy polling to sleep-based after initial period
+                    if in_busy_poll && elapsed >= busy_poll_duration {
+                        in_busy_poll = false;
+                        last_check = Instant::now();
+                    }
+                    
+                    // Check for incoming HIGH packets
+                    if last_check.elapsed() >= if in_busy_poll { check_interval } else { sleep_interval } {
                         if let Ok(new_task) = input.try_recv() {
                             // New packet arrived! Push it and current task back to heap
                             let mut heap_guard = heap.lock();
@@ -637,16 +649,39 @@ fn edf_worker_loop(
                             continue;
                         }
                         last_check = Instant::now();
+                        
+                        // Sleep during non-busy-poll phase to avoid wasting CPU
+                        if !in_busy_poll {
+                            let remaining = elasticity.saturating_sub(elapsed);
+                            let sleep_duration = sleep_interval.min(remaining);
+                            if sleep_duration.as_nanos() > 0 {
+                                thread::sleep(sleep_duration);
+                            }
+                        }
                     }
-                    std::hint::spin_loop();
+                    
+                    // Only busy spin during initial period
+                    if in_busy_poll {
+                        std::hint::spin_loop();
+                    } else {
+                        // Yield during sleep phase to let other threads run
+                        thread::yield_now();
+                    }
                 }
             }
 
-            // Process the packet
+            // Process the packet (simulate processing)
             let processing_time = processing_duration(&task.packet);
-            let start = Instant::now();
-            while start.elapsed() < processing_time {
-                std::hint::spin_loop();
+            // Use sleep instead of busy polling to avoid wasting CPU
+            // For very short processing times (< 100µs), we still do a quick busy wait for accuracy
+            if processing_time < Duration::from_micros(100) {
+                let start = Instant::now();
+                while start.elapsed() < processing_time {
+                    std::hint::spin_loop();
+                }
+            } else {
+                // For longer processing times, use sleep to save CPU
+                thread::sleep(processing_time);
             }
 
             // Forward to output queue
