@@ -120,14 +120,14 @@ impl EDFScheduler {
     /// * `max_heap_size` - Unused (retained for compatibility, scheduler uses per-priority buffers)
     pub fn new(
         input_queues: PriorityTable<Arc<Receiver<Packet>>>, // Input channels per priority
-        output_queues: PriorityTable<Sender<Packet>>, // Output channels per priority
+        output_queues: PriorityTable<Sender<Packet>>,       // Output channels per priority
         max_heap_size: usize, // Unused: retained for API compatibility
     ) -> Self {
         // Initialize drop counters to zero for each priority
         let output_drop_counters = PriorityTable::from_fn(|_| Arc::new(AtomicU64::new(0)));
         Self {
-            input_queues, // Store input channels
-            output_queues, // Store output channels
+            input_queues,         // Store input channels
+            output_queues,        // Store output channels
             output_drop_counters, // Store atomic drop counters
             // Initialize pending buffer: one slot per priority, all empty (None)
             pending: Arc::new(Mutex::new(PriorityTable::from_fn(|_| None))),
@@ -218,7 +218,7 @@ impl EDFScheduler {
         let task = buffers[selected_priority]
             .take() // Remove from buffer (sets slot to None)
             .expect("pending task must exist for selected priority"); // Should never fail
-        // Release the lock early (we no longer need the buffer)
+                                                                      // Release the lock early (we no longer need the buffer)
         drop(buffers);
 
         // Extract the packet from the task
@@ -233,7 +233,7 @@ impl EDFScheduler {
         // Maximum: ~0.20 ms for MTU-sized packets (1500 bytes)
 
         let base_ms = 0.10; // Base processing time (0.10 ms)
-        // Calculate extra processing time for larger packets
+                            // Calculate extra processing time for larger packets
         let extra_ms = if packet.len() > 200 {
             // Clamp packet size to MTU (1500 bytes) to avoid unrealistic values
             let clamped = packet.len().min(1500);

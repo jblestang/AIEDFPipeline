@@ -80,9 +80,9 @@ impl EgressDRRScheduler {
     /// * `address` - The destination address for UDP packets
     pub fn add_output_socket(
         &self,
-        priority: Priority, // Priority class for this socket
+        priority: Priority,     // Priority class for this socket
         socket: Arc<UdpSocket>, // UDP socket to send to
-        address: SocketAddr, // Destination address
+        address: SocketAddr,    // Destination address
     ) {
         // Set socket to non-blocking mode (required for async operation)
         socket
@@ -132,7 +132,7 @@ impl EgressDRRScheduler {
         let socket_map: HashMap<Priority, Vec<(Arc<UdpSocket>, SocketAddr)>> = {
             let sockets = self.output_sockets.lock(); // Acquire mutex
             sockets.clone() // Clone the map
-            // Lock is released here (RAII)
+                            // Lock is released here (RAII)
         };
         // Clone last packet ID trackers (for order verification)
         let last_ids = PriorityTable::from_fn(|priority| self.last_packet_ids[priority].clone());
@@ -201,8 +201,9 @@ impl EgressDRRScheduler {
                                     // Round-robin: select socket using index, then increment for next packet
                                     let socket_idx = socket_indices[priority] % sockets.len();
                                     let (socket, target_addr) = &sockets[socket_idx];
-                                    socket_indices[priority] = (socket_indices[priority] + 1) % sockets.len().max(1);
-                                    
+                                    socket_indices[priority] =
+                                        (socket_indices[priority] + 1) % sockets.len().max(1);
+
                                     // Non-blocking send; retry on WouldBlock to preserve packet ordering.
                                     // We retry instead of dropping to ensure packets are sent in order.
                                     loop {
@@ -212,7 +213,9 @@ impl EgressDRRScheduler {
                                                 // Successfully sent: exit retry loop
                                                 break;
                                             }
-                                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                            Err(e)
+                                                if e.kind() == std::io::ErrorKind::WouldBlock =>
+                                            {
                                                 // Socket buffer full: yield and retry
                                                 // This preserves packet ordering (we don't skip to next packet)
                                                 std::thread::yield_now(); // Yield CPU to other threads
@@ -262,4 +265,3 @@ impl EgressDRRScheduler {
 
 #[cfg(test)]
 mod tests {}
-

@@ -24,7 +24,7 @@ use crate::scheduler::edf::EDFDropCounters;
 // Import processing duration calculation
 use crate::scheduler::multi_worker_edf::processing_duration;
 // Import lock-free channels for inter-thread communication
-use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
+use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
 // Import mutex for synchronization
 use parking_lot::Mutex;
 // Import ordering trait for deadline comparisons
@@ -100,10 +100,10 @@ impl HighDistributionStats {
         // Score each channel: prefer channels with fewer packets and earlier deadlines
         let mut best_channel = 0;
         let mut best_score = i64::MAX;
-        
+
         for (idx, &count) in self.packet_count.iter().enumerate() {
             let deadline_sum = self.deadline_sum[idx];
-            
+
             // Score based on:
             // 1. Packet count (lower is better)
             // 2. Deadline sum (earlier deadlines = smaller sum = higher priority)
@@ -111,13 +111,13 @@ impl HighDistributionStats {
             let count_penalty = count as i64 * 1000;
             let deadline_penalty = deadline_sum.as_micros() as i64;
             let score = count_penalty + deadline_penalty;
-            
+
             if score < best_score {
                 best_score = score;
                 best_channel = idx;
             }
         }
-        
+
         best_channel
     }
 
@@ -130,20 +130,22 @@ impl HighDistributionStats {
 }
 
 /// EDF scheduler for a single priority channel.
+/// Uses per-priority input queues to allow priority-based reception.
 struct ChannelEDF {
     /// Min-heap of tasks ordered by deadline (earliest first)
     heap: Arc<Mutex<BinaryHeap<EDFTask>>>,
-    /// Input channel for this EDF
-    input: Arc<Receiver<EDFTask>>,
+    /// Per-priority input channels for this EDF (HIGH, MEDIUM, LOW, etc.)
+    /// Not all priorities may be active for a given EDF
+    input_queues: PriorityTable<Arc<Receiver<EDFTask>>>,
     /// Output channel for processed packets (goes to re-ordering stage)
     output: Sender<Packet>,
 }
 
 impl ChannelEDF {
-    fn new(input: Arc<Receiver<EDFTask>>, output: Sender<Packet>) -> Self {
+    fn new(input_queues: PriorityTable<Arc<Receiver<EDFTask>>>, output: Sender<Packet>) -> Self {
         Self {
             heap: Arc::new(Mutex::new(BinaryHeap::new())),
-            input,
+            input_queues,
             output,
         }
     }
@@ -181,6 +183,38 @@ impl PartialEq for OrderedPacket {
 
 impl Eq for OrderedPacket {}
 
+/// Tracks average processing latency for HIGH priority packets.
+/// Used to dynamically calculate timeout for MEDIUM/LOW preemption.
+struct HighLatencyTracker {
+    /// Average processing latency in microseconds (updated with EMA)
+    avg_latency_us: Arc<Mutex<f64>>,
+}
+
+impl HighLatencyTracker {
+    fn new() -> Self {
+        Self {
+            avg_latency_us: Arc::new(Mutex::new(0.0)),
+        }
+    }
+
+    /// Record a processing latency measurement.
+    /// Uses Exponential Moving Average (EMA) with alpha = 0.1 for smooth adaptation.
+    /// This method should be called by the worker after processing each HIGH packet.
+    fn record_latency(tracker: &Arc<Mutex<f64>>, latency: Duration) {
+        let latency_us = latency.as_micros() as f64;
+        let mut avg = tracker.lock();
+        if *avg == 0.0 {
+            // First measurement: use it directly
+            *avg = latency_us;
+        } else {
+            // EMA: new_avg = alpha * new_value + (1 - alpha) * old_avg
+            // alpha = 0.1 gives 90% weight to history, 10% to new measurement
+            let alpha = 0.1;
+            *avg = alpha * latency_us + (1.0 - alpha) * *avg;
+        }
+    }
+}
+
 /// Multi-Channel EDF with Elasticity Scheduler
 pub struct MCEDFElasticScheduler {
     /// Per-priority input channels from ingress DRR
@@ -189,17 +223,20 @@ pub struct MCEDFElasticScheduler {
     output_queues: PriorityTable<Sender<Packet>>,
     /// Drop counters for metrics
     drop_counters: PriorityTable<Arc<AtomicU64>>,
-    /// Internal channels: HIGH EDF (can receive HIGH packets)
-    high_channel_tx: Sender<EDFTask>,
-    high_channel_rx: Arc<Receiver<EDFTask>>,
-    /// Internal channels: MEDIUM EDF (can receive HIGH and MEDIUM packets)
-    medium_channel_tx: Sender<EDFTask>,
-    medium_channel_rx: Arc<Receiver<EDFTask>>,
-    /// Internal channels: LOW EDF (can receive HIGH and LOW packets)
-    low_channel_tx: Sender<EDFTask>,
-    low_channel_rx: Arc<Receiver<EDFTask>>,
+    /// Per-priority input channels for HIGH EDF (can receive HIGH packets)
+    high_input_tx: PriorityTable<Option<Sender<EDFTask>>>,
+    high_input_rx: PriorityTable<Arc<Receiver<EDFTask>>>,
+    /// Per-priority input channels for MEDIUM EDF (can receive HIGH and MEDIUM packets)
+    medium_input_tx: PriorityTable<Option<Sender<EDFTask>>>,
+    medium_input_rx: PriorityTable<Arc<Receiver<EDFTask>>>,
+    /// Per-priority input channels for LOW EDF (can receive HIGH, MEDIUM, and LOW packets)
+    low_input_tx: PriorityTable<Option<Sender<EDFTask>>>,
+    low_input_rx: PriorityTable<Arc<Receiver<EDFTask>>>,
     /// Statistics for intelligent HIGH distribution across 3 EDFs
     high_distribution_stats: Arc<Mutex<HighDistributionStats>>,
+    /// Tracker for average HIGH priority processing latency (for dynamic timeout)
+    /// Shared across all EDF workers to calculate timeout dynamically
+    high_latency_tracker: HighLatencyTracker,
     /// Internal channels: outputs from EDFs go to re-ordering stage
     /// Stored as Arc to allow cloning for worker threads
     reorder_input_rxs: [Arc<Receiver<Packet>>; 3], // HIGH, MEDIUM, LOW
@@ -220,45 +257,98 @@ impl MCEDFElasticScheduler {
         output_queues: PriorityTable<Sender<Packet>>,
     ) -> Self {
         let drop_counters = PriorityTable::from_fn(|_| Arc::new(AtomicU64::new(0)));
-        
-        // Create channels for the 3 EDFs: HIGH, MEDIUM, LOW
+
+        // Create per-priority channels for each of the 3 EDFs: HIGH, MEDIUM, LOW
         // HIGH can be distributed to all 3 EDFs to avoid favoring HIGH during bursts
-        let (high_tx, high_rx) = unbounded();
-        let (medium_tx, medium_rx) = unbounded();
-        let (low_tx, low_rx) = unbounded();
+        // Each EDF has per-priority input queues to allow priority-based reception
         
+        // HIGH EDF: receives HIGH packets only
+        let (high_high_tx, high_high_rx) = unbounded();
+        let high_input_tx = PriorityTable::from_fn(|priority| {
+            if priority == Priority::High {
+                Some(high_high_tx.clone())
+            } else {
+                None
+            }
+        });
+        let high_input_rx = PriorityTable::from_fn(|priority| {
+            if priority == Priority::High {
+                Arc::new(high_high_rx.clone())
+            } else {
+                // Dummy receiver that will never receive (channel is dropped)
+                Arc::new(unbounded().1)
+            }
+        });
+        
+        // MEDIUM EDF: receives HIGH and MEDIUM packets
+        let (medium_high_tx, medium_high_rx) = unbounded();
+        let (medium_medium_tx, medium_medium_rx) = unbounded();
+        let medium_input_tx = PriorityTable::from_fn(|priority| {
+            match priority {
+                Priority::High => Some(medium_high_tx.clone()),
+                Priority::Medium => Some(medium_medium_tx.clone()),
+                _ => None,
+            }
+        });
+        let medium_input_rx = PriorityTable::from_fn(|priority| {
+            match priority {
+                Priority::High => Arc::new(medium_high_rx.clone()),
+                Priority::Medium => Arc::new(medium_medium_rx.clone()),
+                _ => Arc::new(unbounded().1), // Dummy
+            }
+        });
+        
+        // LOW EDF: receives HIGH, MEDIUM, and LOW packets
+        let (low_high_tx, low_high_rx) = unbounded();
+        let (low_medium_tx, low_medium_rx) = unbounded();
+        let (low_low_tx, low_low_rx) = unbounded();
+        let low_input_tx = PriorityTable::from_fn(|priority| {
+            match priority {
+                Priority::High => Some(low_high_tx.clone()),
+                Priority::Medium => Some(low_medium_tx.clone()),
+                Priority::Low => Some(low_low_tx.clone()),
+                _ => None,
+            }
+        });
+        let low_input_rx = PriorityTable::from_fn(|priority| {
+            match priority {
+                Priority::High => Arc::new(low_high_rx.clone()),
+                Priority::Medium => Arc::new(low_medium_rx.clone()),
+                Priority::Low => Arc::new(low_low_rx.clone()),
+                _ => Arc::new(unbounded().1), // Dummy
+            }
+        });
+
         // Create internal channels: EDF outputs go to re-ordering stage
         let (high_edf_out_tx, high_edf_out_rx) = unbounded();
         let (medium_edf_out_tx, medium_edf_out_rx) = unbounded();
         let (low_edf_out_tx, low_edf_out_rx) = unbounded();
-        
+
         // Store receivers for the re-ordering stage (3 EDFs: HIGH, MEDIUM, LOW)
         let reorder_input_rxs = [
             Arc::new(high_edf_out_rx),
             Arc::new(medium_edf_out_rx),
             Arc::new(low_edf_out_rx),
         ];
-        
+
         // Store transmitters for EDF workers (internal channels to re-ordering)
-        let edf_output_txs = [
-            high_edf_out_tx,
-            medium_edf_out_tx,
-            low_edf_out_tx,
-        ];
-        
+        let edf_output_txs = [high_edf_out_tx, medium_edf_out_tx, low_edf_out_tx];
+
         let high_distribution_stats = Arc::new(Mutex::new(HighDistributionStats::new()));
+        let high_latency_tracker = HighLatencyTracker::new();
         
         Self {
             input_queues,
             output_queues: output_queues.clone(),
             drop_counters,
-            high_channel_tx: high_tx,
-            high_channel_rx: Arc::new(high_rx),
-            medium_channel_tx: medium_tx,
-            medium_channel_rx: Arc::new(medium_rx),
-            low_channel_tx: low_tx,
-            low_channel_rx: Arc::new(low_rx),
+            high_input_tx,
+            high_input_rx,
+            medium_input_tx,
+            medium_input_rx,
+            low_input_tx,
+            low_input_rx,
             high_distribution_stats,
+            high_latency_tracker,
             reorder_input_rxs,
             reorder_output_txs: output_queues,
             edf_output_txs,
@@ -285,30 +375,30 @@ impl MCEDFElasticScheduler {
         worker_cores: &[usize],
     ) {
         // Create 3 EDF channels (output to internal re-ordering channels)
-        // HIGH EDF: receives HIGH packets
+        // HIGH EDF: receives HIGH packets only
         let high_edf = ChannelEDF::new(
-            self.high_channel_rx.clone(),
+            self.high_input_rx.clone(),
             self.edf_output_txs[0].clone(),
         );
         // MEDIUM EDF: receives HIGH and MEDIUM packets
         let medium_edf = ChannelEDF::new(
-            self.medium_channel_rx.clone(),
+            self.medium_input_rx.clone(),
             self.edf_output_txs[1].clone(),
         );
-        // LOW EDF: receives HIGH and LOW packets
+        // LOW EDF: receives HIGH, MEDIUM, and LOW packets
         let low_edf = ChannelEDF::new(
-            self.low_channel_rx.clone(),
+            self.low_input_rx.clone(),
             self.edf_output_txs[2].clone(),
         );
 
         // Spawn dispatcher thread (intelligent Round Robin for HIGH across 3 EDFs)
         let dispatcher_inputs = self.input_queues.clone();
-        let dispatcher_high_tx = self.high_channel_tx.clone();
-        let dispatcher_medium_tx = self.medium_channel_tx.clone();
-        let dispatcher_low_tx = self.low_channel_tx.clone();
+        let dispatcher_high_tx = self.high_input_tx.clone();
+        let dispatcher_medium_tx = self.medium_input_tx.clone();
+        let dispatcher_low_tx = self.low_input_tx.clone();
         let dispatcher_stats = self.high_distribution_stats.clone();
         let dispatcher_running = running.clone();
-        
+
         thread::Builder::new()
             .name("MC-EDF-Dispatcher".to_string())
             .spawn(move || {
@@ -327,75 +417,83 @@ impl MCEDFElasticScheduler {
 
         // Spawn 3 EDF worker threads
         let worker_running = running.clone();
+
+        // HIGH EDF gets dedicated core to avoid CPU contention with MEDIUM/LOW
+        // MEDIUM/LOW EDFs share a core (they have larger budgets and can tolerate contention)
+        let high_edf_core = worker_cores[0];
+        let medium_low_edf_core = worker_cores.get(1).copied().unwrap_or(worker_cores[0]);
         
-        // All EDFs run on the same core (first worker core)
-        let edf_core = worker_cores[0];
-        
-        // HIGH EDF (receives HIGH packets only)
+        // Clone latency tracker for all workers (shared across all EDFs)
+        let latency_tracker = self.high_latency_tracker.avg_latency_us.clone();
+
+        // HIGH EDF (receives HIGH packets only) - dedicated core
         let high_edf_heap = high_edf.heap.clone();
-        let high_edf_input = high_edf.input.clone();
+        let high_edf_inputs = high_edf.input_queues.clone();
         let high_edf_output = high_edf.output.clone();
         let high_edf_drops = self.drop_counters[Priority::High].clone();
         let worker_running_high = worker_running.clone();
+        let high_latency_tracker = latency_tracker.clone();
         thread::Builder::new()
             .name("MC-EDF-HIGH".to_string())
             .spawn(move || {
                 set_priority(3);
-                set_core(edf_core);
+                set_core(high_edf_core); // Dedicated core for HIGH
                 edf_worker_loop(
                     high_edf_heap,
-                    high_edf_input,
+                    high_edf_inputs,
                     high_edf_output,
                     Priority::High,
                     high_edf_drops,
                     worker_running_high,
-                    false, // HIGH has no elasticity
+                    Some(high_latency_tracker),
                 );
             })
             .expect("failed to spawn MC-EDF HIGH worker");
 
         // MEDIUM EDF (receives HIGH and MEDIUM packets)
         let medium_edf_heap = medium_edf.heap.clone();
-        let medium_edf_input = medium_edf.input.clone();
+        let medium_edf_inputs = medium_edf.input_queues.clone();
         let medium_edf_output = medium_edf.output.clone();
         let medium_edf_drops = self.drop_counters[Priority::Medium].clone();
         let worker_running_medium = worker_running.clone();
+        let medium_latency_tracker = latency_tracker.clone();
         thread::Builder::new()
             .name("MC-EDF-MEDIUM".to_string())
             .spawn(move || {
                 set_priority(3);
-                set_core(edf_core);
+                set_core(medium_low_edf_core); // Shared core with LOW
                 edf_worker_loop(
                     medium_edf_heap,
-                    medium_edf_input,
+                    medium_edf_inputs,
                     medium_edf_output,
                     Priority::Medium,
                     medium_edf_drops,
                     worker_running_medium,
-                    true, // MEDIUM has elasticity
+                    Some(medium_latency_tracker),
                 );
             })
             .expect("failed to spawn MC-EDF MEDIUM worker");
 
         // LOW EDF (receives HIGH and LOW packets)
         let low_edf_heap = low_edf.heap.clone();
-        let low_edf_input = low_edf.input.clone();
+        let low_edf_inputs = low_edf.input_queues.clone();
         let low_edf_output = low_edf.output.clone();
         let low_edf_drops = self.drop_counters[Priority::Low].clone();
         let worker_running_low = worker_running.clone();
+        let low_latency_tracker = latency_tracker.clone();
         thread::Builder::new()
             .name("MC-EDF-LOW".to_string())
             .spawn(move || {
                 set_priority(3);
-                set_core(edf_core);
+                set_core(medium_low_edf_core); // Shared core with MEDIUM
                 edf_worker_loop(
                     low_edf_heap,
-                    low_edf_input,
+                    low_edf_inputs,
                     low_edf_output,
                     Priority::Low,
                     low_edf_drops,
                     worker_running_low,
-                    true, // LOW has elasticity
+                    Some(low_latency_tracker),
                 );
             })
             .expect("failed to spawn MC-EDF LOW worker");
@@ -410,12 +508,13 @@ impl MCEDFElasticScheduler {
         let reorder_outputs = self.reorder_output_txs.clone();
         let reorder_drops = self.drop_counters.clone();
         let reorder_running = running.clone();
-        
+
         thread::Builder::new()
             .name("MC-EDF-Reorder".to_string())
             .spawn(move || {
                 set_priority(3);
-                set_core(edf_core);
+                // Re-ordering runs on same core as HIGH to minimize latency for HIGH packets
+                set_core(high_edf_core);
                 reorder_loop(
                     reorder_inputs,
                     reorder_outputs,
@@ -428,7 +527,7 @@ impl MCEDFElasticScheduler {
 }
 
 /// Calculate virtual deadline scaling factor based on priority.
-/// 
+///
 /// Virtual deadlines reduce the latency budget to prioritize higher priority tasks:
 /// - HIGH: budget / 40 (factor = 0.025) - Extremely aggressive to achieve lower P50
 /// - MEDIUM: budget / 2 (factor = 0.5)
@@ -436,8 +535,8 @@ impl MCEDFElasticScheduler {
 fn virtual_deadline_scale(priority: Priority) -> f64 {
     match priority {
         Priority::High => 0.025, // Divide by 40 (extremely aggressive for lower P50)
-        Priority::Medium => 0.5,  // Divide by 2
-        _ => 1.0,                 // No reduction
+        Priority::Medium => 0.5, // Divide by 2
+        _ => 1.0,                // No reduction
     }
 }
 
@@ -447,11 +546,12 @@ fn virtual_deadline_scale(priority: Priority) -> f64 {
 /// (HIGH, MEDIUM, LOW) to avoid favoring HIGH during bursts.
 /// MEDIUM packets go to MEDIUM EDF, LOW packets go to LOW EDF.
 /// Virtual deadlines are calculated to prioritize HIGH (divide by 16) and MEDIUM (divide by 2).
+/// Uses per-priority queues for each EDF.
 fn dispatcher_loop(
     input_queues: PriorityTable<Arc<Receiver<Packet>>>,
-    high_tx: Sender<EDFTask>,
-    medium_tx: Sender<EDFTask>,
-    low_tx: Sender<EDFTask>,
+    high_input_tx: PriorityTable<Option<Sender<EDFTask>>>,
+    medium_input_tx: PriorityTable<Option<Sender<EDFTask>>>,
+    low_input_tx: PriorityTable<Option<Sender<EDFTask>>>,
     distribution_stats: Arc<Mutex<HighDistributionStats>>,
     running: Arc<AtomicBool>,
 ) {
@@ -468,7 +568,7 @@ fn dispatcher_loop(
                     let scale = virtual_deadline_scale(Priority::High);
                     let virtual_budget = packet.latency_budget.mul_f64(scale);
                     let virtual_deadline = packet.timestamp + virtual_budget;
-                    
+
                     let task = EDFTask {
                         packet,
                         virtual_deadline,
@@ -478,26 +578,46 @@ fn dispatcher_loop(
 
                     // Use intelligent Round Robin to select best EDF (0=HIGH, 1=MEDIUM, 2=LOW)
                     // Use real deadline for distribution stats
-                    // Determine channel first, then clone and send (avoid holding lock during send)
+                    // Optimize lock contention: select channel in lock, send outside, record in lock
                     let channel = {
                         let stats = distribution_stats.lock();
                         stats.find_best_channel(real_deadline, now)
                     };
-                    
-                    // Clone only once, after channel is determined
-                    // Send to selected EDF (only one clone per packet)
+
+                    // Clone and send outside lock to minimize lock hold time
+                    // Send is fast (unbounded channel), so no blocking
+                    // Use per-priority queue: HIGH packets go to HIGH priority queue
                     let sent = match channel {
-                        0 => high_tx.send(task.clone()).is_ok(),
-                        1 => medium_tx.send(task.clone()).is_ok(),
-                        2 => low_tx.send(task.clone()).is_ok(),
+                        0 => {
+                            if let Some(ref tx) = high_input_tx[Priority::High] {
+                                tx.send(task.clone()).is_ok()
+                            } else {
+                                false
+                            }
+                        }
+                        1 => {
+                            // Send HIGH to MEDIUM priority queue of MEDIUM EDF
+                            if let Some(ref tx) = medium_input_tx[Priority::High] {
+                                tx.send(task.clone()).is_ok()
+                            } else {
+                                false
+                            }
+                        }
+                        2 => {
+                            if let Some(ref tx) = low_input_tx[Priority::High] {
+                                tx.send(task.clone()).is_ok()
+                            } else {
+                                false
+                            }
+                        }
                         _ => false,
                     };
-                    
+
+                    // Record distribution only if send succeeded (minimal lock time)
                     if sent {
-                        // Record distribution for statistics (using real deadline)
-                        // Re-acquire lock only if send succeeded
                         let mut stats = distribution_stats.lock();
                         stats.record_distribution(channel, real_deadline, now);
+                        // Lock released immediately
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -512,14 +632,17 @@ fn dispatcher_loop(
             let scale = virtual_deadline_scale(Priority::Medium);
             let virtual_budget = packet.latency_budget.mul_f64(scale);
             let virtual_deadline = packet.timestamp + virtual_budget;
-            
+
             let task = EDFTask {
                 packet,
                 virtual_deadline,
                 real_deadline,
                 priority: Priority::Medium,
             };
-            let _ = medium_tx.send(task);
+            // Send to MEDIUM priority queue of MEDIUM EDF
+            if let Some(ref tx) = medium_input_tx[Priority::Medium] {
+                let _ = tx.send(task);
+            }
         }
 
         // Process LOW priority packets (only after all HIGH and MEDIUM are dispatched)
@@ -529,14 +652,17 @@ fn dispatcher_loop(
             let scale = virtual_deadline_scale(Priority::Low);
             let virtual_budget = packet.latency_budget.mul_f64(scale);
             let virtual_deadline = packet.timestamp + virtual_budget;
-            
+
             let task = EDFTask {
                 packet,
                 virtual_deadline,
                 real_deadline,
                 priority: Priority::Low,
             };
-            let _ = low_tx.send(task);
+            // Send to LOW priority queue of LOW EDF
+            if let Some(ref tx) = low_input_tx[Priority::Low] {
+                let _ = tx.send(task);
+            }
         }
 
         // Process BEST_EFFORT priority packets (if any)
@@ -547,14 +673,19 @@ fn dispatcher_loop(
             let scale = virtual_deadline_scale(Priority::BestEffort);
             let virtual_budget = packet.latency_budget.mul_f64(scale);
             let virtual_deadline = packet.timestamp + virtual_budget;
-            
+
             let task = EDFTask {
                 packet,
                 virtual_deadline,
                 real_deadline,
                 priority: Priority::BestEffort,
             };
-            let _ = low_tx.send(task);
+            // BEST_EFFORT can go to LOW priority queue of LOW EDF (if supported)
+            // For now, drop it or send to LOW if LOW EDF supports BEST_EFFORT
+            // This is a placeholder - BEST_EFFORT handling may need adjustment
+            if let Some(ref tx) = low_input_tx[Priority::Low] {
+                let _ = tx.send(task);
+            }
         }
 
         // Yield if no work
@@ -564,124 +695,128 @@ fn dispatcher_loop(
 
 /// EDF worker loop for a single channel.
 ///
-/// Processes tasks from the EDF heap, applying elasticity if enabled.
-/// Elasticity window is fixed at 120µs for MEDIUM/LOW packets.
+/// Processes tasks from the EDF heap. Before processing MEDIUM/LOW tasks,
+/// waits up to avg_processing_time * 1.1 for HIGH priority packets to arrive (timeout-based preemption).
 fn edf_worker_loop(
     heap: Arc<Mutex<BinaryHeap<EDFTask>>>,
-    input: Arc<Receiver<EDFTask>>,
+    input_queues: PriorityTable<Arc<Receiver<EDFTask>>>,
     output: Sender<Packet>,
     _priority: Priority,
     drop_counter: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
-    has_elasticity: bool,
+    latency_tracker: Option<Arc<Mutex<f64>>>,
 ) {
-    // Fixed elasticity window for MEDIUM/LOW
-    let elasticity = Duration::from_micros(500);
-
     while running.load(AtomicOrdering::Relaxed) {
-        // Receive new tasks from input channel (prioritize HIGH)
+        // Receive new tasks from per-priority input queues (prioritize HIGH)
         // If HIGH arrives, process it immediately without batching for lower latency
+        // Use try_recv to avoid blocking and reduce lock contention
         let mut received_tasks = Vec::new();
         
-        loop {
-            match input.try_recv() {
-                Ok(task) => {
-                    if task.priority == Priority::High {
-                        // HIGH arrived: push immediately and break to process
-                        let mut heap_guard = heap.lock();
-                        heap_guard.push(task);
-                        drop(heap_guard);
-                        break; // Process HIGH immediately
-                    } else {
-                        // Non-HIGH: batch for efficiency
-                        received_tasks.push(task);
-                    }
+        // Quick path: check HIGH priority queue first
+        let mut high_received = false;
+        if let Ok(task) = input_queues[Priority::High].try_recv() {
+            // HIGH arrived: push immediately and skip batching
+            let mut heap_guard = heap.lock();
+            heap_guard.push(task);
+            drop(heap_guard); // Release lock immediately
+            high_received = true;
+        }
+        
+        // If HIGH was not received, check other priority queues in priority order
+        if !high_received {
+            // Check MEDIUM priority queue (only for MEDIUM and LOW EDFs)
+            while let Ok(task) = input_queues[Priority::Medium].try_recv() {
+                received_tasks.push(task);
+            }
+            
+            // Check LOW priority queue (only for LOW EDF)
+            while let Ok(task) = input_queues[Priority::Low].try_recv() {
+                received_tasks.push(task);
+            }
+            
+            // Check BEST_EFFORT priority queue
+            while let Ok(task) = input_queues[Priority::BestEffort].try_recv() {
+                received_tasks.push(task);
+            }
+            
+            // Batch push non-HIGH tasks to heap (single lock acquisition)
+            if !received_tasks.is_empty() {
+                let mut heap_guard = heap.lock();
+                for task in received_tasks {
+                    heap_guard.push(task);
                 }
-                Err(_) => break,
+                // Lock released here
             }
         }
         
-        // Batch push non-HIGH tasks to heap (single lock acquisition)
-        if !received_tasks.is_empty() {
-            let mut heap_guard = heap.lock();
-            for task in received_tasks {
-                heap_guard.push(task);
-            }
-        }
-
         // Process task with earliest virtual deadline (HIGH will have earliest due to VD)
+        // Minimize lock hold time by only holding lock for pop operation
         let task = {
             let mut heap_guard = heap.lock();
-            heap_guard.pop()
+            let task = heap_guard.pop();
+            // Lock released immediately after pop
+            task
         };
 
         if let Some(task) = task {
-            // Apply elasticity ONLY if the current packet being processed is NOT HIGH
-            // HIGH packets should never be delayed by elasticity
-            if has_elasticity && task.priority != Priority::High {
-                let wait_start = Instant::now();
-                // Hybrid approach: short busy polling for low latency, then sleep to save CPU
-                let busy_poll_duration = Duration::from_micros(50); // Busy poll first 50µs
-                let check_interval = Duration::from_micros(10); // Check every 10µs during busy poll
-                let sleep_interval = Duration::from_micros(50); // Sleep 50µs between checks after busy poll
-                let mut last_check = Instant::now();
-                let mut in_busy_poll = true;
-                
-                while wait_start.elapsed() < elasticity {
-                    let elapsed = wait_start.elapsed();
-                    
-                    // Transition from busy polling to sleep-based after initial period
-                    if in_busy_poll && elapsed >= busy_poll_duration {
-                        in_busy_poll = false;
-                        last_check = Instant::now();
-                    }
-                    
-                    // Check for incoming HIGH packets
-                    if last_check.elapsed() >= if in_busy_poll { check_interval } else { sleep_interval } {
-                        if let Ok(new_task) = input.try_recv() {
-                            // New packet arrived! Push it and current task back to heap
+            // If task is MEDIUM/LOW, wait up to avg_processing_time * 1.1 for HIGH priority before processing
+            // This allows HIGH to preempt MEDIUM/LOW without elasticity guards
+            if task.priority != Priority::High {
+                // Calculate timeout based on average HIGH processing latency + 10%
+                let mut timeout = if let Some(ref tracker) = latency_tracker {
+                    let avg = tracker.lock();
+                    let avg_us = if *avg > 0.0 { *avg } else { 50.0 }; // Default 50µs if no data
+                    Duration::from_micros((avg_us * 1.1) as u64) // +10% margin
+                } else {
+                    Duration::from_micros(55) // Default: 50µs * 1.1 = 55µs
+                };
+                 // Use recv_timeout to wait for HIGH packets without busy polling
+                // Check HIGH priority queue first
+                match input_queues[Priority::High].recv_timeout(timeout) {
+                    Ok(new_task) => {
+                        // HIGH (or any) packet arrived! Push it and current task back to heap
+                        // Minimize lock hold time
+                        {
                             let mut heap_guard = heap.lock();
                             heap_guard.push(new_task);
-                            heap_guard.push(task.clone());
-                            drop(heap_guard);
-                            // Break elasticity wait immediately and process earliest from heap
-                            // If HIGH arrived, it will be processed next due to virtual deadline
-                            continue;
+                            heap_guard.push(task.clone()); // Clone to keep original for potential processing
+                                                           // Lock released here
                         }
-                        last_check = Instant::now();
-                        
-                        // Sleep during non-busy-poll phase to avoid wasting CPU
-                        if !in_busy_poll {
-                            let remaining = elasticity.saturating_sub(elapsed);
-                            let sleep_duration = sleep_interval.min(remaining);
-                            if sleep_duration.as_nanos() > 0 {
-                                thread::sleep(sleep_duration);
-                            }
-                        }
+                        // HIGH arrived, skip processing current MEDIUM/LOW task
+                        // Restart loop to process HIGH from heap
+                        continue;
                     }
-                    
-                    // Only busy spin during initial period
-                    if in_busy_poll {
-                        std::hint::spin_loop();
-                    } else {
-                        // Yield during sleep phase to let other threads run
-                        thread::yield_now();
+                    Err(RecvTimeoutError::Timeout) => {
+                        // Timeout expired, no HIGH packet arrived
+                        // Continue to process the MEDIUM/LOW task
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        // Channel disconnected, continue to process current task
                     }
                 }
             }
 
             // Process the packet (simulate processing)
             let processing_time = processing_duration(&task.packet);
+            let process_start = Instant::now();
+            
             // Use sleep instead of busy polling to avoid wasting CPU
             // For very short processing times (< 100µs), we still do a quick busy wait for accuracy
             if processing_time < Duration::from_micros(100) {
-                let start = Instant::now();
-                while start.elapsed() < processing_time {
+                while process_start.elapsed() < processing_time {
                     std::hint::spin_loop();
                 }
             } else {
                 // For longer processing times, use sleep to save CPU
                 thread::sleep(processing_time);
+            }
+            
+            // Record processing latency for HIGH priority packets (for dynamic timeout calculation)
+            if task.priority == Priority::High {
+                let actual_processing = process_start.elapsed();
+                if let Some(ref tracker) = latency_tracker {
+                    HighLatencyTracker::record_latency(tracker, actual_processing);
+                }
             }
 
             // Forward to output queue
@@ -712,6 +847,8 @@ fn reorder_loop(
 
     while running.load(AtomicOrdering::Relaxed) {
         // Fill empty buffers from input channels
+        // Yield frequently to avoid CPU contention with HIGH EDF (same core)
+        let mut filled_any = false;
         for (idx, input) in inputs.iter().enumerate() {
             if buffers[idx].is_none() {
                 if let Ok(packet) = input.try_recv() {
@@ -723,8 +860,15 @@ fn reorder_loop(
                         priority: priorities[idx],
                         deadline,
                     });
+                    filled_any = true;
                 }
             }
+        }
+
+        // Yield after checking channels to reduce CPU contention with HIGH EDF
+        // This allows HIGH EDF to run more frequently on the same core
+        if !filled_any {
+            thread::yield_now();
         }
 
         // Find earliest deadline among buffered packets
@@ -750,10 +894,15 @@ fn reorder_loop(
             if outputs[priority].try_send(ordered.packet).is_err() {
                 drop_counters[priority].fetch_add(1, AtomicOrdering::Relaxed);
             }
+
+            // Yield after forwarding HIGH priority to allow HIGH EDF to run
+            // This reduces CPU contention on the shared core
+            if priority == Priority::High {
+                thread::yield_now();
+            }
         } else {
-            // No packets available, yield
+            // No packets available, yield to allow HIGH EDF to run
             thread::yield_now();
         }
     }
 }
-

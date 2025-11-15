@@ -109,7 +109,7 @@ impl SharedQueue {
             // Acquire mutex and push task into heap
             let mut guard = self.heap.lock();
             guard.push(task); // Push task (heap maintains min-virtual-deadline order)
-            // Mutex is released here (RAII)
+                              // Mutex is released here (RAII)
         }
         // Wake one waiting worker (if any) to process the new task
         self.available.notify_one();
@@ -175,7 +175,7 @@ fn scaling_table() -> PriorityTable<f64> {
     PriorityTable::from_fn(|priority| match priority {
         Priority::High => 0.01, // 95% reduction: High gets earliest virtual deadline (strongest priority)
         Priority::Medium => 0.8, // 40% reduction: Medium gets earlier virtual deadline
-        Priority::Low => 0.9, // 25% reduction: Low gets earlier virtual deadline
+        Priority::Low => 0.9,   // 25% reduction: Low gets earlier virtual deadline
         Priority::BestEffort => 1.0, // No scaling: BestEffort uses original deadline (lowest priority)
     })
 }
@@ -283,7 +283,7 @@ fn dispatcher_loop(
     input_queues: PriorityTable<Arc<Receiver<Packet>>>, // Input channels per priority
     shared_queue: Arc<SharedQueue>, // Shared run queue (min-heap on virtual deadline)
     scaling: PriorityTable<f64>, // Per-priority scaling factors (High=0.05, Medium=0.6, Low=0.75, BE=1.0) - INVERTED to prioritize HIGH
-    running: Arc<AtomicBool>, // Shutdown flag (checked each iteration)
+    running: Arc<AtomicBool>,    // Shutdown flag (checked each iteration)
 ) {
     // Main dispatcher loop: continues until shutdown signal
     while running.load(AtomicOrdering::Relaxed) {
@@ -308,8 +308,8 @@ fn dispatcher_loop(
                     // Push task to shared queue (wakes a waiting worker if queue was empty)
                     shared_queue.push(QueuedTask {
                         virtual_deadline, // Virtual deadline (for heap ordering)
-                        priority, // Priority class (for routing to output queue)
-                        packet, // The packet to process
+                        priority,         // Priority class (for routing to output queue)
+                        packet,           // The packet to process
                     });
                     // Mark that we dispatched at least one packet
                     dispatched = true;
@@ -356,7 +356,7 @@ fn worker_loop(
     shared_queue: Arc<SharedQueue>, // Shared run queue (min-heap on virtual deadline)
     output_queues: PriorityTable<Sender<Packet>>, // Output channels per priority
     drop_counters: PriorityTable<Arc<AtomicU64>>, // Drop counters per priority
-    running: Arc<AtomicBool>, // Shutdown flag (passed to pop for early exit)
+    running: Arc<AtomicBool>,       // Shutdown flag (passed to pop for early exit)
 ) {
     // Main worker loop: continues until shared_queue.pop returns None (shutdown)
     // The pop operation blocks if the queue is empty, and returns None on shutdown.

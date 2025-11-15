@@ -137,9 +137,9 @@ impl IngressDRRScheduler {
             // Initialize state: no sockets registered yet, empty active flows list
             state: Arc::new(Mutex::new(IngressDRRState {
                 socket_configs: HashMap::new(), // No sockets yet
-                flow_states: HashMap::new(), // No flow states yet
-                active_flows: Vec::new(), // No active flows yet
-                current_flow_index: 0, // Start at index 0 for round-robin
+                flow_states: HashMap::new(),    // No flow states yet
+                active_flows: Vec::new(),       // No active flows yet
+                current_flow_index: 0,          // Start at index 0 for round-robin
             })),
             drop_counters, // Store atomic drop counters
         }
@@ -169,9 +169,9 @@ impl IngressDRRScheduler {
     pub fn add_socket(
         &self,
         socket: Arc<StdUdpSocket>, // UDP socket to read from
-        priority: Priority, // Priority class for this socket
-        latency_budget: Duration, // Maximum latency budget for packets
-        quantum: usize, // DRR quantum (packets per round)
+        priority: Priority,        // Priority class for this socket
+        latency_budget: Duration,  // Maximum latency budget for packets
+        quantum: usize,            // DRR quantum (packets per round)
     ) {
         // Create socket configuration
         let config = SocketConfig { socket };
@@ -180,19 +180,23 @@ impl IngressDRRScheduler {
         // The deficit counter is atomic, so updates in the hot loop don't require locking.
         // Only create flow state if this is the first socket for this priority.
         let mut state = self.state.lock();
-        
+
         // Get or create flow state for this priority (shared across all sockets of same priority)
         let _flow_state = state.flow_states.entry(priority).or_insert_with(|| {
             Arc::new(FlowState {
-                quantum, // Store quantum (number of packets per round)
+                quantum,                      // Store quantum (number of packets per round)
                 deficit: AtomicUsize::new(0), // Initialize deficit to 0 (no credit yet)
-                latency_budget, // Store latency budget for packet creation
+                latency_budget,               // Store latency budget for packet creation
             })
         });
-        
+
         // Register the socket configuration for this priority (append to vector)
-        state.socket_configs.entry(priority).or_insert_with(Vec::new).push(config);
-        
+        state
+            .socket_configs
+            .entry(priority)
+            .or_insert_with(Vec::new)
+            .push(config);
+
         // Add to active flows list if not already present (for round-robin iteration)
         if !state.active_flows.contains(&priority) {
             state.active_flows.push(priority);
@@ -258,7 +262,7 @@ impl IngressDRRScheduler {
                         Some((
                             *priority, // Priority as key
                             FlowSnapshot {
-                                sockets, // All sockets for this priority
+                                sockets,                   // All sockets for this priority
                                 state: flow_state.clone(), // Clone flow state Arc
                             },
                         ))
@@ -353,7 +357,7 @@ impl IngressDRRScheduler {
                         // us to allocate the right-sized buffer from the pool (zero-copy optimization).
                         let expected = size_hint;
                         let mut lease = buffer_pool::lease(expected); // Lease buffer from pool
-                        // Attempt to receive a UDP datagram (non-blocking)
+                                                                      // Attempt to receive a UDP datagram (non-blocking)
                         match socket.recv_from(lease.as_mut_slice()) {
                             Ok((size, _addr)) if size > 0 => {
                                 // Successfully received a packet: decrement deficit
@@ -363,9 +367,12 @@ impl IngressDRRScheduler {
                                 // Materialise packet (including timestamp used for EDF deadlines).
                                 // The buffer is frozen at the actual size (may be smaller than expected).
                                 let buffer = lease.freeze(size); // Freeze buffer at actual size
-                                // Create packet with priority, buffer, and latency budget
-                                let packet =
-                                    Packet::from_buffer(priority, buffer, flow_state.latency_budget);
+                                                                 // Create packet with priority, buffer, and latency budget
+                                let packet = Packet::from_buffer(
+                                    priority,
+                                    buffer,
+                                    flow_state.latency_budget,
+                                );
 
                                 // Get the output channel for this priority
                                 let tx = &self.priority_queues[priority];
@@ -452,7 +459,7 @@ impl IngressDRRScheduler {
 fn datagram_size_hint(socket: &StdUdpSocket) -> usize {
     match socket_bytes_available(socket) {
         Ok(available) if available > 0 => available, // Use actual size if available
-        _ => MAX_PACKET_SIZE, // Fallback to maximum size
+        _ => MAX_PACKET_SIZE,                        // Fallback to maximum size
     }
 }
 

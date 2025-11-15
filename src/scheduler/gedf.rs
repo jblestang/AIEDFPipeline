@@ -113,7 +113,7 @@ impl SharedQueue {
             // Acquire mutex and push task into heap
             let mut guard = self.heap.lock();
             guard.push(task); // Push task (heap maintains min-deadline order)
-            // Mutex is released here (RAII)
+                              // Mutex is released here (RAII)
         }
         // Wake one waiting worker (if any) to process the new task
         self.available.notify_one();
@@ -247,8 +247,8 @@ impl GEDFScheduler {
 /// * `running` - Atomic flag to signal shutdown
 fn dispatcher_loop(
     input_queues: PriorityTable<Arc<Receiver<Packet>>>, // Input channels per priority
-    shared_queue: Arc<SharedQueue>, // Shared run queue (min-heap on deadline)
-    running: Arc<AtomicBool>, // Shutdown flag (checked each iteration)
+    shared_queue: Arc<SharedQueue>,                     // Shared run queue (min-heap on deadline)
+    running: Arc<AtomicBool>,                           // Shutdown flag (checked each iteration)
 ) {
     // Main dispatcher loop: continues until shutdown signal
     while running.load(AtomicOrdering::Relaxed) {
@@ -267,7 +267,7 @@ fn dispatcher_loop(
                     shared_queue.push(QueuedTask {
                         deadline, // EDF deadline (for heap ordering)
                         priority, // Priority class (for routing to output queue)
-                        packet, // The packet to process
+                        packet,   // The packet to process
                     });
                     // Mark that we dispatched at least one packet
                     dispatched = true;
@@ -313,7 +313,7 @@ fn worker_loop(
     shared_queue: Arc<SharedQueue>, // Shared run queue (min-heap on deadline)
     output_queues: PriorityTable<Sender<Packet>>, // Output channels per priority
     drop_counters: PriorityTable<Arc<AtomicU64>>, // Drop counters per priority
-    running: Arc<AtomicBool>, // Shutdown flag (passed to pop for early exit)
+    running: Arc<AtomicBool>,       // Shutdown flag (passed to pop for early exit)
 ) {
     // Main worker loop: continues until shared_queue.pop returns None (shutdown)
     // The pop operation blocks if the queue is empty, and returns None on shutdown.

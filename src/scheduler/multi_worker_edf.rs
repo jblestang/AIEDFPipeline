@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 ///
 /// The assignment prevents priority inversion by ensuring higher priorities have more workers available.
 const WORKER_ASSIGNMENTS: [&[Priority]; 3] = [
-    &[Priority::High], // Worker 0: exclusive HIGH priority
+    &[Priority::High],                   // Worker 0: exclusive HIGH priority
     &[Priority::High, Priority::Medium], // Worker 1: HIGH and MEDIUM
     &[
         Priority::High,
@@ -107,7 +107,7 @@ impl SequenceTracker {
             next_sequence: AtomicU64::new(0),
             // Initialize inner state: expect sequence 0 next, no pending packets
             inner: Mutex::new(SequenceInner {
-                next_emit: 0, // First packet to emit should have sequence 0
+                next_emit: 0,             // First packet to emit should have sequence 0
                 pending: BTreeMap::new(), // No out-of-order packets yet
             }),
         }
@@ -139,9 +139,9 @@ impl SequenceTracker {
     /// * `drop_counter` - Atomic counter incremented if the send fails (queue full)
     fn complete(
         &self,
-        sequence: u64, // Sequence number of the completed packet
-        packet: Packet, // The packet that was processed
-        sender: &Sender<Packet>, // Output channel to egress DRR
+        sequence: u64,            // Sequence number of the completed packet
+        packet: Packet,           // The packet that was processed
+        sender: &Sender<Packet>,  // Output channel to egress DRR
         drop_counter: &AtomicU64, // Counter for dropped packets (queue full)
     ) {
         // Acquire the mutex to access inner state (needed for reordering logic)
@@ -265,7 +265,7 @@ impl CompletionRouter {
         WorkItem {
             priority, // Preserve the priority
             sequence, // Include the assigned sequence number
-            packet, // Include the packet data
+            packet,   // Include the packet data
         }
     }
 }
@@ -319,11 +319,11 @@ pub(crate) fn processing_duration(packet: &Packet) -> Duration {
 /// `true` if the item was pushed, `false` if capacity limits prevented it
 fn push_with_capacity(
     heap: &mut BinaryHeap<ScheduledItem>, // The EDF min-deadline heap
-    counts: &mut PriorityTable<usize>, // Per-priority counts (tracked locally)
-    total_count: &mut usize, // Total items in heap (tracked locally)
+    counts: &mut PriorityTable<usize>,    // Per-priority counts (tracked locally)
+    total_count: &mut usize,              // Total items in heap (tracked locally)
     per_priority_limit: &PriorityTable<usize>, // Per-priority quotas (from adaptive controller)
-    total_limit: usize, // Global worker backlog limit (from adaptive controller)
-    item: ScheduledItem, // The item to push (contains deadline and work item)
+    total_limit: usize,                   // Global worker backlog limit (from adaptive controller)
+    item: ScheduledItem,                  // The item to push (contains deadline and work item)
 ) -> bool {
     // Extract the priority from the work item
     let priority = item.work_item.priority;
@@ -777,12 +777,12 @@ impl AdaptiveController {
         worker_priority_counters: Vec<PriorityTable<Arc<AtomicUsize>>>,
     ) {
         // Hard caps to prevent unbounded quota growth per worker/priority
-        const HIGH_PRIMARY_MAX: usize = 64;  // Maximum High priority packets for Worker 0
-        const HIGH_SPILL_MAX: usize = 16;    // Maximum High priority spillover for Workers 1 & 2
-        const MEDIUM_W1_MAX: usize = 160;    // Maximum Medium priority packets for Worker 1
-        const MEDIUM_W2_MAX: usize = 160;   // Maximum Medium priority packets for Worker 2
-        const LOW_MAX: usize = 192;          // Maximum Low priority packets for Worker 2
-        const BEST_EFFORT_MAX: usize = 128;  // Fixed BestEffort quota for Worker 2
+        const HIGH_PRIMARY_MAX: usize = 64; // Maximum High priority packets for Worker 0
+        const HIGH_SPILL_MAX: usize = 16; // Maximum High priority spillover for Workers 1 & 2
+        const MEDIUM_W1_MAX: usize = 160; // Maximum Medium priority packets for Worker 1
+        const MEDIUM_W2_MAX: usize = 160; // Maximum Medium priority packets for Worker 2
+        const LOW_MAX: usize = 192; // Maximum Low priority packets for Worker 2
+        const BEST_EFFORT_MAX: usize = 128; // Fixed BestEffort quota for Worker 2
 
         // Main rebalancing loop: runs every 100ms until shutdown signal
         while running.load(AtomicOrdering::Relaxed) {
@@ -792,10 +792,10 @@ impl AdaptiveController {
 
             // Initialize new quota tables: we'll compute all quotas first, then atomically update them
             // This ensures consistency (all quotas updated together) and avoids intermediate states
-            let mut new_totals = vec![0usize; WORKER_ASSIGNMENTS.len()];  // Total capacity per worker
+            let mut new_totals = vec![0usize; WORKER_ASSIGNMENTS.len()]; // Total capacity per worker
             let mut new_limits: Vec<PriorityTable<usize>> = WORKER_ASSIGNMENTS
                 .iter()
-                .map(|_| PriorityTable::from_fn(|_| 0usize))  // Per-worker, per-priority quotas
+                .map(|_| PriorityTable::from_fn(|_| 0usize)) // Per-worker, per-priority quotas
                 .collect();
 
             // Collect guard slice duration candidates from all priorities
@@ -851,8 +851,8 @@ impl AdaptiveController {
                         let mut alloc2 = 0usize;
                         // Allocate spillover to workers 1 & 2 if we have enough capacity
                         if remaining >= 3 {
-                            alloc1 = 1;  // Worker 1 gets 1 High packet
-                            alloc2 = 1;  // Worker 2 gets 1 High packet
+                            alloc1 = 1; // Worker 1 gets 1 High packet
+                            alloc2 = 1; // Worker 2 gets 1 High packet
                             remaining -= 2;
                         } else if remaining == 2 {
                             // If only 2 packets, give 1 to Worker 1, rest to Worker 0
@@ -908,7 +908,7 @@ impl AdaptiveController {
                         // This allows Medium packets to briefly poll for High before processing
                         let guard_us = ((avg_ns / 1_000).saturating_mul(2))
                             .min((budget_ns / 1_000).max(1))
-                            .min(80);  // Cap at 80µs to prevent excessive guarding
+                            .min(80); // Cap at 80µs to prevent excessive guarding
                         self.set_guard_threshold_us(priority, guard_us);
                         guard_slice_candidates.push((priority, guard_us));
                     }
@@ -923,7 +923,7 @@ impl AdaptiveController {
                         // Compute guard threshold for Low priority (same formula as Medium)
                         let guard_us = ((avg_ns / 1_000).saturating_mul(2))
                             .min((budget_ns / 1_000).max(1))
-                            .min(80);  // Cap at 80µs
+                            .min(80); // Cap at 80µs
                         self.set_guard_threshold_us(priority, guard_us);
                         guard_slice_candidates.push((priority, guard_us));
                     }
@@ -944,9 +944,9 @@ impl AdaptiveController {
             for (worker_id, total) in new_totals.iter().enumerate() {
                 // Each worker has a minimum total limit to ensure it can always process some packets
                 let min_total = match worker_id {
-                    0 => 4,   // Worker 0 (High priority specialist): minimum 4 packets
-                    1 => 16,  // Worker 1 (High + Medium): minimum 16 packets
-                    _ => 64,  // Worker 2 (all priorities): minimum 64 packets
+                    0 => 4,  // Worker 0 (High priority specialist): minimum 4 packets
+                    1 => 16, // Worker 1 (High + Medium): minimum 16 packets
+                    _ => 64, // Worker 2 (all priorities): minimum 64 packets
                 };
                 // Update total limit (clamped to minimum)
                 self.set_total_limit(worker_id, (*total).max(min_total));
@@ -1183,7 +1183,7 @@ impl MultiWorkerScheduler {
                 self.worker_priority_counters[worker_id][priority].clone()
             });
             let controller = self.adaptive.clone(); // Adaptive controller (quotas, guard timings)
-            // Assign core: round-robin if fewer cores than workers
+                                                    // Assign core: round-robin if fewer cores than workers
             let core_id = core_list[worker_id % core_list.len()];
 
             // Spawn worker thread
@@ -1306,11 +1306,11 @@ impl MultiWorkerScheduler {
 /// * `shared_priority_counters` - Per-priority atomic counters (shared across workers, for adaptive controller)
 /// * `controller` - Adaptive controller that sets quotas and guard timings
 fn run_worker(
-    worker_id: usize, // Worker identifier (0=HIGH only, 1=HIGH+MED, 2=all)
+    worker_id: usize,          // Worker identifier (0=HIGH only, 1=HIGH+MED, 2=all)
     priorities: Vec<Priority>, // Priorities this worker can process
     input_queues: PriorityTable<Arc<Receiver<Packet>>>, // Input channels per priority
     completion: Arc<CompletionRouter>, // Router for packet completion (sequence tracking)
-    running: Arc<AtomicBool>, // Shutdown flag (checked each iteration)
+    running: Arc<AtomicBool>,  // Shutdown flag (checked each iteration)
     backlog: Arc<AtomicUsize>, // Atomic counter for worker queue depth (metrics)
     shared_priority_counters: PriorityTable<Arc<AtomicUsize>>, // Per-priority counters (adaptive controller)
     controller: Arc<AdaptiveController>, // Adaptive controller (quotas, guard timings)
@@ -1368,13 +1368,13 @@ fn run_worker(
                         let work_item = completion.prepare(priority, packet, deadline);
                         // Attempt to push into heap (respects quotas)
                         let pushed = push_with_capacity(
-                            &mut heap, // The EDF min-deadline heap
-                            &mut counts, // Per-priority counts (updated if pushed)
-                            &mut total_count, // Total count (updated if pushed)
+                            &mut heap,           // The EDF min-deadline heap
+                            &mut counts,         // Per-priority counts (updated if pushed)
+                            &mut total_count,    // Total count (updated if pushed)
                             &per_priority_limit, // Quota limits
-                            total_limit, // Global limit
+                            total_limit,         // Global limit
                             ScheduledItem {
-                                deadline, // EDF deadline (for heap ordering)
+                                deadline,  // EDF deadline (for heap ordering)
                                 work_item, // Packet + priority + sequence
                             },
                         );
@@ -1417,7 +1417,7 @@ fn run_worker(
         // Update local counters: packet is no longer in the heap
         counts[initial_priority] -= 1; // Decrement per-priority count
         total_count -= 1; // Decrement total count
-        // Update shared counter: adaptive controller tracks backlog
+                          // Update shared counter: adaptive controller tracks backlog
         shared_priority_counters[initial_priority].fetch_sub(1, AtomicOrdering::Relaxed);
 
         // ========================================================================
@@ -1453,14 +1453,14 @@ fn run_worker(
                         if deadline < scheduled.deadline {
                             // Yes: preempt! Requeue the current job and run HIGH instead.
                             let requeued_priority = initial_priority; // Remember original priority
-                            // Put the current packet back into the heap
+                                                                      // Put the current packet back into the heap
                             let requeued = push_with_capacity(
-                                &mut heap, // Put back into heap
-                                &mut counts, // Update counts
-                                &mut total_count, // Update total
+                                &mut heap,           // Put back into heap
+                                &mut counts,         // Update counts
+                                &mut total_count,    // Update total
                                 &per_priority_limit, // Quota limits
-                                total_limit, // Global limit
-                                scheduled, // The packet we're preempting
+                                total_limit,         // Global limit
+                                scheduled,           // The packet we're preempting
                             );
                             // This should always succeed (we just removed it, so quota should allow it)
                             debug_assert!(requeued, "failed to requeue preempted packet");
@@ -1470,19 +1470,19 @@ fn run_worker(
 
                             // Replace scheduled packet with the HIGH priority one
                             scheduled = ScheduledItem {
-                                deadline, // Earlier deadline
+                                deadline,  // Earlier deadline
                                 work_item, // HIGH priority packet
                             };
                         } else {
                             // No: HIGH packet has later deadline, just queue it normally
                             if push_with_capacity(
-                                &mut heap, // Add to heap
-                                &mut counts, // Update counts
-                                &mut total_count, // Update total
+                                &mut heap,           // Add to heap
+                                &mut counts,         // Update counts
+                                &mut total_count,    // Update total
                                 &per_priority_limit, // Quota limits
-                                total_limit, // Global limit
+                                total_limit,         // Global limit
                                 ScheduledItem {
-                                    deadline, // Later deadline (will be processed after current)
+                                    deadline,  // Later deadline (will be processed after current)
                                     work_item, // HIGH priority packet
                                 },
                             ) {
@@ -1531,7 +1531,7 @@ fn run_worker(
                         let remaining_guard = guard_threshold
                             .checked_sub(current_elapsed) // Time left before threshold
                             .unwrap_or_default(); // Default to zero if subtraction underflows
-                        // If no time remaining, exit immediately
+                                                  // If no time remaining, exit immediately
                         if remaining_guard.is_zero() {
                             break; // Threshold reached, proceed with processing
                         }
@@ -1560,12 +1560,12 @@ fn run_worker(
                                     // Requeue the current packet (Medium/Low) back into heap
                                     let requeued_priority = initial_priority; // Remember original priority
                                     let requeued = push_with_capacity(
-                                        &mut heap, // Put back into heap
-                                        &mut counts, // Update counts
-                                        &mut total_count, // Update total
+                                        &mut heap,           // Put back into heap
+                                        &mut counts,         // Update counts
+                                        &mut total_count,    // Update total
                                         &per_priority_limit, // Quota limits
-                                        total_limit, // Global limit
-                                        scheduled, // The packet we're preempting
+                                        total_limit,         // Global limit
+                                        scheduled,           // The packet we're preempting
                                     );
                                     // This should always succeed (we just removed it)
                                     debug_assert!(requeued, "failed to requeue guarded packet");
@@ -1575,7 +1575,7 @@ fn run_worker(
 
                                     // Replace scheduled packet with HIGH priority one
                                     scheduled = ScheduledItem {
-                                        deadline, // HIGH packet deadline
+                                        deadline,  // HIGH packet deadline
                                         work_item, // HIGH priority packet
                                     };
                                     // Exit guard loop: we found a HIGH packet to process

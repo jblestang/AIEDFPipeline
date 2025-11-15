@@ -564,15 +564,15 @@ fn spawn_pipeline(path: &Path, scheduler: &str, metrics_port: u16) -> io::Result
 
 fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<StressRunRecord> {
     if interactive {
-    println!("=== AIEDF Pipeline Stress Test ===\n");
-    println!("This test verifies latency prioritization by:");
-    println!("  1. Sending packets to all three flows simultaneously");
-    println!("  2. Verifying that Flow 1 (1ms deadline) is prioritized by EDF");
-    println!("  3. Measuring packet arrival times and throughput");
+        println!("=== AIEDF Pipeline Stress Test ===\n");
+        println!("This test verifies latency prioritization by:");
+        println!("  1. Sending packets to all three flows simultaneously");
+        println!("  2. Verifying that Flow 1 (1ms deadline) is prioritized by EDF");
+        println!("  3. Measuring packet arrival times and throughput");
         println!("  4. Recording metrics for scheduler-to-scheduler comparisons.\n");
         println!("Make sure the pipeline is running before starting this test!");
-    println!("Press Enter to start...");
-    let mut input = String::new();
+        println!("Press Enter to start...");
+        let mut input = String::new();
         let _ = std::io::stdin().read_line(&mut input);
     } else {
         println!("\n>>> Starting automated run for scheduler \"{label}\"");
@@ -586,7 +586,7 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
         test_duration.as_secs()
     );
 
-    let factor = 2;
+    let factor = 5;
     let rate_flow1 = 64u64 * factor;
     let rate_flow2 = 128u64 * factor;
     let rate_flow3 = 256u64 * factor;
@@ -604,21 +604,27 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
     // Flow 2 (Medium): ports 9082, 9083
     // Flow 3 (Low): ports 9084, 9085
     let receiver_handles: Vec<_> = vec![
-        (1, 9080), (1, 9081), // Flow 1: High priority (2 sockets)
-        (2, 9082), (2, 9083), // Flow 2: Medium priority (2 sockets)
-        (3, 9084), (3, 9085), // Flow 3: Low priority (2 sockets)
+        (1, 9080),
+        (1, 9081), // Flow 1: High priority (2 sockets)
+        (2, 9082),
+        (2, 9083), // Flow 2: Medium priority (2 sockets)
+        (3, 9084),
+        (3, 9085), // Flow 3: Low priority (2 sockets)
     ]
-        .into_iter()
-        .map(|(flow_id, port)| {
-            let test_clone = StressTest {
-                packets_sent: test.packets_sent.clone(),
-                packets_received: test.packets_received.clone(),
-            };
-            thread::spawn(move || {
-                (flow_id, test_clone.receive_packets(port, flow_id, test_duration + Duration::from_secs(2)))
-            })
+    .into_iter()
+    .map(|(flow_id, port)| {
+        let test_clone = StressTest {
+            packets_sent: test.packets_sent.clone(),
+            packets_received: test.packets_received.clone(),
+        };
+        thread::spawn(move || {
+            (
+                flow_id,
+                test_clone.receive_packets(port, flow_id, test_duration + Duration::from_secs(2)),
+            )
         })
-        .collect();
+    })
+    .collect();
 
     thread::sleep(Duration::from_millis(100));
 
@@ -675,19 +681,19 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
     // Flow 1 (High): ports 8080, 8081
     // Flow 2 (Medium): ports 8082, 8083
     // Flow 3 (Low): ports 8084, 8085
-    // 
+    //
     // When using multiple sockets, we divide packets evenly but double the interval
     // to maintain the same total rate (each socket sends at half rate, combined = full rate)
     // Use ceiling division to ensure we don't lose packets due to integer division
     let packets_per_socket_flow1 = (packets_flow1 as usize + 1) / 2; // Round up
     let packets_per_socket_flow2 = (packets_flow2 as usize + 1) / 2; // Round up
     let packets_per_socket_flow3 = (packets_flow3 as usize + 1) / 2; // Round up
-    
+
     // Double the interval for each socket to maintain total rate (2 sockets * half rate = full rate)
     let interval_per_socket_flow1 = interval_flow1 * 2;
     let interval_per_socket_flow2 = interval_flow2 * 2;
     let interval_per_socket_flow3 = interval_flow3 * 2;
-    
+
     // Flow 1: High priority (2 sockets)
     test.send_packets(
         1,
@@ -704,7 +710,7 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
         Some(flow1_bar.clone()),
     );
     thread::sleep(Duration::from_millis(10));
-    
+
     // Flow 2: Medium priority (2 sockets)
     test.send_packets(
         2,
@@ -721,7 +727,7 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
         Some(flow2_bar.clone()),
     );
     thread::sleep(Duration::from_millis(10));
-    
+
     // Flow 3: Low priority (2 sockets)
     test.send_packets(
         3,
@@ -754,10 +760,14 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
     println!("Test completed. Waiting for receivers to finish...\n");
 
     // Collect results from all receivers and merge by flow_id
-    let mut results_by_flow: std::collections::HashMap<u64, Vec<(Instant, String)>> = std::collections::HashMap::new();
+    let mut results_by_flow: std::collections::HashMap<u64, Vec<(Instant, String)>> =
+        std::collections::HashMap::new();
     for handle in receiver_handles {
         let (flow_id, packets) = handle.join().unwrap();
-        results_by_flow.entry(flow_id).or_insert_with(Vec::new).extend(packets);
+        results_by_flow
+            .entry(flow_id)
+            .or_insert_with(Vec::new)
+            .extend(packets);
     }
     // Sort packets by timestamp within each flow
     for packets in results_by_flow.values_mut() {
