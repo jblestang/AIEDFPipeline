@@ -41,7 +41,7 @@ impl Default for Metrics {
         Self {
             priority: Priority::High,
             packet_count: 0,
-            latencies: VecDeque::with_capacity(10000), // Pre-allocate for high packet rates
+            latencies: VecDeque::with_capacity(1024), // Pre-allocate for high packet rates
             deadline_misses: 0,
             time_window: Duration::from_secs(10), // Keep last 10 seconds of latency data
             cached_p50: RefCell::new(None),
@@ -68,7 +68,7 @@ impl Metrics {
         Self {
             priority,
             packet_count: 0,
-            latencies: VecDeque::with_capacity(10000), // Pre-allocate for high packet rates
+            latencies: VecDeque::with_capacity(1024), // Pre-allocate for high packet rates
             deadline_misses: 0,
             time_window: Duration::from_secs(10), // Keep last 10 seconds of latency data
             cached_p50: RefCell::new(None),
@@ -561,7 +561,7 @@ impl MetricsCollector {
     /// Create a new collector backed by the provided metrics sender.
     ///
     /// Initializes the collector with:
-    /// - A lock-free channel for hot-path events (bounded to 10000 events)
+    /// - A lock-free channel for hot-path events (bounded to 1024 events)
     /// - A background thread that processes events in batches (100 events per batch)
     /// - A metrics map that aggregates statistics per priority
     /// - Worker stats storage (for multi-worker EDF scheduler)
@@ -580,7 +580,7 @@ impl MetricsCollector {
         let (events_tx, events_rx): (
             crossbeam_channel::Sender<MetricsEvent>,
             crossbeam_channel::Receiver<MetricsEvent>,
-        ) = crossbeam_channel::bounded(10000);
+        ) = crossbeam_channel::bounded(1024);
 
         let metrics: Arc<Mutex<std::collections::HashMap<Priority, Metrics>>> =
             Arc::new(Mutex::new(std::collections::HashMap::new()));

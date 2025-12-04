@@ -55,6 +55,7 @@ fn normalize_metrics_bind(value: &str) -> String {
 /// - `gedf-vd`, `g-edf-vd`, `global-vd`: Global EDF with virtual deadlines
 /// - `cedf`, `clairvoyant`: Clairvoyant EDF scheduler
 /// - `mcedf`, `mc-edf`, `mc-edf-elastic`: Multi-Channel EDF with elasticity scheduler
+/// - `single-cpu-edf`, `single_cpu_edf`: Single-CPU EDF scheduler with direct socket reading
 ///
 /// # Returns
 /// `CliOptions` with parsed values (defaults to Single scheduler and "127.0.0.1:9999")
@@ -72,6 +73,7 @@ fn parse_cli_options() -> CliOptions {
                         "gedf-vd" | "g-edf-vd" | "global-vd" => SchedulerKind::GlobalVD,
                         "cedf" | "clairvoyant" => SchedulerKind::Clairvoyant,
                         "mcedf" | "mc-edf" | "mc-edf-elastic" => SchedulerKind::MCEDFElastic,
+                        "single-cpu-edf" | "single_cpu_edf" => SchedulerKind::SingleCPUEDF,
                         "single" | "legacy" => SchedulerKind::Single,
                         _ => scheduler,
                     };
@@ -88,6 +90,7 @@ fn parse_cli_options() -> CliOptions {
                     "gedf" | "g-edf" | "global" => SchedulerKind::Global,
                     "gedf-vd" | "g-edf-vd" | "global-vd" => SchedulerKind::GlobalVD,
                     "cedf" | "clairvoyant" => SchedulerKind::Clairvoyant,
+                    "single-cpu-edf" | "single_cpu_edf" => SchedulerKind::SingleCPUEDF,
                     "single" | "legacy" => SchedulerKind::Single,
                     _ => scheduler,
                 };

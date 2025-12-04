@@ -230,13 +230,18 @@ fn update_ui(
 
                 ui.separator();
 
-                let mut flows: Vec<_> = latest_metrics.keys().collect();
+                // Filter out flows with no packets (only show active flows)
+                let mut flows: Vec<_> = latest_metrics
+                    .iter()
+                    .filter(|(_, metrics)| metrics.packet_count > 0)
+                    .map(|(flow_id, _)| *flow_id)
+                    .collect();
                 flows.sort();
 
                 for &flow_id in &flows {
-                    let metrics = &latest_metrics[flow_id];
+                    let metrics = &latest_metrics[&flow_id];
                     // Convert flow_id to Priority for display
-                    let priority = flow_id_to_priority(*flow_id);
+                    let priority = flow_id_to_priority(flow_id);
                     ui.horizontal(|ui| {
                         ui.label(format!("{}", priority));
                         ui.label(format!("{}", metrics.packet_count));
@@ -305,9 +310,9 @@ fn update_ui(
                 ui.heading("Real-Time Statistics Plots");
 
                 for &flow_id in &flows {
-                    let metrics = &latest_metrics[flow_id];
+                    let metrics = &latest_metrics[&flow_id];
 
-                    if let Some(flow_stats) = stats_history.get(flow_id) {
+                    if let Some(flow_stats) = stats_history.get(&flow_id) {
                         if !flow_stats.points.is_empty() {
                             ui.group(|ui| {
                                 ui.label(format!(
@@ -664,7 +669,7 @@ pub fn run_gui_client(server_addr: &str, shutdown_flag: Arc<AtomicBool>) {
                                                 let flow_stats = stats_guard.entry(k).or_insert_with(|| FlowStatistics {
                                                     start_time: now, // Only set start_time when flow is first created
                                                     points: VecDeque::with_capacity(1000),
-                                                    max_points: 10000, // Keep last 10000 points
+                                                    max_points: 1024, // Keep last 1024 points
                                                     last_point_time: -1.0, // Initialize to -1 to always add first point
                                                 });
 
@@ -782,13 +787,18 @@ fn update_ui_client(
 
                 ui.separator();
 
-                let mut flows: Vec<_> = latest_metrics.keys().collect();
+                // Filter out flows with no packets (only show active flows)
+                let mut flows: Vec<_> = latest_metrics
+                    .iter()
+                    .filter(|(_, metrics)| metrics.packet_count > 0)
+                    .map(|(flow_id, _)| *flow_id)
+                    .collect();
                 flows.sort();
 
                 for &flow_id in &flows {
-                    let metrics = &latest_metrics[flow_id];
+                    let metrics = &latest_metrics[&flow_id];
                     // Convert flow_id to Priority for display
-                    let priority = flow_id_to_priority(*flow_id);
+                    let priority = flow_id_to_priority(flow_id);
                     ui.horizontal(|ui| {
                         ui.label(format!("{}", priority));
                         ui.label(format!("{}", metrics.packet_count));
@@ -857,9 +867,9 @@ fn update_ui_client(
                 ui.heading("Real-Time Statistics Plots");
 
                 for &flow_id in &flows {
-                    let metrics = &latest_metrics[flow_id];
+                    let metrics = &latest_metrics[&flow_id];
 
-                    if let Some(flow_stats) = stats_history.get(flow_id) {
+                    if let Some(flow_stats) = stats_history.get(&flow_id) {
                         if !flow_stats.points.is_empty() {
                             ui.group(|ui| {
                                 ui.label(format!(

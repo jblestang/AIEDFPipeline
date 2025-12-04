@@ -21,6 +21,7 @@ use crate::scheduler::gedf_vd::GEDFVDScheduler;
 use crate::scheduler::ingress_drr::IngressDRRScheduler;
 use crate::scheduler::mc_edf_elastic::MCEDFElasticScheduler;
 use crate::scheduler::multi_worker_edf::MultiWorkerScheduler;
+use crate::scheduler::single_cpu_edf::SingleCPUEDFScheduler;
 use crate::threading::{set_cpu_affinity, set_thread_core, set_thread_priority};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -71,6 +72,8 @@ pub enum SchedulerKind {
     Clairvoyant,
     /// Multi-Channel EDF with elasticity (one EDF per priority, intelligent Round Robin for HIGH)
     MCEDFElastic,
+    /// Single-CPU EDF scheduler with direct socket reading (reads directly from sockets, no ingress DRR)
+    SingleCPUEDF,
 }
 
 impl Default for SchedulerKind {
@@ -222,6 +225,7 @@ pub struct Pipeline {
     edf_global_vd: Option<Arc<GEDFVDScheduler>>,
     edf_cedf: Option<Arc<CEDFScheduler>>,
     edf_mcedf: Option<Arc<MCEDFElasticScheduler>>,
+    edf_single_cpu: Option<Arc<SingleCPUEDFScheduler>>,
     egress_drr: Arc<EgressDRRScheduler>,
     metrics_collector: Arc<MetricsCollector>,
     metrics_receiver: Receiver<std::collections::HashMap<u64, MetricsSnapshot>>,
@@ -345,13 +349,14 @@ impl Pipeline {
 
         let ingress_drr = Arc::new(IngressDRRScheduler::new(ingress_input_txs.clone()));
         let scheduler_kind = config.scheduler;
-        let (edf_single, edf_multi, edf_global, edf_global_vd, edf_cedf, edf_mcedf): (
+        let (edf_single, edf_multi, edf_global, edf_global_vd, edf_cedf, edf_mcedf, edf_single_cpu): (
             Option<Arc<EDFScheduler>>,
             Option<Arc<MultiWorkerScheduler>>,
             Option<Arc<GEDFScheduler>>,
             Option<Arc<GEDFVDScheduler>>,
             Option<Arc<CEDFScheduler>>,
             Option<Arc<MCEDFElasticScheduler>>,
+            Option<Arc<SingleCPUEDFScheduler>>,
         ) = match scheduler_kind {
             SchedulerKind::Single => {
                 let edf = Arc::new(EDFScheduler::new(
@@ -361,7 +366,7 @@ impl Pipeline {
                     edf_output_txs.clone(),
                     config.edf.max_heap_size,
                 ));
-                (Some(edf), None, None, None, None, None)
+                (Some(edf), None, None, None, None, None, None)
             }
             SchedulerKind::MultiWorker => {
                 let multi = Arc::new(MultiWorkerScheduler::new(
@@ -371,7 +376,7 @@ impl Pipeline {
                     edf_output_txs.clone(),
                     latency_table.clone(),
                 ));
-                (None, Some(multi), None, None, None, None)
+                (None, Some(multi), None, None, None, None, None)
             }
             SchedulerKind::Global => {
                 let global = Arc::new(GEDFScheduler::new(
@@ -380,7 +385,7 @@ impl Pipeline {
                     }),
                     edf_output_txs.clone(),
                 ));
-                (None, None, Some(global), None, None, None)
+                (None, None, Some(global), None, None, None, None)
             }
             SchedulerKind::GlobalVD => {
                 let global_vd = Arc::new(GEDFVDScheduler::new(
@@ -389,7 +394,7 @@ impl Pipeline {
                     }),
                     edf_output_txs.clone(),
                 ));
-                (None, None, None, Some(global_vd), None, None)
+                (None, None, None, Some(global_vd), None, None, None)
             }
             SchedulerKind::Clairvoyant => {
                 let cedf = Arc::new(CEDFScheduler::new(
@@ -398,7 +403,7 @@ impl Pipeline {
                     }),
                     edf_output_txs.clone(),
                 ));
-                (None, None, None, None, Some(cedf), None)
+                (None, None, None, None, Some(cedf), None, None)
             }
             SchedulerKind::MCEDFElastic => {
                 let mcedf = Arc::new(MCEDFElasticScheduler::new(
@@ -407,7 +412,16 @@ impl Pipeline {
                     }),
                     edf_output_txs.clone(),
                 ));
-                (None, None, None, None, None, Some(mcedf))
+                (None, None, None, None, None, Some(mcedf), None)
+            }
+            SchedulerKind::SingleCPUEDF => {
+                // Note: SingleCPUEDF reads directly from sockets, so it needs special socket configuration
+                // For now, create a placeholder - full integration would require socket configuration setup
+                // TODO: Integrate SingleCPUEDFScheduler with proper socket configuration
+                let single_cpu_edf = Arc::new(SingleCPUEDFScheduler::new(
+                    edf_output_txs.clone(),
+                ));
+                (None, None, None, None, None, None, Some(single_cpu_edf))
             }
         };
         let egress_drr = Arc::new(EgressDRRScheduler::new(edf_output_rxs.clone()));
@@ -423,6 +437,7 @@ impl Pipeline {
             edf_global_vd: edf_global_vd.clone(),
             edf_cedf: edf_cedf.clone(),
             edf_mcedf: edf_mcedf.clone(),
+            edf_single_cpu: edf_single_cpu.clone(),
             egress_drr,
             metrics_collector,
             metrics_receiver: metrics_rx,
@@ -545,18 +560,35 @@ impl Pipeline {
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.running.store(true, Ordering::Relaxed);
 
-        // Create and bind input sockets, add to IngressDRRScheduler
-        for config in &self.input_sockets {
-            let addr = format!("{}:{}", config.address, config.port);
-            let std_socket = std::net::UdpSocket::bind(&addr)?;
-            std_socket.set_nonblocking(true)?;
-            let socket = Arc::new(std_socket);
+        // Create and bind input sockets
+        // For SingleCPUEDF: add sockets directly to the scheduler (replaces ingress DRR)
+        // For other schedulers: add sockets to IngressDRRScheduler
+        if self.scheduler_kind == SchedulerKind::SingleCPUEDF {
+            // SingleCPUEDF reads directly from sockets, bypassing ingress DRR
+            if let Some(ref single_cpu_edf) = self.edf_single_cpu {
+                for config in &self.input_sockets {
+                    let addr = format!("{}:{}", config.address, config.port);
+                    let std_socket = std::net::UdpSocket::bind(&addr)?;
+                    std_socket.set_nonblocking(true)?;
+                    let socket = Arc::new(std_socket);
+                    
+                    single_cpu_edf.add_socket(socket, config.priority, config.latency_budget);
+                }
+            }
+        } else {
+            // Other schedulers use ingress DRR
+            for config in &self.input_sockets {
+                let addr = format!("{}:{}", config.address, config.port);
+                let std_socket = std::net::UdpSocket::bind(&addr)?;
+                std_socket.set_nonblocking(true)?;
+                let socket = Arc::new(std_socket);
 
-            let priority = config.priority;
-            let quantum = self.config.ingress.quantums[priority];
+                let priority = config.priority;
+                let quantum = self.config.ingress.quantums[priority];
 
-            self.ingress_drr
-                .add_socket(socket, priority, config.latency_budget, quantum);
+                self.ingress_drr
+                    .add_socket(socket, priority, config.latency_budget, quantum);
+            }
         }
 
         // Create output sockets and add to EgressDRRScheduler
@@ -570,22 +602,25 @@ impl Pipeline {
         }
 
         // Start IngressDRRScheduler (reads from UDP sockets, routes to priority queues)
-        let ingress_drr_clone = self.ingress_drr.clone();
-        let running_ingress = self.running.clone();
-        let ingress_core = self.config.cores.ingress;
-        std::thread::Builder::new()
-            .name("Ingress-DRR".to_string())
-            .spawn(move || {
-                set_thread_priority(2);
-                set_thread_core(ingress_core);
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                rt.block_on(async move {
-                    let _ = ingress_drr_clone.process_sockets(running_ingress).await;
-                });
-            })?;
+        // Skip ingress DRR for SingleCPUEDF since it reads directly from sockets
+        if self.scheduler_kind != SchedulerKind::SingleCPUEDF {
+            let ingress_drr_clone = self.ingress_drr.clone();
+            let running_ingress = self.running.clone();
+            let ingress_core = self.config.cores.ingress;
+            std::thread::Builder::new()
+                .name("Ingress-DRR".to_string())
+                .spawn(move || {
+                    set_thread_priority(2);
+                    set_thread_core(ingress_core);
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let _ = ingress_drr_clone.process_sockets(running_ingress).await;
+                    });
+                })?;
+        }
 
         match self.scheduler_kind {
             SchedulerKind::Single => {
@@ -708,6 +743,26 @@ impl Pipeline {
                     &worker_cores,
                 );
             }
+            SchedulerKind::SingleCPUEDF => {
+                // SingleCPUEDF uses run() method instead of spawn_threads
+                // It reads directly from sockets (replaces ingress DRR)
+                let scheduler = self
+                    .edf_single_cpu
+                    .as_ref()
+                    .expect("SingleCPU-EDF scheduler must be present")
+                    .clone();
+                let running_single_cpu = self.running.clone();
+                let edf_core = self.config.cores.edf_dispatcher;
+                
+                std::thread::Builder::new()
+                    .name("SingleCPU-EDF".to_string())
+                    .spawn(move || {
+                        set_thread_priority(2);
+                        set_thread_core(edf_core);
+                        // run() now takes &self (interior mutability)
+                        scheduler.run(running_single_cpu);
+                    })?;
+            }
         }
 
         // Start EgressDRRScheduler (reads from priority queues, writes to UDP sockets)
@@ -759,6 +814,7 @@ impl Pipeline {
         let edf_global_vd_for_drops = self.edf_global_vd.clone();
         let edf_cedf_for_drops = self.edf_cedf.clone();
         let edf_mcedf_for_drops = self.edf_mcedf.clone();
+        let edf_single_cpu_for_drops = self.edf_single_cpu.clone();
         let scheduler_kind = self.scheduler_kind;
         let stats_core = self.config.cores.egress;
         std::thread::Builder::new()
@@ -802,6 +858,10 @@ impl Pipeline {
                             SchedulerKind::MCEDFElastic => edf_mcedf_for_drops
                                 .as_ref()
                                 .expect("MC-EDF should exist")
+                                .get_drop_counts(),
+                            SchedulerKind::SingleCPUEDF => edf_single_cpu_for_drops
+                                .as_ref()
+                                .expect("SingleCPU-EDF should exist")
                                 .get_drop_counts(),
                         };
                         if let Some(multi) = edf_multi_for_drops.as_ref() {

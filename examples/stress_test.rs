@@ -53,6 +53,7 @@ struct StressConfig {
     benchmark_all: bool,
     report_path: Option<PathBuf>,
     pipeline_path: Option<PathBuf>,
+    high_only: bool,
 }
 
 impl StressConfig {
@@ -64,6 +65,7 @@ impl StressConfig {
         let mut benchmark_all = false;
         let mut report_path: Option<PathBuf> = None;
         let mut pipeline_path: Option<PathBuf> = None;
+        let mut high_only = false;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -99,7 +101,11 @@ impl StressConfig {
                     _ => {}
                 }
             } else {
+                // Handle flags without values
                 match arg.as_str() {
+                    "--high-only" => {
+                        high_only = true;
+                    }
                     "--duration" => {
                         if let Some(value) = args.next() {
                             if let Ok(secs) = value.parse::<u64>() {
@@ -156,6 +162,7 @@ impl StressConfig {
             benchmark_all,
             report_path,
             pipeline_path,
+            high_only,
         }
     }
 
@@ -170,6 +177,7 @@ impl StressConfig {
         println!("  --benchmark-all         Run against every scheduler and emit a report");
         println!("  --report <file>         Markdown report path (with --benchmark-all)");
         println!("  --pipeline <path>       Override pipeline binary path");
+        println!("  --high-only             Only test HIGH priority flows (Flow 1)");
         println!("  -h, --help              Show this help message");
     }
 
@@ -565,11 +573,18 @@ fn spawn_pipeline(path: &Path, scheduler: &str, metrics_port: u16) -> io::Result
 fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<StressRunRecord> {
     if interactive {
         println!("=== AIEDF Pipeline Stress Test ===\n");
-        println!("This test verifies latency prioritization by:");
-        println!("  1. Sending packets to all three flows simultaneously");
-        println!("  2. Verifying that Flow 1 (1ms deadline) is prioritized by EDF");
-        println!("  3. Measuring packet arrival times and throughput");
-        println!("  4. Recording metrics for scheduler-to-scheduler comparisons.\n");
+        if config.high_only {
+            println!("This test measures HIGH priority flow performance:");
+            println!("  1. Sending packets to Flow 1 (HIGH priority, 1ms deadline) only");
+            println!("  2. Measuring packet arrival times and throughput");
+            println!("  3. Recording metrics for scheduler-to-scheduler comparisons.\n");
+        } else {
+            println!("This test verifies latency prioritization by:");
+            println!("  1. Sending packets to all three flows simultaneously");
+            println!("  2. Verifying that Flow 1 (1ms deadline) is prioritized by EDF");
+            println!("  3. Measuring packet arrival times and throughput");
+            println!("  4. Recording metrics for scheduler-to-scheduler comparisons.\n");
+        }
         println!("Make sure the pipeline is running before starting this test!");
         println!("Press Enter to start...");
         let mut input = String::new();
@@ -586,7 +601,7 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
         test_duration.as_secs()
     );
 
-    let factor = 5;
+    let factor = 1;
     let rate_flow1 = 64u64 * factor;
     let rate_flow2 = 128u64 * factor;
     let rate_flow3 = 256u64 * factor;
@@ -603,14 +618,21 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
     // Flow 1 (High): ports 9080, 9081
     // Flow 2 (Medium): ports 9082, 9083
     // Flow 3 (Low): ports 9084, 9085
-    let receiver_handles: Vec<_> = vec![
-        (1, 9080),
-        (1, 9081), // Flow 1: High priority (2 sockets)
-        (2, 9082),
-        (2, 9083), // Flow 2: Medium priority (2 sockets)
-        (3, 9084),
-        (3, 9085), // Flow 3: Low priority (2 sockets)
-    ]
+    let receiver_handles: Vec<_> = if config.high_only {
+        vec![
+            (1, 9080),
+            (1, 9081), // Flow 1: High priority (2 sockets) only
+        ]
+    } else {
+        vec![
+            (1, 9080),
+            (1, 9081), // Flow 1: High priority (2 sockets)
+            (2, 9082),
+            (2, 9083), // Flow 2: Medium priority (2 sockets)
+            (3, 9084),
+            (3, 9085), // Flow 3: Low priority (2 sockets)
+        ]
+    }
     .into_iter()
     .map(|(flow_id, port)| {
         let test_clone = StressTest {
@@ -637,18 +659,20 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
         interval_flow1.as_secs_f64() * 1000.0,
         rate_flow1
     );
-    println!(
-        "  Flow 2 (10ms deadline): {} packets at {:.2} ms intervals ({} pps)",
-        packets_flow2,
-        interval_flow2.as_secs_f64() * 1000.0,
-        rate_flow2
-    );
-    println!(
-        "  Flow 3 (100ms deadline): {} packets at {:.2} ms intervals ({} pps)",
-        packets_flow3,
-        interval_flow3.as_secs_f64() * 1000.0,
-        rate_flow3
-    );
+    if !config.high_only {
+        println!(
+            "  Flow 2 (10ms deadline): {} packets at {:.2} ms intervals ({} pps)",
+            packets_flow2,
+            interval_flow2.as_secs_f64() * 1000.0,
+            rate_flow2
+        );
+        println!(
+            "  Flow 3 (100ms deadline): {} packets at {:.2} ms intervals ({} pps)",
+            packets_flow3,
+            interval_flow3.as_secs_f64() * 1000.0,
+            rate_flow3
+        );
+    }
     println!();
 
     let multi = MultiProgress::new();
@@ -662,13 +686,25 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
     flow1_bar.set_style(bar_style.clone());
     flow1_bar.set_prefix("Flow 1");
 
-    let flow2_bar = Arc::new(multi.add(ProgressBar::new(packets_flow2.max(1))));
-    flow2_bar.set_style(bar_style.clone());
-    flow2_bar.set_prefix("Flow 2");
+    let flow2_bar = if config.high_only {
+        Arc::new(multi.add(ProgressBar::new(0))) // Unused, but keep for compatibility
+    } else {
+        Arc::new(multi.add(ProgressBar::new(packets_flow2.max(1))))
+    };
+    if !config.high_only {
+        flow2_bar.set_style(bar_style.clone());
+        flow2_bar.set_prefix("Flow 2");
+    }
 
-    let flow3_bar = Arc::new(multi.add(ProgressBar::new(packets_flow3.max(1))));
-    flow3_bar.set_style(bar_style.clone());
-    flow3_bar.set_prefix("Flow 3");
+    let flow3_bar = if config.high_only {
+        Arc::new(multi.add(ProgressBar::new(0))) // Unused, but keep for compatibility
+    } else {
+        Arc::new(multi.add(ProgressBar::new(packets_flow3.max(1))))
+    };
+    if !config.high_only {
+        flow3_bar.set_style(bar_style.clone());
+        flow3_bar.set_prefix("Flow 3");
+    }
 
     let elapsed_bar = multi.add(ProgressBar::new(test_duration.as_secs().max(1)));
     elapsed_bar.set_style(
@@ -709,40 +745,43 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
         interval_per_socket_flow1,
         Some(flow1_bar.clone()),
     );
-    thread::sleep(Duration::from_millis(10));
 
-    // Flow 2: Medium priority (2 sockets)
-    test.send_packets(
-        2,
-        8082,
-        packets_per_socket_flow2,
-        interval_per_socket_flow2,
-        Some(flow2_bar.clone()),
-    );
-    test.send_packets(
-        2,
-        8083,
-        packets_per_socket_flow2,
-        interval_per_socket_flow2,
-        Some(flow2_bar.clone()),
-    );
-    thread::sleep(Duration::from_millis(10));
+    if !config.high_only {
+        thread::sleep(Duration::from_millis(10));
 
-    // Flow 3: Low priority (2 sockets)
-    test.send_packets(
-        3,
-        8084,
-        packets_per_socket_flow3,
-        interval_per_socket_flow3,
-        Some(flow3_bar.clone()),
-    );
-    test.send_packets(
-        3,
-        8085,
-        packets_per_socket_flow3,
-        interval_per_socket_flow3,
-        Some(flow3_bar.clone()),
-    );
+        // Flow 2: Medium priority (2 sockets)
+        test.send_packets(
+            2,
+            8082,
+            packets_per_socket_flow2,
+            interval_per_socket_flow2,
+            Some(flow2_bar.clone()),
+        );
+        test.send_packets(
+            2,
+            8083,
+            packets_per_socket_flow2,
+            interval_per_socket_flow2,
+            Some(flow2_bar.clone()),
+        );
+        thread::sleep(Duration::from_millis(10));
+
+        // Flow 3: Low priority (2 sockets)
+        test.send_packets(
+            3,
+            8084,
+            packets_per_socket_flow3,
+            interval_per_socket_flow3,
+            Some(flow3_bar.clone()),
+        );
+        test.send_packets(
+            3,
+            8085,
+            packets_per_socket_flow3,
+            interval_per_socket_flow3,
+            Some(flow3_bar.clone()),
+        );
+    }
 
     let elapsed_handle = {
         let pb = elapsed_bar.clone();
@@ -784,14 +823,16 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
     println!("Total packets received: {}", total_received);
 
     let expected_flow1 = packets_flow1;
-    let expected_flow2 = packets_flow2;
-    let expected_flow3 = packets_flow3;
+    let expected_flow2 = if config.high_only { 0 } else { packets_flow2 };
+    let expected_flow3 = if config.high_only { 0 } else { packets_flow3 };
     let total_expected = expected_flow1 + expected_flow2 + expected_flow3;
 
     println!("\nExpected packets per flow:");
-    println!("  Flow 1: {} (low data rate)", expected_flow1);
-    println!("  Flow 2: {} (medium data rate)", expected_flow2);
-    println!("  Flow 3: {} (high data rate)", expected_flow3);
+    println!("  Flow 1: {} (HIGH priority)", expected_flow1);
+    if !config.high_only {
+        println!("  Flow 2: {} (MEDIUM priority)", expected_flow2);
+        println!("  Flow 3: {} (LOW priority)", expected_flow3);
+    }
     println!("  Total expected: {}", total_expected);
 
     let loss_rate = if total_sent > 0 {

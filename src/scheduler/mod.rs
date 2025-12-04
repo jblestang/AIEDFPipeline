@@ -6,3 +6,4 @@ pub mod gedf_vd;
 pub mod ingress_drr;
 pub mod mc_edf_elastic;
 pub mod multi_worker_edf;
+pub mod single_cpu_edf;
