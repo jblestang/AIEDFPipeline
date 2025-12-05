@@ -601,7 +601,7 @@ fn run_stress(label: &str, config: &StressConfig, interactive: bool) -> Option<S
         test_duration.as_secs()
     );
 
-    let factor = 1;
+    let factor = 10;
     let rate_flow1 = 64u64 * factor;
     let rate_flow2 = 128u64 * factor;
     let rate_flow3 = 256u64 * factor;
